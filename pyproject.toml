@@ -1,0 +1,20 @@
+[project]
+name = "hyperconnections"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "einops",
+    "timm",
+    "treescope"
+    
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
