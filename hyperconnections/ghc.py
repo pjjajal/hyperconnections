@@ -27,6 +27,7 @@ class GeneralizedHyperConnections(nn.Module):
         self.m = m
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        assert embed_dim % m == 0, f"embed_dim ({embed_dim}) must be divisible by m ({m})"
         assert input_dim == int(
             (n / m) * embed_dim
         ), f"Input dimension must be (n / m) * embed_dim, but got {input_dim} and {(n / m) * embed_dim}"
@@ -34,93 +35,94 @@ class GeneralizedHyperConnections(nn.Module):
         self.block_size = embed_dim // m  # the block size = d_in / n = embed_dim / m
         self.scaling_factor = math.sqrt(self.block_size)
 
-        static_b = torch.zeros((m, n))  # [m, n]
-        for j in range(static_b.shape[1]):
-            static_b[j % m, j] = 1.0
-        self.static_b = nn.Parameter(static_b.T.contiguous())  # [n, m]
-        self.dynamic_scaling_b = nn.Parameter(torch.ones_like(self.static_b))  # [n, m]
-        self.dynamic_scaling_weight_b = nn.Linear(
-            self.block_size, m, bias=bias
-        )  # [block_size, m]
+        # write_out (B): [n, m]
+        self.write_out = nn.Parameter(torch.empty(n, m))
+        self.dynamic_scaling_write_out = nn.Parameter(torch.ones(n, m))
+        self.dynamic_scaling_weight_write_out = nn.Linear(self.block_size, m, bias=bias)
 
-        static_a = torch.zeros((n, n + m))  # [n, n + m]
-        r = n - m
-        static_a[:m, :m] = torch.eye(m)
-        static_a[:m, m : m + m] = torch.eye(m)
-        if r > 0:
-            static_a[m:, 2 * m : 2 * m + r] = torch.eye(r)
-        self.static_a = nn.Parameter(static_a.contiguous())  # [n, n + m]
-        self.dynamic_scaling_a = nn.Parameter(
-            torch.ones_like(self.static_a)
-        )  # [n, n + m]
-        self.dynamic_scaling_weight_a = nn.Linear(
-            self.block_size, n + m, bias=bias
-        )  # [block_size, n + m]
+        # read_in (Å): [n, m]
+        self.read_in = nn.Parameter(torch.empty(n, m))
+        self.dynamic_scaling_read_in = nn.Parameter(torch.ones(n, m))
+        self.dynamic_scaling_weight_read_in = nn.Linear(self.block_size, m, bias=bias)
+
+        # stream_mixing (Â): [n, n]
+        self.stream_mixing = nn.Parameter(torch.empty(n, n))
+        self.dynamic_scaling_stream_mixing = nn.Parameter(torch.ones(n, n))
+        self.dynamic_scaling_weight_stream_mixing = nn.Linear(self.block_size, n, bias=bias)
 
         self.norm = nn.RMSNorm(self.block_size, elementwise_affine=elementwise_affine)
-
         self.module = module
 
+        self.init_weights()
+
     def init_weights(self):
-        # Initialize the dynamic scaling weights to be small, so that the initial behavior of the model is close to the static connections.
-        nn.init.zeros_(self.dynamic_scaling_weight_b.weight)
-        if self.dynamic_scaling_weight_b.bias is not None:
-            nn.init.zeros_(self.dynamic_scaling_weight_b.bias)
-        nn.init.zeros_(self.dynamic_scaling_weight_a.weight)
-        if self.dynamic_scaling_weight_a.bias is not None:
-            nn.init.zeros_(self.dynamic_scaling_weight_a.bias)
+        # Static matrices
+        write_out = torch.zeros(self.m, self.n)
+        for j in range(self.n):
+            write_out[j % self.m, j] = 1.0
+        self.write_out.data.copy_(write_out.T)  # [n, m]
 
-    def compute_mixing_weights(self, x: torch.Tensor) -> torch.Tensor:
+        read_in = torch.zeros(self.n, self.m)
+        read_in[: self.m, : self.m] = torch.eye(self.m)
+        self.read_in.data.copy_(read_in)  # [n, m]
+
+        self.stream_mixing.data.copy_(torch.eye(self.n))  # [n, n]
+
+        # Dynamic scaling weights start at zero so initial behavior matches static connections
+        nn.init.zeros_(self.dynamic_scaling_weight_write_out.weight)
+        if self.dynamic_scaling_weight_write_out.bias is not None:
+            nn.init.zeros_(self.dynamic_scaling_weight_write_out.bias)
+        nn.init.zeros_(self.dynamic_scaling_weight_read_in.weight)
+        if self.dynamic_scaling_weight_read_in.bias is not None:
+            nn.init.zeros_(self.dynamic_scaling_weight_read_in.bias)
+        nn.init.zeros_(self.dynamic_scaling_weight_stream_mixing.weight)
+        if self.dynamic_scaling_weight_stream_mixing.bias is not None:
+            nn.init.zeros_(self.dynamic_scaling_weight_stream_mixing.bias)
+
+    def compute_mixing_weights(self, x: torch.Tensor):
         # x: [B, n, block_size]
-
         x = self.norm(x)  # [B, n, block_size]
 
-        # Computes the dynamic B matrix, this is referred to as the write_out_matrix. Because it writes out to the high-dimensional hyperconnection space.
-        write_out_matrix = (
-            self.dynamic_scaling_b
-            * F.tanh(self.dynamic_scaling_weight_b(x) / self.scaling_factor)
-            + self.static_b
+        write_out = (
+            self.dynamic_scaling_write_out
+            * F.tanh(self.dynamic_scaling_weight_write_out(x) / self.scaling_factor)
+            + self.write_out
         )  # [B, n, m]
 
-        # Computes the dynamic A matrix, i.e., the read_in_matrix (\mathring{A}), and stream_mixing_matrix (\hat{A}). Because it reads in from the high-dimensional hyperconnection space.
-        dynamic_A = (
-            self.dynamic_scaling_a
-            * F.tanh(self.dynamic_scaling_weight_a(x) / self.scaling_factor)
-            + self.static_a
-        )  # [B, n, n + m]
-        read_in_matrix = dynamic_A[:, :, : self.m].transpose(1, 2)  # [B, m, n]
-        stream_mixing_matrix = dynamic_A[:, :, self.m :]  # [B, n, n]
+        read_in = (
+            self.dynamic_scaling_read_in
+            * F.tanh(self.dynamic_scaling_weight_read_in(x) / self.scaling_factor)
+            + self.read_in
+        ).transpose(1, 2)  # [B, n, m] -> [B, m, n]
 
-        return write_out_matrix, read_in_matrix, stream_mixing_matrix
+        stream_mixing = (
+            self.dynamic_scaling_stream_mixing
+            * F.tanh(self.dynamic_scaling_weight_stream_mixing(x) / self.scaling_factor)
+            + self.stream_mixing
+        )  # [B, n, n]
+
+        return write_out, read_in, stream_mixing
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        # X: [B, input_dim]
-        B, _ = x.shape
-        # Reshape the input to [B, n, block_size]
-        x = x.reshape(B, self.n, self.block_size)  # [B, n, block_size]
+        # x: [B, *, input_dim]
+        shape = x.shape
+        x = x.reshape(-1, self.n, self.block_size)  # [B*, n, block_size]
+        B = x.shape[0]
 
-        # We compute the dynamic mixing weights.
-        write_out_matrix, read_in_matrix, stream_mixing_matrix = (
-            self.compute_mixing_weights(x)
-        )  # [B, n, m], [B, m, n], [B, n, n]
+        write_out, read_in, stream_mixing = self.compute_mixing_weights(x)
+        # [B*, n, m], [B*, m, n], [B*, n, n]
 
-        # Read in from the hyperconnection space
-        x_read_in = einsum(
-            read_in_matrix, x, "b m n, b n d -> b m d"
-        )  # [B, m, block_size]
+        # Read in from the over-width space to backbone width
+        x_read_in = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
-        #  process the read-in information through the module.
+        # Process through the backbone module
         out = self.module(x_read_in.reshape(B, -1), **kwargs)
 
-        # write out to the hyperconnection space
-        out = out.reshape(B, self.m, self.block_size)  # [B, m, block_size]
-        out = einsum(
-            write_out_matrix, out, "b n m, b m d -> b n d"
-        )  # [B, n, block_size]
+        # Write out from backbone width back to the over-width space
+        out = out.reshape(B, self.m, self.block_size)  # [B*, m, block_size]
+        out = einsum(write_out, out, "b n m, b m d -> b n d")  # [B*, n, block_size]
 
-        # mix the original hyperconnection space.
-        x = einsum(
-            stream_mixing_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-        )  # [B, n, block_size]
-        out = out + x  # [B, n, block_size]
-        return out.reshape(B, -1)
+        # Mix within the over-width space and add residual
+        x = einsum(stream_mixing, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
+        out = out + x  # [B*, n, block_size]
+        return out.reshape(shape)
