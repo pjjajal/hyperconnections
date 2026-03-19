@@ -220,7 +220,7 @@ class ContinuousGenHyperConnections(nn.Module):
         x_read = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
         # Process through the backbone module
-        out = self.module(x_read.reshape(B, -1), **kwargs)
+        out = self.module(x_read.reshape(*shape[:-1], self.embed_dim), **kwargs)
 
         # Write out from backbone width back to the over-width space
         out = out.reshape(B, self.m, self.block_size)
