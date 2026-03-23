@@ -214,6 +214,8 @@ class ContinuousGenHyperConnections(nn.Module):
         B = x.shape[0]
 
         write_out, read_in = self.compute_read_write_weights(x)
+        write_out = write_out.to(x.dtype)
+        read_in = read_in.to(x.dtype)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
         # Read in from over-width space to backbone width
@@ -229,9 +231,12 @@ class ContinuousGenHyperConnections(nn.Module):
         ### Steam Mixing
         # Mixing: X_new_mix = Phi @ X  (or protected variant)
         transition_matrix = self.compute_transition(x)  # [B, n, n]
+        transition_matrix = transition_matrix.to(x.dtype)
 
         # compute projection direction for projected mixing
         projection_dir = self.compute_projection(x) # [B, n] or None
+        if projection_dir is not None:
+            projection_dir = projection_dir.to(x.dtype)
 
         if projection_dir is None:
             x_mixed = einsum(transition_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]

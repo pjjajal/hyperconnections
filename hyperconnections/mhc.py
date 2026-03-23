@@ -126,6 +126,9 @@ class ManifoldHyperConnections(nn.Module):
         B = x.shape[0]
 
         write_out, read_in, stream_mixing = self.compute_mixing_weights(x)
+        write_out = write_out.to(x.dtype)
+        read_in = read_in.to(x.dtype)
+        stream_mixing = stream_mixing.to(x.dtype)
         # [B*, n, m], [B*, m, n], [B*, n, n]
 
         # Read in from the over-width space to backbone width
