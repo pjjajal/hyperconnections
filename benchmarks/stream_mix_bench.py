@@ -254,6 +254,7 @@ def run_correctness(
     ns: Sequence[int],
     ms: Sequence[int],
     embed_dims: Sequence[int],
+    bs: Sequence[int],
     dtypes: Sequence[str],
 ):
     """Run forward + backward correctness checks and print a summary table."""
@@ -267,7 +268,7 @@ def run_correctness(
     # D = embed_dim // m; deduplicate so the table stays concise
     # (correctness only depends on D, not on how it was derived from m)
     D_vals = _derive_D_vals(ms, embed_dims)
-    configs = list(product([32, 256, 1024], ns, D_vals))
+    configs = list(product(bs, ns, D_vals))
     configs += [(4, ns[0], 100)]   # non-power-of-2 D to test masking
 
     all_passed = True
@@ -295,7 +296,7 @@ def run_correctness(
     print(_CORR_SEP)
 
     struct_D_vals = _derive_D_vals(ms, embed_dims)
-    struct_configs = list(product([128, 1024], ns, struct_D_vals))
+    struct_configs = list(product(bs, ns, struct_D_vals))
     dtype = torch.float32
     atol_f, atol_b = 1e-3, 2e-3
 
@@ -358,6 +359,7 @@ def run_perf(
     ns: Sequence[int],
     ms: Sequence[int],
     embed_dims: Sequence[int],
+    bs: Sequence[int],
     dtypes: Sequence[str],
     warmup: int = 25,
     rep: int = 200,
@@ -370,14 +372,11 @@ def run_perf(
     print(_PERF_HDR)
     print(_PERF_SEP)
 
-    # Realistic CGHC configurations: B × N × (m, embed_dim) → D = embed_dim // m
-    B_vals = [64, 512, 2048, 8192]
-
     for dtype_name in dtypes:
         dtype = _dtype(dtype_name)
         elem  = torch.finfo(dtype).bits // 8
 
-        for N, B, m, embed_dim in product(ns, B_vals, ms, embed_dims):
+        for N, B, m, embed_dim in product(ns, bs, ms, embed_dims):
             if embed_dim % m != 0:
                 continue
             D = embed_dim // m
@@ -438,6 +437,7 @@ def run_structured_perf(
     ns: Sequence[int],
     ms: Sequence[int],
     embed_dims: Sequence[int],
+    bs: Sequence[int],
     dtypes: Sequence[str],
     warmup: int = 25,
     rep: int = 200,
@@ -455,16 +455,13 @@ def run_structured_perf(
     print(_SPHDR)
     print(_SPSEP)
 
-    # Representative configs — one per (N, B, m, embed_dim) combination
-    B_vals = [512, 2048, 8192]
-
     phi_types = list(_PHI_FACTORIES.keys())   # random, skew_sym, psd, diagonal
 
     for dtype_name in dtypes:
         dtype = _dtype(dtype_name)
         elem  = torch.finfo(dtype).bits // 8
 
-        for N, B, m, embed_dim in product(ns, B_vals, ms, embed_dims):
+        for N, B, m, embed_dim in product(ns, bs, ms, embed_dims):
             if embed_dim % m != 0:
                 continue
             D = embed_dim // m
@@ -542,6 +539,10 @@ def main():
         metavar="M", help="m values (modules per HC layer, default: 1 4)",
     )
     parser.add_argument(
+        "--b", type=int, nargs="+", default=[64, 512, 2048],
+        metavar="B", help="batch size values, shared across correctness and perf (default: 64 512 2048)",
+    )
+    parser.add_argument(
         "--embed_dim", type=int, nargs="+", default=[128, 256, 512],
         metavar="E",
         help="embed_dim values; D = embed_dim // m (default: 128 256 512)",
@@ -569,17 +570,18 @@ def main():
     print(f"\nDevice     : {dev}")
     print(f"N vals     : {args.n}")
     print(f"m vals     : {args.m}")
+    print(f"B vals     : {args.b}")
     print(f"embed_dims : {args.embed_dim}")
     print(f"dtypes     : {args.dtype}")
 
     passed = True
     if args.mode in ("correctness", "all"):
-        passed = run_correctness(args.n, args.m, args.embed_dim, args.dtype)
+        passed = run_correctness(args.n, args.m, args.embed_dim, args.b, args.dtype)
 
     if args.mode in ("perf", "all"):
-        run_perf(args.n, args.m, args.embed_dim, args.dtype,
+        run_perf(args.n, args.m, args.embed_dim, args.b, args.dtype,
                  warmup=args.warmup, rep=args.rep)
-        run_structured_perf(args.n, args.m, args.embed_dim, args.dtype,
+        run_structured_perf(args.n, args.m, args.embed_dim, args.b, args.dtype,
                             warmup=args.warmup, rep=args.rep)
 
     if args.mode in ("correctness", "all") and not passed:
