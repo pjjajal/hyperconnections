@@ -245,7 +245,17 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     return all_passed
 
 
-def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
+def _derive_D_vals(ms: Sequence[int], embed_dims: Sequence[int]) -> list[int]:
+    """Return sorted unique D = embed_dim // m values for valid (m, embed_dim) pairs."""
+    return sorted({e // m for m, e in product(ms, embed_dims) if e % m == 0})
+
+
+def run_correctness(
+    ns: Sequence[int],
+    ms: Sequence[int],
+    embed_dims: Sequence[int],
+    dtypes: Sequence[str],
+):
     """Run forward + backward correctness checks and print a summary table."""
     print()
     print(bold("=" * 90))
@@ -254,11 +264,10 @@ def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
     print(_CORR_HDR)
     print(_CORR_SEP)
 
-    configs = list(product(
-        [32, 256, 1024],   # B
-        ns,                # N
-        [64, 128, 256],    # D
-    ))
+    # D = embed_dim // m; deduplicate so the table stays concise
+    # (correctness only depends on D, not on how it was derived from m)
+    D_vals = _derive_D_vals(ms, embed_dims)
+    configs = list(product([32, 256, 1024], ns, D_vals))
     configs += [(4, ns[0], 100)]   # non-power-of-2 D to test masking
 
     all_passed = True
@@ -285,7 +294,8 @@ def run_correctness(ns: Sequence[int], dtypes: Sequence[str]):
     print(_CORR_HDR)
     print(_CORR_SEP)
 
-    struct_configs = list(product([128, 1024], ns, [64, 256]))
+    struct_D_vals = _derive_D_vals(ms, embed_dims)
+    struct_configs = list(product([128, 1024], ns, struct_D_vals))
     dtype = torch.float32
     atol_f, atol_b = 1e-3, 2e-3
 
@@ -344,27 +354,36 @@ def _perf_row(config, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs):
     )
 
 
-def run_perf(ns: Sequence[int], dtypes: Sequence[str], warmup: int = 25, rep: int = 200):
+def run_perf(
+    ns: Sequence[int],
+    ms: Sequence[int],
+    embed_dims: Sequence[int],
+    dtypes: Sequence[str],
+    warmup: int = 25,
+    rep: int = 200,
+):
     """Benchmark Triton kernel vs PyTorch bmm+add reference."""
     print()
-    print(bold("=" * 100))
+    print(bold("=" * 120))
     print(bold("  PERFORMANCE"))
-    print(bold("=" * 100))
+    print(bold("=" * 120))
     print(_PERF_HDR)
     print(_PERF_SEP)
 
-    # Realistic CGHC configurations
+    # Realistic CGHC configurations: B × N × (m, embed_dim) → D = embed_dim // m
     B_vals = [64, 512, 2048, 8192]
-    D_vals = [64, 128, 256, 512]
 
     for dtype_name in dtypes:
         dtype = _dtype(dtype_name)
         elem  = torch.finfo(dtype).bits // 8
 
-        for N, B, D in product(ns, B_vals, D_vals):
+        for N, B, m, embed_dim in product(ns, B_vals, ms, embed_dims):
+            if embed_dim % m != 0:
+                continue
+            D = embed_dim // m
             Phi, x, Y = _make(B, N, D, dtype)
             v = _make_v(B, N, dtype)
-            cfg_str = f"B={B} N={N} D={D}"
+            cfg_str = f"B={B} N={N} m={m} D={D}"
 
             # ---- no-proj ----
             t_tri = triton.testing.do_bench(
@@ -417,6 +436,8 @@ _SPSEP = "-" * 125
 
 def run_structured_perf(
     ns: Sequence[int],
+    ms: Sequence[int],
+    embed_dims: Sequence[int],
     dtypes: Sequence[str],
     warmup: int = 25,
     rep: int = 200,
@@ -428,15 +449,14 @@ def run_structured_perf(
       overhead of loading the full Phi matrix in the Triton kernel.
     """
     print()
-    print(bold("=" * 110))
+    print(bold("=" * 125))
     print(bold("  STRUCTURED-MATRIX PERFORMANCE"))
-    print(bold("=" * 110))
+    print(bold("=" * 125))
     print(_SPHDR)
     print(_SPSEP)
 
-    # Representative configs — one per (N, B, D) combination
+    # Representative configs — one per (N, B, m, embed_dim) combination
     B_vals = [512, 2048, 8192]
-    D_vals = [128, 512]
 
     phi_types = list(_PHI_FACTORIES.keys())   # random, skew_sym, psd, diagonal
 
@@ -444,10 +464,13 @@ def run_structured_perf(
         dtype = _dtype(dtype_name)
         elem  = torch.finfo(dtype).bits // 8
 
-        for N, B, D in product(ns, B_vals, D_vals):
+        for N, B, m, embed_dim in product(ns, B_vals, ms, embed_dims):
+            if embed_dim % m != 0:
+                continue
+            D = embed_dim // m
             _, x, Y = _make(B, N, D, dtype, seed=0)
             v = _make_v(B, N, dtype)
-            cfg_str = f"B={B} N={N} D={D}"
+            cfg_str = f"B={B} N={N} m={m} D={D}"
 
             for phi_type in phi_types:
                 Phi = _PHI_FACTORIES[phi_type](B, N, dtype).contiguous()
@@ -515,6 +538,15 @@ def main():
         metavar="N", help="N_STREAMS values to benchmark (default: 4 8 16)",
     )
     parser.add_argument(
+        "--m", type=int, nargs="+", default=[1, 4],
+        metavar="M", help="m values (modules per HC layer, default: 1 4)",
+    )
+    parser.add_argument(
+        "--embed_dim", type=int, nargs="+", default=[128, 256, 512],
+        metavar="E",
+        help="embed_dim values; D = embed_dim // m (default: 128 256 512)",
+    )
+    parser.add_argument(
         "--dtype", choices=["fp32", "fp16", "bf16"], nargs="+",
         default=["fp32", "fp16"], metavar="DTYPE",
         help="dtypes to test (default: fp32 fp16)",
@@ -534,17 +566,21 @@ def main():
         sys.exit(1)
 
     dev = torch.cuda.get_device_name(0)
-    print(f"\nDevice : {dev}")
-    print(f"N vals : {args.n}")
-    print(f"dtypes : {args.dtype}")
+    print(f"\nDevice     : {dev}")
+    print(f"N vals     : {args.n}")
+    print(f"m vals     : {args.m}")
+    print(f"embed_dims : {args.embed_dim}")
+    print(f"dtypes     : {args.dtype}")
 
     passed = True
     if args.mode in ("correctness", "all"):
-        passed = run_correctness(args.n, args.dtype)
+        passed = run_correctness(args.n, args.m, args.embed_dim, args.dtype)
 
     if args.mode in ("perf", "all"):
-        run_perf(args.n, args.dtype, warmup=args.warmup, rep=args.rep)
-        run_structured_perf(args.n, args.dtype, warmup=args.warmup, rep=args.rep)
+        run_perf(args.n, args.m, args.embed_dim, args.dtype,
+                 warmup=args.warmup, rep=args.rep)
+        run_structured_perf(args.n, args.m, args.embed_dim, args.dtype,
+                            warmup=args.warmup, rep=args.rep)
 
     if args.mode in ("correctness", "all") and not passed:
         sys.exit(1)
