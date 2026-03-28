@@ -156,8 +156,8 @@ class ContinuousGenHyperConnections(nn.Module):
         Dynamic deltas are zero-init so A starts from the static base alone.
         """
         B = x.shape[0]
-        x_norm = self.norm(x.view(B, -1)).float()  # [B, input_dim], float32 for linear stability
-        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=torch.float32)  # float32 to match x_norm computations
+        x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
+        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)  # match input dtype
 
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
@@ -182,7 +182,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """Compute dynamic read/write weights from the current stream state."""
         B = x.shape[0]
         x_flat = x.view(B, -1)  # [B, input_dim]
-        x_norm = self.norm(x_flat).float()  # float32 for linear layers under torch.compile
+        x_norm = self.norm(x_flat)  # [B, input_dim]
 
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
         h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
@@ -202,7 +202,7 @@ class ContinuousGenHyperConnections(nn.Module):
         elif self.projection == "v":
             B = x.shape[0]
             x_flat = x.view(B, -1)
-            v = self.projection_dir(self.norm(x_flat).float())  # [B, n]
+            v = self.projection_dir(self.norm(x_flat))  # [B, n]
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None
@@ -214,8 +214,6 @@ class ContinuousGenHyperConnections(nn.Module):
         B = x.shape[0]
 
         write_out, read_in = self.compute_read_write_weights(x)
-        write_out = write_out.to(x.dtype)
-        read_in = read_in.to(x.dtype)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
         # Read in from over-width space to backbone width
@@ -231,12 +229,9 @@ class ContinuousGenHyperConnections(nn.Module):
         ### Steam Mixing
         # Mixing: X_new_mix = Phi @ X  (or protected variant)
         transition_matrix = self.compute_transition(x)  # [B, n, n]
-        transition_matrix = transition_matrix.to(x.dtype)
 
         # compute projection direction for projected mixing
         projection_dir = self.compute_projection(x) # [B, n] or None
-        if projection_dir is not None:
-            projection_dir = projection_dir.to(x.dtype)
 
         if projection_dir is None:
             x_mixed = einsum(transition_matrix, x, "b n1 n2, b n2 d -> b n1 d")  # [B*, n, block_size]
