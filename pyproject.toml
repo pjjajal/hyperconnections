@@ -9,7 +9,6 @@ dependencies = [
     "einops",
     "timm",
     "treescope"
-    
 ]
 
 [build-system]
