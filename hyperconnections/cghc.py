@@ -193,7 +193,8 @@ class ContinuousGenHyperConnections(nn.Module):
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         dt = torch.clamp(self.log_dt.exp(), self.dt_min, self.dt_max)
-        return torch.linalg.matrix_exp(dt * self.compute_generator(x))
+        A = self.compute_generator(x)
+        return torch.linalg.matrix_exp((dt * A).float()).to(A.dtype)
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
