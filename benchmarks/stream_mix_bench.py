@@ -34,6 +34,8 @@ import triton.testing
 
 from hyperconnections.ops.stream_mix import stream_mix_add
 
+torch.set_float32_matmul_precision("high")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
