@@ -65,6 +65,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.dt_max = dt_max
         log_dt_init = math.log(dt)
         self.log_dt = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
+        self.dt_proj = nn.Linear(input_dim, 1, bias=True)
 
         # Generator parameters — boolean flags drive which components are created
         conserv = generator_type in {
@@ -137,6 +138,10 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.laplacian_k.weight)
             nn.init.zeros_(self.laplacian_k.bias)
 
+        # dt_proj: zero so initial dt comes entirely from log_dt
+        nn.init.zeros_(self.dt_proj.weight)
+        nn.init.zeros_(self.dt_proj.bias)
+
         # Projections: zero so initial behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
             nn.init.zeros_(proj.weight)
@@ -147,14 +152,15 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.projection_dir.weight)
             nn.init.ones_(self.projection_dir.bias)
 
-    def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
-        """Return A of shape [B, n, n].
+    def compute_generator(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (A, dt) where A has shape [B, n, n] and dt has shape [B].
 
         Each component adds independently to A:
           - conservative:  skew-sym S = (M - M^T),  M = conserv_A + conv_pred(x)
           - psd_diss:      negative PSD K = -R R^T,  R = diss_A + diss_pred(x)
           - diag_diss:     negative diagonal -diag(d),  d = softplus(diss_diag + diss_pred(x))
         Dynamic deltas are zero-init so A starts from the static base alone.
+        dt = exp(log_dt) + softplus(dt_proj(x)), clamped to [dt_min, dt_max].
         """
         B = x.shape[0]
         if hasattr(self, "laplacian_A"):
@@ -188,13 +194,15 @@ class ContinuousGenHyperConnections(nn.Module):
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency
             A = A - laplacian
-        return A
+
+        dt = self.log_dt.exp() + F.softplus(self.dt_proj(x_norm).squeeze(-1))  # [B]
+        dt = torch.clamp(dt, self.dt_min, self.dt_max)  # [B]
+        return A, dt
 
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
-        dt = torch.clamp(self.log_dt.exp(), self.dt_min, self.dt_max)
-        A = self.compute_generator(x)
-        return torch.linalg.matrix_exp((dt * A).float()).to(x.dtype)
+        A, dt = self.compute_generator(x)
+        return torch.linalg.matrix_exp((dt[:, None, None] * A).float()).to(x.dtype)
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
