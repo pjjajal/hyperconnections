@@ -394,7 +394,7 @@ class _StreamMixFn(torch.autograd.Function):
 # Public API
 # ---------------------------------------------------------------------------
 
-def stream_mix_add(
+def stream_mix_add_small_n(
     Phi: torch.Tensor,
     x: torch.Tensor,
     Y: torch.Tensor,
