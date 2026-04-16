@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
 
+from hyperconnections.ops import stream_mix_add
+
 
 class ContinuousGenHyperConnections(nn.Module):
     def __init__(
@@ -32,6 +34,7 @@ class ContinuousGenHyperConnections(nn.Module):
         dt_max: float = 1.0,
         bias: bool = False,
         elementwise_affine: bool = False,
+        use_triton: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -106,7 +109,11 @@ class ContinuousGenHyperConnections(nn.Module):
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
+        self._stream_mix = (
+            self._stream_mix_triton if use_triton else self._stream_mix_eager
+        )
         self.init_weights()
+
 
     def init_weights(self):
         # read_in: σ(bias) = 1/n  →  bias = log(1/(n-1))
@@ -199,10 +206,12 @@ class ContinuousGenHyperConnections(nn.Module):
         dt = torch.clamp(dt, self.dt_min, self.dt_max)  # [B]
         return A, dt
 
+
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         A, dt = self.compute_generator(x)
         return torch.linalg.matrix_exp((dt[:, None, None] * A).float()).to(x.dtype)
+
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
@@ -233,32 +242,26 @@ class ContinuousGenHyperConnections(nn.Module):
         else:
             return None
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        # x: [B, *, input_dim]
-        leading = x.shape[:-1]
-        x = x.reshape(-1, self.n, self.block_size)  # [B*, n, block_size]
-        B = x.shape[0]
 
-        write_out, read_in = self.compute_read_write_weights(x)
+    def _stream_mix_triton(
+        self,
+        x: torch.Tensor,
+        transition_matrix: torch.Tensor,
+        Y: torch.Tensor,
+        projection_dir: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if projection_dir is not None:
+            projection_dir = projection_dir.expand(x.shape[0], -1) ### [1, N] ("mean" mode) --> [B, N]
+        return stream_mix_add(transition_matrix, x, Y, projection_dir)
 
-        ### Source term Y = H^post F(H^pre X)  (read → compute → write)
-        # Read in from over-width space to backbone width
-        x_read = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
-        # Process through the backbone module
-        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
-
-        # Write out from backbone width back to the over-width space
-        out = out.reshape(B, self.m, self.block_size)
-        Y = einsum(write_out, out, "b n m, b m d -> b n d")  # [B*, n, block_size]
-
-        ### Steam Mixing
-        # Mixing: X_new_mix = Phi @ X  (or protected variant)
-        transition_matrix = self.compute_transition(x)  # [B, n, n]
-
-        # compute projection direction for projected mixing
-        projection_dir = self.compute_projection(x)  # [B, n] or None
-
+    def _stream_mix_eager(
+        self,
+        x: torch.Tensor,
+        transition_matrix: torch.Tensor,
+        Y: torch.Tensor,
+        projection_dir: torch.Tensor | None,
+    ) -> torch.Tensor:
         if projection_dir is None:
             x_mixed = einsum(
                 transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
@@ -279,5 +282,60 @@ class ContinuousGenHyperConnections(nn.Module):
             x_mixed = x_proj + einsum(
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
             )  # [B*, n, block_size]
+        return (x_mixed + Y)
 
-        return (x_mixed + Y).unflatten(0, leading).flatten(-2)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        ### x: [B, *, input_dim]
+        leading = x.shape[:-1]
+        x = x.reshape(-1, self.n, self.block_size) ### [B*, n, block_size]
+        B = x.shape[0]
+
+        write_out, read_in = self.compute_read_write_weights(x)
+
+        ### Source term Y = H^post F(H^pre X)  (read → compute → write)
+        ### Read in from over-width space to backbone width
+        x_read = einsum(read_in, x, "b m n, b n d -> b m d") ### [B*, m, block_size]
+
+        ### Process through the backbone module
+        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
+
+        ### Write out from backbone width back to the over-width space
+        out = out.reshape(B, self.m, self.block_size)
+        Y = einsum(write_out, out, "b n m, b m d -> b n d") ### [B*, n, block_size]
+
+        ### Steam Mixing
+        ### Mixing: X_new_mix = Phi @ X  (or protected variant)
+        transition_matrix = self.compute_transition(x) ### [B, n, n]
+
+        ### compute projection direction for projected mixing
+        projection_dir = self.compute_projection(x) ### [B, n] or None
+
+        # if projection_dir is None:
+        #     x_mixed = einsum(
+        #         transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+        #     )  # [B*, n, block_size]
+        # else:
+        #     proj_matrix = einsum(
+        #         projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
+        #     )  # [b, n, n]
+        #     orthogonal_proj = (
+        #         torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
+        #     )  # [b, n, n]
+        #     x_proj = einsum(
+        #         proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+        #     )  # [b, n, block_size]
+        #     x_orth = einsum(
+        #         orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
+        #     )  # [b, n, block_size]
+        #     x_mixed = x_proj + einsum(
+        #         transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
+        #     )  # [B*, n, block_size]
+        # return (x_mixed + Y).unflatten(0, leading).flatten(-2)
+
+        return self._stream_mix(
+            x=x,
+            transition_matrix=transition_matrix,
+            Y=Y,
+            projection_dir=projection_dir,
+        ).unflatten(0, leading).flatten(-2)
