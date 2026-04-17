@@ -202,7 +202,8 @@ class ContinuousGenHyperConnections(nn.Module):
             laplacian = degree - adjacency
             A = A - laplacian
 
-        dt = self.log_dt.exp() + F.softplus(self.dt_proj(x_norm).squeeze(-1))  # [B]
+        dynamic_dt = F.softplus(self.dt_proj(x_norm).squeeze(-1)) - math.log(2)  # [B]
+        dt = self.log_dt.exp() + dynamic_dt  # [B]
         dt = torch.clamp(dt, self.dt_min, self.dt_max)  # [B]
         return A, dt
 
