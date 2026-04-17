@@ -67,8 +67,10 @@ class ContinuousGenHyperConnections(nn.Module):
         self.dt_min = dt_min
         self.dt_max = dt_max
         log_dt_init = math.log(dt)
-        self.log_dt = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
-        self.dt_proj = nn.Linear(input_dim, 1, bias=True)
+        self.log_dt_conserv = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
+        self.log_dt_diss = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
+        self.dt_proj_conserv = nn.Linear(input_dim, 1, bias=True)
+        self.dt_proj_diss = nn.Linear(input_dim, 1, bias=True)
 
         # Generator parameters — boolean flags drive which components are created
         conserv = generator_type in {
@@ -146,8 +148,10 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.laplacian_k.bias)
 
         # dt_proj: zero so initial dt comes entirely from log_dt
-        nn.init.zeros_(self.dt_proj.weight)
-        nn.init.zeros_(self.dt_proj.bias)
+        nn.init.zeros_(self.dt_proj_conserv.weight)
+        nn.init.zeros_(self.dt_proj_conserv.bias)
+        nn.init.zeros_(self.dt_proj_diss.weight)
+        nn.init.zeros_(self.dt_proj_diss.bias)
 
         # Projections: zero so initial behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
@@ -179,15 +183,23 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
-            A = A + (M - M.transpose(-1, -2))  # skew-symmetric
+            dynamic_dt = F.softplus(self.dt_proj_conserv(x_norm).squeeze(-1)) - math.log(2)  # [B]
+            dt_conserv = self.log_dt_conserv.exp() + dynamic_dt  # [B]
+            dt_conserv = torch.clamp(dt_conserv, self.dt_min, self.dt_max)  # [B]
+            A = A + dt_conserv * (M - M.transpose(-1, -2))  # skew-symmetric
+
+        if hasattr(self, "diss_A") or hasattr(self, "diss_diag") or hasattr(self, "laplacian_A"):
+            dynamic_dt = F.softplus(self.dt_proj_diss(x_norm).squeeze(-1)) - math.log(2)  # [B]
+            dt_diss = self.log_dt_diss.exp() + dynamic_dt  # [B]
+            dt_diss = torch.clamp(dt_diss, self.dt_min, self.dt_max)  # [B]
 
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            A = A - R @ R.transpose(-1, -2)  # subtract PSD K
+            A = A - dt_diss * (R @ R.transpose(-1, -2))  # subtract PSD K
 
         if hasattr(self, "diss_diag"):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            A = A - torch.diag_embed(d)
+            A = A - dt_diss * torch.diag_embed(d)
 
         if hasattr(self, "laplacian_A"):
             score_bias = self.laplacian_A
@@ -200,18 +212,14 @@ class ContinuousGenHyperConnections(nn.Module):
             adjacency = adjacency - torch.diag_embed(torch.diagonal(adjacency, dim1=-2, dim2=-1))
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency
-            A = A - laplacian
-
-        dynamic_dt = F.softplus(self.dt_proj(x_norm).squeeze(-1)) - math.log(2)  # [B]
-        dt = self.log_dt.exp() + dynamic_dt  # [B]
-        dt = torch.clamp(dt, self.dt_min, self.dt_max)  # [B]
-        return A, dt
+            A = A - dt_diss * laplacian
+        return A
 
 
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
-        A, dt = self.compute_generator(x)
-        return torch.linalg.matrix_exp((dt[:, None, None] * A).float()).to(x.dtype)
+        A = self.compute_generator(x)
+        return torch.linalg.matrix_exp(A.float()).to(x.dtype)
 
 
     def compute_read_write_weights(self, x: torch.Tensor):
