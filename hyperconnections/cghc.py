@@ -186,7 +186,7 @@ class ContinuousGenHyperConnections(nn.Module):
             dynamic_dt = F.softplus(self.dt_proj_conserv(x_norm).squeeze(-1)) - math.log(2)  # [B]
             dt_conserv = self.log_dt_conserv.exp() + dynamic_dt  # [B]
             dt_conserv = torch.clamp(dt_conserv, self.dt_min, self.dt_max)  # [B]
-            A = A + dt_conserv * (M - M.transpose(-1, -2))  # skew-symmetric
+            A = A + dt_conserv.view(B, 1, 1) * (M - M.transpose(-1, -2))  # skew-symmetric
 
         if hasattr(self, "diss_A") or hasattr(self, "diss_diag") or hasattr(self, "laplacian_A"):
             dynamic_dt = F.softplus(self.dt_proj_diss(x_norm).squeeze(-1)) - math.log(2)  # [B]
@@ -195,11 +195,11 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            A = A - dt_diss * (R @ R.transpose(-1, -2))  # subtract PSD K
+            A = A - dt_diss.view(B, 1, 1) * (R @ R.transpose(-1, -2))  # subtract PSD K
 
         if hasattr(self, "diss_diag"):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            A = A - dt_diss * torch.diag_embed(d)
+            A = A - dt_diss.view(B, 1, 1) * torch.diag_embed(d)
 
         if hasattr(self, "laplacian_A"):
             score_bias = self.laplacian_A
@@ -212,7 +212,7 @@ class ContinuousGenHyperConnections(nn.Module):
             adjacency = adjacency - torch.diag_embed(torch.diagonal(adjacency, dim1=-2, dim2=-1))
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency
-            A = A - dt_diss * laplacian
+            A = A - dt_diss.view(B, 1, 1) * laplacian
         return A
 
 
