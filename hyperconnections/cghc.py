@@ -180,6 +180,10 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(proj.weight, std=0.01)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
+        
+        # mean projection: set to mean direction so initial projection has no effect and dynamic variation starts around mean behaviour
+        if self.projection == "mean":                                           
+                self.projection_dir.fill_(1.0 / math.sqrt(self.n))
         # proj_v: small random weight + scaled ones bias → starts near mean direction with input-dependent variation
         if self.projection == "v":
             trunc_normal_(self.projection_dir.weight, std=0.01)
