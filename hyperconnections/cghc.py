@@ -97,7 +97,7 @@ class ContinuousGenHyperConnections(nn.Module):
             self.diss_pred = nn.Linear(input_dim, n * n, bias=True)
         if diag_diss:
             # Diagonal dissipation: store only the diagonal entries for efficiency
-            # Initialise so softplus(diss_diag) ≈ 0.007 → Phi ≈ I at start
+            # Initialised to -2.0 in init_weights, giving softplus(-2.0) ≈ 0.127
             self.diss_diag = nn.Parameter(torch.full((n,), -5.0, requires_grad=True))
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
         if laplacian:
@@ -169,20 +169,20 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(self.log_dt_conserv, self.log_dt_init)
         nn.init.constant_(self.log_dt_diss, self.log_dt_init)
 
-        # dt_proj: zero so initial dt comes entirely from log_dt
-        nn.init.zeros_(self.dt_proj_conserv.weight)
+        # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
+        trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
         nn.init.zeros_(self.dt_proj_conserv.bias)
-        nn.init.zeros_(self.dt_proj_diss.weight)
+        trunc_normal_(self.dt_proj_diss.weight, std=0.01)
         nn.init.zeros_(self.dt_proj_diss.bias)
 
-        # Projections: zero so initial behaviour matches static biases
+        # Projections: small random init for weights, zero bias so initial mean behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
-            nn.init.zeros_(proj.weight)
+            trunc_normal_(proj.weight, std=0.01)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
-        # proj_v: zero weight + ones bias → normalise(ones) = 1/√n · 1 (mean direction)
+        # proj_v: small random weight + scaled ones bias → starts near mean direction with input-dependent variation
         if self.projection == "v":
-            nn.init.zeros_(self.projection_dir.weight)
+            trunc_normal_(self.projection_dir.weight, std=0.01)
             nn.init.ones_(self.projection_dir.bias)
             self.projection_dir.bias.data /= math.sqrt(self.n)
 
@@ -203,8 +203,8 @@ class ContinuousGenHyperConnections(nn.Module):
           - conservative:  skew-sym S = (M - M^T),  M = conserv_A + conv_pred(x)
           - psd_diss:      negative PSD K = -R R^T,  R = diss_A + diss_pred(x)
           - diag_diss:     negative diagonal -diag(d),  d = softplus(diss_diag + diss_pred(x))
-        Dynamic deltas are zero-init so A starts from the static base alone.
-        dt = exp(log_dt) + softplus(dt_proj(x)), clamped to [dt_min, dt_max].
+        Dynamic prediction weights use trunc_normal(std=0.01) with zero bias for input-dependent variation.
+        dt = exp(log_dt) + softplus(dt_proj(x)) - log(2), clamped to [dt_min, dt_max].
         """
         B = x.shape[0]
         if hasattr(self, "laplacian_A"):
