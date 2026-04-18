@@ -128,31 +128,42 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(self.alpha_read_in, 0.01)
         nn.init.constant_(self.alpha_write_out, 0.01)
 
-        # Generator Dynamic Parameters
+        # Generator Static Parameters
         if hasattr(self, "conserv_A"):
+            nn.init.eye_(self.conserv_A)
+            # Small asymmetry so skew-sym part is non-zero at init
+            with torch.no_grad():
+                self.conserv_A.add_(torch.randn_like(self.conserv_A) * 0.01)
+
+        if hasattr(self, "diss_A"):
+            nn.init.zeros_(self.diss_A)
+
+        if hasattr(self, "diss_diag"):
+            nn.init.constant_(self.diss_diag, -5.0)
+
+        if hasattr(self, "laplacian_A"):
+            nn.init.zeros_(self.laplacian_A)
+
+        # Generator Dynamic Parameters
+        if hasattr(self, "conv_pred"):
             nn.init.zeros_(self.conv_pred.weight)
             nn.init.zeros_(self.conv_pred.bias)
 
-        if hasattr(self, "diss_A"):
+        if hasattr(self, "diss_pred"):
             nn.init.zeros_(self.diss_pred.weight)
             nn.init.zeros_(self.diss_pred.bias)
 
-        if hasattr(self, "diss_diag"):
-            nn.init.zeros_(self.diss_pred.weight)
-            nn.init.zeros_(self.diss_pred.bias)
-        
-        if hasattr(self, "laplacian_A"):
-            nn.init.zeros_(self.laplacian_A)
+        if hasattr(self, "laplacian_q"):
             nn.init.zeros_(self.laplacian_q.weight)
             nn.init.zeros_(self.laplacian_q.bias)
             nn.init.zeros_(self.laplacian_k.weight)
             nn.init.zeros_(self.laplacian_k.bias)
 
-        
+
         # log_dt: set so initial dt matches the provided value
         nn.init.constant_(self.log_dt_conserv, self.log_dt_init)
         nn.init.constant_(self.log_dt_diss, self.log_dt_init)
-        
+
         # dt_proj: zero so initial dt comes entirely from log_dt
         nn.init.zeros_(self.dt_proj_conserv.weight)
         nn.init.zeros_(self.dt_proj_conserv.bias)
@@ -168,6 +179,12 @@ class ContinuousGenHyperConnections(nn.Module):
         if self.projection == "v":
             nn.init.zeros_(self.projection_dir.weight)
             nn.init.ones_(self.projection_dir.bias)
+
+        # RMSNorm weights: must be ones for proper normalization
+        if hasattr(self.norm, "weight") and self.norm.weight is not None:
+            nn.init.ones_(self.norm.weight)
+        if hasattr(self, "norm_lap") and hasattr(self.norm_lap, "weight") and self.norm_lap.weight is not None:
+            nn.init.ones_(self.norm_lap.weight)
 
     def compute_generator(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (A, dt) where A has shape [B, n, n] and dt has shape [B].
