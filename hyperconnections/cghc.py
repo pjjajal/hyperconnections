@@ -66,6 +66,7 @@ class ContinuousGenHyperConnections(nn.Module):
         assert dt > 0, "Initial dt must be positive"
         self.dt_min = dt_min
         self.dt_max = dt_max
+        self.log_dt_init = math.log(dt)
         log_dt_init = math.log(dt)
         self.log_dt_conserv = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
         self.log_dt_diss = nn.Parameter(torch.tensor(log_dt_init), requires_grad=learn_dt)
@@ -147,6 +148,11 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.laplacian_k.weight)
             nn.init.zeros_(self.laplacian_k.bias)
 
+        
+        # log_dt: set so initial dt matches the provided value
+        nn.init.constant_(self.log_dt_conserv, self.log_dt_init)
+        nn.init.constant_(self.log_dt_diss, self.log_dt_init)
+        
         # dt_proj: zero so initial dt comes entirely from log_dt
         nn.init.zeros_(self.dt_proj_conserv.weight)
         nn.init.zeros_(self.dt_proj_conserv.bias)
