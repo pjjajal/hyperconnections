@@ -102,9 +102,9 @@ class ContinuousGenHyperConnections(nn.Module):
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_q = nn.Linear(self.block_size, self.block_size, bias=True)
-            self.laplacian_k = nn.Linear(self.block_size, self.block_size, bias=True)
-            self.laplacian_scale = self.block_size**-0.5
+            self.laplacian_q = nn.Linear(self.block_size, self.block_size // 4, bias=True)
+            self.laplacian_k = nn.Linear(self.block_size, self.block_size // 4, bias=True)
+            self.laplacian_scale = (self.block_size // 4)**-0.5
             self.norm_lap = nn.RMSNorm(self.block_size, elementwise_affine=True)
 
         # Projection Direction
