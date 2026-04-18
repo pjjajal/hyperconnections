@@ -126,7 +126,8 @@ class ContinuousGenHyperConnections(nn.Module):
         # read_in: σ(bias) = 1/n  →  bias = log(1/(n-1))
         logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
         nn.init.constant_(self.read_in, logit_1_over_n)
-        self.read_in.add_(torch.randn_like(self.read_in) * 0.01)  # small noise for asymmetry breaking
+        with torch.no_grad():
+            self.read_in.add_(torch.randn_like(self.read_in) * 0.01)  # small noise for asymmetry breaking
         # write_out: 2·σ(0) = 1
         trunc_normal_(self.write_out, std=0.01)
         # Alpha gating: 0.01 so dynamic component starts negligible
@@ -186,8 +187,9 @@ class ContinuousGenHyperConnections(nn.Module):
         # small noise for asymmetry breaking so projection isn't exactly static at init, but normalised to keep initial scale consistent.
         if self.projection == "mean":                                           
                 self.projection_dir.fill_(1.0 / math.sqrt(self.n))
-                self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01) 
-                self.projection_dir.div_(self.projection_dir.norm())  
+                with torch.no_grad():
+                    self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01) 
+                    self.projection_dir.div_(self.projection_dir.norm())  
         # proj_v: small random weight + scaled ones bias → starts near mean direction with input-dependent variation
         if self.projection == "v":
             trunc_normal_(self.projection_dir.weight, std=0.01)
