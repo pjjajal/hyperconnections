@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.models.layers import trunc_normal_
 
-from hyperconnections.ops import stream_mix_add
+from hyperconnections.ops import stream_mix_add, expm_t18
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -275,7 +275,8 @@ class ContinuousGenHyperConnections(nn.Module):
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         A = self.compute_generator(x)
-        return torch.linalg.matrix_exp(A.float()).to(x.dtype)
+        return expm_t18(A).to(x.dtype)
+        # return torch.linalg.matrix_exp(A.float()).to(x.dtype)
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
