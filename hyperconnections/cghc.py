@@ -64,19 +64,20 @@ class ContinuousGenHyperConnections(nn.Module):
         self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
 
         # dt parameters
-        assert dt > 0, "Initial dt must be positive"
+        assert dt_min < dt < dt_max, (
+            f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
+        )
         self.dt_min = dt_min
         self.dt_max = dt_max
         self.log_dt_init = math.log(dt)
-        log_dt_init = math.log(dt)
         self.log_dt_conserv = nn.Parameter(
-            torch.tensor(log_dt_init), requires_grad=learn_dt
+            torch.empty(n), requires_grad=learn_dt
         )
         self.log_dt_diss = nn.Parameter(
-            torch.tensor(log_dt_init), requires_grad=learn_dt
+            torch.empty(n), requires_grad=learn_dt
         )
-        self.dt_proj_conserv = nn.Linear(input_dim, 1, bias=True)
-        self.dt_proj_diss = nn.Linear(input_dim, 1, bias=True)
+        self.dt_proj_conserv = nn.Linear(input_dim, self.n, bias=True)
+        self.dt_proj_diss = nn.Linear(input_dim, self.n, bias=True)
 
         # Generator parameters — boolean flags drive which components are created
         conserv = generator_type in {
@@ -167,9 +168,14 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(self.laplacian_k.weight, std=0.01)
             nn.init.zeros_(self.laplacian_k.bias)
 
-        # log_dt: set so initial dt matches the provided value
-        nn.init.constant_(self.log_dt_conserv, self.log_dt_init)
-        nn.init.constant_(self.log_dt_diss, self.log_dt_init)
+        # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
+        # log_dt is now a length-n vector; nn.init.constant_ broadcasts.
+        dt_init = math.exp(self.log_dt_init)
+        target = (dt_init - self.dt_min) / (self.dt_max - self.dt_min)
+        target = min(max(target, 1e-4), 1 - 1e-4)  # guard against endpoint singularities
+        bias_init = math.log(target / (1 - target))
+        nn.init.constant_(self.log_dt_conserv, bias_init)
+        nn.init.constant_(self.log_dt_diss, bias_init)
 
         # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
         trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
@@ -206,70 +212,76 @@ class ContinuousGenHyperConnections(nn.Module):
         ):
             nn.init.ones_(self.norm_lap.weight)
 
-    def compute_generator(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (A, dt) where A has shape [B, n, n] and dt has shape [B].
+    def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the effective generator A of shape [B, n, n].
 
-        Each component adds independently to A:
-          - conservative:  skew-sym S = (M - M^T),  M = conserv_A + conv_pred(x)
-          - psd_diss:      negative PSD K = -R R^T,  R = diss_A + diss_pred(x)
-          - diag_diss:     negative diagonal -diag(d),  d = softplus(diss_diag + diss_pred(x))
-        Dynamic prediction weights use trunc_normal(std=0.01) with zero bias for input-dependent variation.
-        dt = exp(log_dt) + softplus(dt_proj(x)) - log(2), clamped to [dt_min, dt_max].
+        The generator is built as a sum of conservative and dissipative components,
+        each applied as a symmetric congruence sandwich with a per-stream time scale:
+
+            A = D_S^{1/2} (S) D_S^{1/2}  -  D_Q^{1/2} (Q) D_Q^{1/2}
+
+        where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B, n]
+        and entries in (dt_min, dt_max). This preserves skew-symmetry of S and PSD-ness
+        of Q under the sandwich, so the Lyapunov stability argument carries through.
+
+        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d),
+        so no sqrt is needed.
         """
         B = x.shape[0]
         if hasattr(self, "laplacian_A"):
             x_lap_norm = self.norm_lap(x)
         x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
-        A = torch.zeros(
-            B, self.n, self.n, device=x.device, dtype=x.dtype
-        )  # match input dtype
+        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)
 
+        # --- Conservative branch ---
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
-            dynamic_dt = F.softplus(
-                self.dt_proj_conserv(x_norm).squeeze(-1)
-            ) - math.log(2)  # [B]
-            dt_conserv = self.log_dt_conserv.exp() + dynamic_dt  # [B]
-            dt_conserv = torch.clamp(dt_conserv, self.dt_min, self.dt_max)  # [B]
-            A = A + dt_conserv.view(B, 1, 1) * (
-                M - M.transpose(-1, -2)
-            )  # skew-symmetric
+            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
+            dt_conserv = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_conserv)
+            sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
+            skew = M - M.transpose(-1, -2)  # [B, n, n], skew-symmetric
+            # Symmetric sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
+            A = A + sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
 
+        # --- Shared dissipative dt ---
         if (
             hasattr(self, "diss_A")
             or hasattr(self, "diss_diag")
             or hasattr(self, "laplacian_A")
         ):
-            dynamic_dt = F.softplus(self.dt_proj_diss(x_norm).squeeze(-1)) - math.log(
-                2
-            )  # [B]
-            dt_diss = self.log_dt_diss.exp() + dynamic_dt  # [B]
-            dt_diss = torch.clamp(dt_diss, self.dt_min, self.dt_max)  # [B]
+            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
+            dt_diss = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_diss)
+            sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
 
+        # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            A = A - dt_diss.view(B, 1, 1) * (R @ R.transpose(-1, -2))  # subtract PSD K
+            K = R @ R.transpose(-1, -2)  # [B, n, n], PSD
+            A = A - sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
 
+        # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            A = A - dt_diss.view(B, 1, 1) * torch.diag_embed(d)
+            # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
+            # = diag(dt_diss * d)
+            A = A - torch.diag_embed(dt_diss * d)
 
+        # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
             score_bias = self.laplacian_A
-            lap_q = self.laplacian_q(x_lap_norm)  # [B, n, block_size]
-            lap_k = self.laplacian_k(x_lap_norm)  # [B, n, block_size]
+            lap_q = self.laplacian_q(x_lap_norm)
+            lap_k = self.laplacian_k(x_lap_norm)
             scores = lap_q @ lap_k.transpose(-1, -2) * self.laplacian_scale
             scores = score_bias + scores
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
-            adjacency = F.softplus(scores) - math.log(
-                2
-            )  # shift so zero scores → zero adjacency
+            adjacency = F.softplus(scores) - math.log(2)  # zero scores -> zero adjacency
             adjacency = adjacency - torch.diag_embed(
                 torch.diagonal(adjacency, dim1=-2, dim2=-1)
             )
             degree = torch.diag_embed(adjacency.sum(dim=-1))
-            laplacian = degree - adjacency
-            A = A - dt_diss.view(B, 1, 1) * laplacian
+            laplacian = degree - adjacency  # PSD
+            A = A - sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+
         return A
 
     def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
