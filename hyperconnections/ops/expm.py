@@ -80,9 +80,11 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
 
     # Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
     # Kept as float32 so the comparison (s > i) and division stay on-device.
-    A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
-    s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
-    A = A / (2**s)
+    with torch.no_grad():
+        A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
+        s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
+        scale = 2.0 ** s
+    A = A / scale
 
     eye = torch.eye(A.shape[-1], dtype=torch.float32, device=A.device)
     A_2 = A @ A
