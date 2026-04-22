@@ -29,6 +29,7 @@ class ManifoldHyperConnections(nn.Module):
         bias: bool = False,
         elementwise_affine: bool = False,
         sinkhorn_iters: int = 20,
+        sinkhorn_bias_init: float = _SINKHORN_BIAS_INIT,
     ):
         super().__init__()
         self.n = n
@@ -36,6 +37,7 @@ class ManifoldHyperConnections(nn.Module):
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_bias_init = sinkhorn_bias_init
 
         assert embed_dim % m == 0, f"embed_dim ({embed_dim}) must be divisible by m ({m})"
         assert input_dim == int(
@@ -78,7 +80,7 @@ class ManifoldHyperConnections(nn.Module):
         # stream_mixing: initialise so Sinkhorn(exp(stream_mixing)) ≈ I_n.
         # A large positive diagonal makes exp(stream_mixing) strongly diagonally
         # dominant, so the doubly stochastic projection starts near identity.
-        self.stream_mixing.data.copy_(_SINKHORN_BIAS_INIT * torch.eye(self.n))
+        self.stream_mixing.data.copy_(self.sinkhorn_bias_init * torch.eye(self.n))
 
         # Alpha gating factors: 0.01 per the mHC paper (Table 5).
         nn.init.constant_(self.alpha_read_in, 0.01)
