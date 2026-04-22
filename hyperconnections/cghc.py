@@ -36,6 +36,7 @@ class ContinuousGenHyperConnections(nn.Module):
         bias: bool = False,
         elementwise_affine: bool = False,
         use_triton: bool = True,
+        vec_dt: bool = False
     ):
         super().__init__()
         self.n = n
@@ -70,14 +71,16 @@ class ContinuousGenHyperConnections(nn.Module):
         self.dt_min = dt_min
         self.dt_max = dt_max
         self.log_dt_init = math.log(dt)
+        self.vec_dt = vec_dt
+        n_dt = n if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(
-            torch.empty(n), requires_grad=learn_dt
+            torch.empty(n_dt), requires_grad=learn_dt
         )
         self.log_dt_diss = nn.Parameter(
-            torch.empty(n), requires_grad=learn_dt
+            torch.empty(n_dt), requires_grad=learn_dt
         )
-        self.dt_proj_conserv = nn.Linear(input_dim, self.n, bias=True)
-        self.dt_proj_diss = nn.Linear(input_dim, self.n, bias=True)
+        self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
+        self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
 
         # Generator parameters — boolean flags drive which components are created
         conserv = generator_type in {
@@ -169,7 +172,7 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.laplacian_k.bias)
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
-        # log_dt is now a length-n vector; nn.init.constant_ broadcasts.
+        # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
         dt_init = math.exp(self.log_dt_init)
         target = (dt_init - self.dt_min) / (self.dt_max - self.dt_min)
         target = min(max(target, 1e-4), 1 - 1e-4)  # guard against endpoint singularities
@@ -215,17 +218,20 @@ class ContinuousGenHyperConnections(nn.Module):
     def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
         """Return the effective generator A of shape [B, n, n].
 
-        The generator is built as a sum of conservative and dissipative components,
-        each applied as a symmetric congruence sandwich with a per-stream time scale:
+        When vec_dt=True, each stream has its own time scale and the generator is
+        built via a symmetric congruence sandwich:
 
             A = D_S^{1/2} (S) D_S^{1/2}  -  D_Q^{1/2} (Q) D_Q^{1/2}
 
         where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B, n]
-        and entries in (dt_min, dt_max). This preserves skew-symmetry of S and PSD-ness
-        of Q under the sandwich, so the Lyapunov stability argument carries through.
+        and entries in (dt_min, dt_max). The sandwich preserves skew-symmetry of S
+        and PSD-ness of Q, so the Lyapunov stability argument carries through.
+        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d).
 
-        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d),
-        so no sqrt is needed.
+        When vec_dt=False, dt_conserv and dt_diss are scalars (shape [B, 1]) shared
+        across all streams, reducing the sandwich to a simple scalar scaling:
+
+            A = dt_conserv * S  -  dt_diss * Q
         """
         B = x.shape[0]
         if hasattr(self, "laplacian_A"):
@@ -238,10 +244,16 @@ class ContinuousGenHyperConnections(nn.Module):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
             logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
             dt_conserv = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_conserv)
-            sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
             skew = M - M.transpose(-1, -2)  # [B, n, n], skew-symmetric
-            # Symmetric sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
-            A = A + sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
+            if not self.vec_dt:
+                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
+                skew_dt = dt_conserv * skew
+            else:
+                # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
+                sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
+                skew_dt = sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
+
+            A = A + skew_dt
 
         # --- Shared dissipative dt ---
         if (
