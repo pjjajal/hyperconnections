@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
-from timm.models.layers import trunc_normal_
 
 
 # Input Dimension: d_in = (n / m) * embed_dim

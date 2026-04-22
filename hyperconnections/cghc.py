@@ -247,7 +247,7 @@ class ContinuousGenHyperConnections(nn.Module):
             skew = M - M.transpose(-1, -2)  # [B, n, n], skew-symmetric
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                skew_dt = dt_conserv * skew
+                skew_dt = dt_conserv.unsqueeze(-1) * skew
             else:
                 # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
                 sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
@@ -271,7 +271,7 @@ class ContinuousGenHyperConnections(nn.Module):
             K = R @ R.transpose(-1, -2)  # [B, n, n], PSD
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                diss_dt = dt_diss * K
+                diss_dt = dt_diss.unsqueeze(-1) * K
             else:
                 # Per-stream sandwich: (D^{1/2} K D^{1/2})_{ij} = sqrt_dt_i * K_{ij} * sqrt_dt_j
                 diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
@@ -300,7 +300,7 @@ class ContinuousGenHyperConnections(nn.Module):
             laplacian = degree - adjacency  # PSD
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                laplacian_dt = dt_diss * laplacian
+                laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
             else:
                 laplacian_dt = sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
             A = A - laplacian_dt
