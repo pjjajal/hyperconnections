@@ -362,6 +362,12 @@ class ContinuousGenHyperConnections(nn.Module):
         return x_mixed + Y
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            x: [B, *, input_dim]  (any number of leading dims, last dim = n * block_size)
+        Returns:
+            [B, *, input_dim]
+        """
         ### x: [B, *, input_dim]
         leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
@@ -377,7 +383,7 @@ class ContinuousGenHyperConnections(nn.Module):
         out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
 
         ### Write out from backbone width back to the over-width space
-        out = out.reshape(B, self.m, self.block_size)
+        out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
 
         ### Steam Mixing
