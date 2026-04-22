@@ -1,16 +1,18 @@
 import argparse
 from collections import defaultdict
+import math
 from pathlib import Path
 
 import trackio
 
 import torch
 import torch.nn as nn
-import torchvision
 import torchvision.transforms.v2 as tvt
+from datasets import load_dataset
 from omegaconf import OmegaConf
 from timm.layers import Mlp
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from hyperconnections.cghc import ContinuousGenHyperConnections
 from hyperconnections.ghc import GeneralizedHyperConnections
@@ -160,14 +162,14 @@ class MLPMixer(nn.Module):
 
         if hc_cls is not None:
             self.blocks = nn.Sequential(*[
-                HyperConnectedMixerBlock(hidden_dim, seq_len, hc_cls, n, m, **hc_kwargs)
+                torch.compile(HyperConnectedMixerBlock(hidden_dim, seq_len, hc_cls, n, m, **hc_kwargs))
                 for _ in range(depth)
             ])
             self.expand = HCExpand(hidden_dim, n, m)
             self.contract = HCContract(hidden_dim, n, m)
         else:
             self.blocks = nn.Sequential(*[
-                MixerBlock(hidden_dim, seq_len) for _ in range(depth)
+                torch.compile(MixerBlock(hidden_dim, seq_len)) for _ in range(depth)
             ])
             self.expand = nn.Identity()
             self.contract = nn.Identity()
@@ -207,12 +209,21 @@ def get_cifar10_loaders(batch_size: int, num_workers: int, data_dir: str = "./da
         tvt.ToDtype(torch.float32, scale=True),
         tvt.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
-        data_dir, train=True, download=True, transform=train_transform
-    )
-    val_ds = torchvision.datasets.CIFAR10(
-        data_dir, train=False, download=True, transform=val_transform
-    )
+
+    def apply_train(batch):
+        batch["img"] = [train_transform(img) for img in batch["img"]]
+        return batch
+
+    def apply_val(batch):
+        batch["img"] = [val_transform(img) for img in batch["img"]]
+        return batch
+
+    raw = load_dataset("uoft-cs/cifar10", cache_dir=data_dir)
+    train_ds = raw["train"]
+    train_ds.set_transform(apply_train)
+    val_ds = raw["test"]
+    val_ds.set_transform(apply_val)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -231,46 +242,68 @@ def get_cifar10_loaders(batch_size: int, num_workers: int, data_dir: str = "./da
     return train_loader, val_loader, val_ds
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, global_step: int):
     model.train()
     total_loss = 0.0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
+    for batch in tqdm(loader, desc="train", leave=False):
+        images = batch["img"].to(device)
+        labels = batch["label"].to(device)
         optimizer.zero_grad()
-        loss = criterion(model(images), labels)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            loss = criterion(model(images), labels)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * images.size(0)
-    return total_loss / len(loader.dataset)
+        loss_val = loss.item()
+        global_step += 1
+        if math.isnan(loss_val):
+            return float("nan"), global_step
+        trackio.log({"train_loss": loss_val}, step=global_step)
+        total_loss += loss_val * images.size(0)
+    return total_loss / len(loader.dataset), global_step
 
 
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss, correct = 0.0, 0
     with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            logits = model(images)
+        for batch in tqdm(loader, desc="eval", leave=False):
+            images = batch["img"].to(device)
+            labels = batch["label"].to(device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                logits = model(images)
             total_loss += criterion(logits, labels).item() * images.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
     n = len(loader.dataset)
     return total_loss / n, correct / n
 
 
-def make_run_dir(args) -> Path:
+_GENERATOR_SHORT = {
+    "conservative": "cons",
+    "psd_diss": "psd",
+    "diagonal_diss": "diag",
+    "laplacian": "lap",
+    "conservative_diag_diss": "cons_diag",
+    "conservative_psd_diss": "cons_psd",
+    "conservative_laplacian": "cons_lap",
+}
+
+
+def make_run_dir(args, n_params: int = 0) -> Path:
     name = f"{args.hc_type}_d{args.depth}_ar{args.aspect_ratio}_p{args.patch_size}"
     if args.hc_type != "none":
         name += f"_n{args.n}m{args.m}"
+    if args.hc_type == "cghc":
+        name += f"_{_GENERATOR_SHORT.get(args.generator_type, args.generator_type)}"
     run_dir = Path(__file__).parent / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(OmegaConf.create(vars(args)), run_dir / "config.yaml")
+    OmegaConf.save(OmegaConf.create({**vars(args), "n_params": n_params}), run_dir / "config.yaml")
     return run_dir
 
 
 def sample_per_class(dataset, n_per_class: int = 10, seed: int = 42) -> list:
     """Return indices of n_per_class samples per class, reproducibly seeded."""
     class_indices = defaultdict(list)
-    for idx, label in enumerate(dataset.targets):
+    for idx, label in enumerate(dataset["label"]):
         class_indices[label].append(idx)
     gen = torch.Generator()
     gen.manual_seed(seed)
@@ -282,16 +315,17 @@ def sample_per_class(dataset, n_per_class: int = 10, seed: int = 42) -> list:
     return selected
 
 
-def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42):
+def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, init: bool = False):
     """Sample 10 images per class and compute per-layer HC mixing matrices."""
-    indices = sample_per_class(val_ds, n_per_class=10, seed=seed)
+    indices = sample_per_class(val_ds, n_per_class=3, seed=seed)
     subset = Subset(val_ds, indices)
-    images = torch.stack([subset[i][0] for i in range(len(subset))])
-    labels = torch.tensor([subset[i][1] for i in range(len(subset))])
+    images = torch.stack([subset[i]["img"] for i in range(len(subset))])
+    labels = torch.tensor([subset[i]["label"] for i in range(len(subset))])
 
     model.eval()
     with torch.no_grad():
-        _, mixing_matrices = model(images.to(device), return_mixing=True)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            _, mixing_matrices = model(images.to(device), return_mixing=True)
 
     # Stack per-layer matrices: [depth, B*seq, n, n]
     token_mixing = torch.stack([m["token"] for m in mixing_matrices])
@@ -304,7 +338,7 @@ def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42):
             "labels": labels,
             "indices": indices,
         },
-        run_dir / "mixing_analysis.pt",
+        run_dir / ("mixing_analysis_init.pt" if init else "mixing_analysis.pt"),
     )
     print(f"Mixing analysis saved: {token_mixing.shape} (depth, B, seq_len, n, n)")
 
@@ -328,7 +362,7 @@ def main():
     )
     parser.add_argument("--n", type=int, default=4, help="number of HC streams")
     parser.add_argument(
-        "--m", type=int, default=2, help="HC backbone divisor (must divide n)"
+        "--m", type=int, default=1, help="HC backbone divisor (must divide n)"
     )
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--elementwise_affine", action="store_true")
@@ -364,11 +398,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--seed", type=int, default=42, help="seed for analysis sampling")
+    parser.add_argument("--mixing_only", action="store_true", help="skip training and run mixing analysis on the initialized model")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -396,14 +431,24 @@ def main():
         n=args.n,
         m=args.m,
         **hc_kwargs,
-    ).to(device)
+    ).to(device).to(torch.bfloat16)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # model = torch.compile(model)
 
-    run_dir = make_run_dir(args)
+    run_dir = make_run_dir(args, n_params)
 
     hidden_dim = int(args.aspect_ratio * args.depth)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"depth={args.depth}  hidden_dim={hidden_dim}  hc_type={args.hc_type}  params={n_params:,}")
     print(f"run dir: {run_dir}")
+
+    print("Preparing data loaders...")
+    _, val_loader, val_ds = get_cifar10_loaders(
+        args.batch_size, args.num_workers, args.data_dir
+    ) if args.mixing_only else (None, None, None)
+
+    if args.mixing_only:
+        run_mixing_analysis(model, val_ds, device, run_dir, seed=args.seed, init=True)
+        return
 
     train_loader, val_loader, val_ds = get_cifar10_loaders(
         args.batch_size, args.num_workers, args.data_dir
@@ -416,12 +461,18 @@ def main():
     run_name = run_dir.name
     trackio.init(project="mlpmixer-cifar10", name=run_name, config=vars(args))
 
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss, global_step = train_one_epoch(model, train_loader, optimizer, criterion, device, global_step)
+        if math.isnan(train_loss):
+            msg = f"Training diverged at epoch {epoch} (NaN loss).\n"
+            print(msg)
+            (run_dir / "diverged.txt").write_text(msg)
+            break
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         trackio.log(
-            {"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc},
-            step=epoch,
+            {"val_loss": val_loss, "val_acc": val_acc},
+            step=global_step,
         )
         print(
             f"epoch {epoch:3d}/{args.epochs}"
