@@ -75,8 +75,6 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     Returns:
         exp(A) with the same shape and dtype as A.
     """
-    original_dtype = A.dtype
-    A = A.to(torch.float32)
 
     # Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
     # Kept as float32 so the comparison (s > i) and division stay on-device.
@@ -86,7 +84,7 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
         scale = 2.0 ** s
     A = A / scale
 
-    eye = torch.eye(A.shape[-1], dtype=torch.float32, device=A.device)
+    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
     A_2 = A @ A
     A_3 = A_2 @ A
     A_6 = A_3 @ A_3
@@ -105,4 +103,4 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     for i in range(8):
         T_18 = torch.where(s > i, T_18 @ T_18, T_18)
 
-    return T_18.to(original_dtype)
+    return T_18

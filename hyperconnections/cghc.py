@@ -269,7 +269,13 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
             K = R @ R.transpose(-1, -2)  # [B, n, n], PSD
-            A = A - sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
+            if not self.vec_dt:
+                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
+                diss_dt = dt_diss * K
+            else:
+                # Per-stream sandwich: (D^{1/2} K D^{1/2})_{ij} = sqrt_dt_i * K_{ij} * sqrt_dt_j
+                diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
+            A = A - diss_dt
 
         # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
@@ -292,7 +298,12 @@ class ContinuousGenHyperConnections(nn.Module):
             )
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency  # PSD
-            A = A - sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+            if not self.vec_dt:
+                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
+                laplacian_dt = dt_diss * laplacian
+            else:
+                laplacian_dt = sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+            A = A - laplacian_dt
 
         return A
 
@@ -300,7 +311,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         A = self.compute_generator(x)
         # return expm_t18(A).to(x.dtype)
-        return torch.linalg.matrix_exp(A.float()).to(x.dtype)
+        return torch.linalg.matrix_exp(A)
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
