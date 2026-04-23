@@ -19,7 +19,7 @@ class ContinuousGenHyperConnections(nn.Module):
         input_dim: int,
         embed_dim: int,
         module: nn.Module,
-        dt: float = 1.0,
+        dt: float = 0.01,
         generator_type: Literal[
             "conservative",
             "psd_diss",
@@ -36,7 +36,7 @@ class ContinuousGenHyperConnections(nn.Module):
         bias: bool = False,
         elementwise_affine: bool = False,
         use_triton: bool = True,
-        vec_dt: bool = False
+        vec_dt: bool = False,
     ):
         super().__init__()
         self.n = n
@@ -68,17 +68,16 @@ class ContinuousGenHyperConnections(nn.Module):
         assert dt_min < dt < dt_max, (
             f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
         )
-        self.dt_min = dt_min
-        self.dt_max = dt_max
-        self.log_dt_init = math.log(dt)
+        self.dt_min_cons = dt_min
+        self.dt_max_cons = dt_max
+        self.dt_min_diss = dt_min
+        self.dt_max_diss = dt_max
+        self.log_dt_init_cons = math.log(dt)
+        self.log_dt_init_diss = math.log(dt)
         self.vec_dt = vec_dt
         n_dt = n if vec_dt else 1
-        self.log_dt_conserv = nn.Parameter(
-            torch.empty(n_dt), requires_grad=learn_dt
-        )
-        self.log_dt_diss = nn.Parameter(
-            torch.empty(n_dt), requires_grad=learn_dt
-        )
+        self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
+        self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
         self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
 
@@ -106,9 +105,13 @@ class ContinuousGenHyperConnections(nn.Module):
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_q = nn.Linear(self.block_size, self.block_size // 4, bias=True)
-            self.laplacian_k = nn.Linear(self.block_size, self.block_size // 4, bias=True)
-            self.laplacian_scale = (self.block_size // 4)**-0.5
+            self.laplacian_q = nn.Linear(
+                self.block_size, self.block_size // 4, bias=True
+            )
+            self.laplacian_k = nn.Linear(
+                self.block_size, self.block_size // 4, bias=True
+            )
+            self.laplacian_scale = (self.block_size // 4) ** -0.5
             self.norm_lap = nn.RMSNorm(self.block_size, elementwise_affine=True)
 
         # Projection Direction
@@ -131,7 +134,9 @@ class ContinuousGenHyperConnections(nn.Module):
         logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
         nn.init.constant_(self.read_in, logit_1_over_n)
         with torch.no_grad():
-            self.read_in.add_(torch.randn_like(self.read_in) * 0.01)  # small noise for asymmetry breaking
+            self.read_in.add_(
+                torch.randn_like(self.read_in) * 0.01
+            )  # small noise for asymmetry breaking
         # write_out: 2·σ(0) = 1
         trunc_normal_(self.write_out, std=0.01)
         # Alpha gating: 0.01 so dynamic component starts negligible
@@ -173,11 +178,21 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
         # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
-        dt_init = math.exp(self.log_dt_init)
-        target = (dt_init - self.dt_min) / (self.dt_max - self.dt_min)
-        target = min(max(target, 1e-4), 1 - 1e-4)  # guard against endpoint singularities
+
+        dt_init_cons = math.exp(self.log_dt_init_cons)
+        target = (dt_init_cons - self.dt_min_cons) / (
+            self.dt_max_cons - self.dt_min_cons
+        )
+        target = min(max(target, 1e-4), 1 - 1e-4)
         bias_init = math.log(target / (1 - target))
         nn.init.constant_(self.log_dt_conserv, bias_init)
+
+        dt_init_diss = math.exp(self.log_dt_init_diss)
+        target = (dt_init_diss - self.dt_min_diss) / (
+            self.dt_max_diss - self.dt_min_diss
+        )
+        target = min(max(target, 1e-4), 1 - 1e-4)
+        bias_init = math.log(target / (1 - target))
         nn.init.constant_(self.log_dt_diss, bias_init)
 
         # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
@@ -191,14 +206,14 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(proj.weight, std=0.01)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
-        
+
         # mean projection: set to mean direction.
         # small noise for asymmetry breaking so projection isn't exactly static at init, but normalised to keep initial scale consistent.
-        if self.projection == "mean":                                           
-                self.projection_dir.fill_(1.0 / math.sqrt(self.n))
-                with torch.no_grad():
-                    self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01) 
-                    self.projection_dir.div_(self.projection_dir.norm())  
+        if self.projection == "mean":
+            self.projection_dir.fill_(1.0 / math.sqrt(self.n))
+            with torch.no_grad():
+                self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01)
+                self.projection_dir.div_(self.projection_dir.norm())
         # proj_v: small random weight + scaled ones bias → starts near mean direction with input-dependent variation
         if self.projection == "v":
             trunc_normal_(self.projection_dir.weight, std=0.01)
@@ -243,7 +258,9 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
             logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_conserv)
+            dt_conserv = self.dt_min_cons + (
+                self.dt_max_cons - self.dt_min_cons
+            ) * torch.sigmoid(logit_conserv)
             skew = M - M.transpose(-1, -2)  # [B, n, n], skew-symmetric
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
@@ -251,7 +268,9 @@ class ContinuousGenHyperConnections(nn.Module):
             else:
                 # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
                 sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
-                skew_dt = sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
+                skew_dt = (
+                    sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
+                )
 
             A = A + skew_dt
 
@@ -262,13 +281,15 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "laplacian_A")
         ):
             logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_diss)
+            dt_diss = self.dt_min_diss + (
+                self.dt_max_diss - self.dt_min_diss
+            ) * torch.sigmoid(logit_diss)
             sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
 
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n ** 2)   # [B, n, n], PSD
+            K = R @ R.transpose(-1, -2) / (self.n**2)  # [B, n, n], PSD
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 diss_dt = dt_diss.unsqueeze(-1) * K
@@ -282,7 +303,9 @@ class ContinuousGenHyperConnections(nn.Module):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
-            A = A - torch.diag_embed(dt_diss * d)  # dt_diss [B,1] * d [B,n] broadcasts correctly
+            A = A - torch.diag_embed(
+                dt_diss * d
+            )  # dt_diss [B,1] * d [B,n] broadcasts correctly
 
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
@@ -302,7 +325,9 @@ class ContinuousGenHyperConnections(nn.Module):
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
             else:
-                laplacian_dt = sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+                laplacian_dt = (
+                    sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+                )
             A = A - laplacian_dt
 
         return A
