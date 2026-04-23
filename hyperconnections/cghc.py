@@ -268,7 +268,7 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2)  # [B, n, n], PSD
+            K = R @ R.transpose(-1, -2) / (self.n ** 2)   # [B, n, n], PSD
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 diss_dt = dt_diss.unsqueeze(-1) * K
@@ -282,7 +282,7 @@ class ContinuousGenHyperConnections(nn.Module):
             d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
-            A = A - torch.diag_embed(dt_diss * d)
+            A = A - torch.diag_embed(dt_diss * d)  # dt_diss [B,1] * d [B,n] broadcasts correctly
 
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
@@ -292,7 +292,7 @@ class ContinuousGenHyperConnections(nn.Module):
             scores = lap_q @ lap_k.transpose(-1, -2) * self.laplacian_scale
             scores = score_bias + scores
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
-            adjacency = F.softplus(scores) - math.log(2)  # zero scores -> zero adjacency
+            adjacency = F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
                 torch.diagonal(adjacency, dim1=-2, dim2=-1)
             )
@@ -311,7 +311,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """Return Phi = exp(dt * A), shape [B, n, n]."""
         A = self.compute_generator(x)
         # return expm_t18(A).to(x.dtype)
-        return torch.linalg.matrix_exp(A)
+        return torch.linalg.matrix_exp(A.float()).to(x.dtype)
 
     def compute_read_write_weights(self, x: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state."""
