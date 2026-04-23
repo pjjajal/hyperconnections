@@ -178,7 +178,6 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
         # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
-
         dt_init_cons = math.exp(self.log_dt_init_cons)
         target = (dt_init_cons - self.dt_min_cons) / (
             self.dt_max_cons - self.dt_min_cons
@@ -289,7 +288,7 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
             R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n**2)  # [B, n, n], PSD
+            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 diss_dt = dt_diss.unsqueeze(-1) * K
