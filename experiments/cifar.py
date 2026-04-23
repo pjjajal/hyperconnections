@@ -119,25 +119,44 @@ class PatchEmbed(nn.Module):
 
 
 class HCExpand(nn.Module):
-    def __init__(self, dim: int, n: int, m: int):
+    def __init__(self, dim: int, n: int, m: int, learned: bool = False):
         super().__init__()
         self.dim = dim
         self.n = n
         self.m = m
+        self.learned = learned
+        if learned:
+            self.proj = nn.Linear(n, n, bias=False)
+            nn.init.zeros_(self.proj.weight)  # zero init → additive term is 0 at init
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.repeat(1, 1, self.n // self.m)
+        x = x.repeat(1, 1, self.n // self.m)  # [B, seq_len, n*dim]
+        if self.learned:
+            delta = self.proj(
+                x.unflatten(-1, (self.n // self.m, self.dim)).transpose(-2, -1)
+            ).transpose(-2, -1).flatten(-2)
+            x = x + delta
+        return x
 
 
 class HCContract(nn.Module):
-    def __init__(self, dim: int, n: int, m: int):
+    def __init__(self, dim: int, n: int, m: int, learned: bool = False):
         super().__init__()
         self.dim = dim
         self.n = n
         self.m = m
+        self.learned = learned
+        if learned:
+            self.proj = nn.Linear(n, 1, bias=False)
+            nn.init.zeros_(self.proj.weight)  # zero init → additive term is 0 at init
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.unflatten(-1, (self.n // self.m, self.dim)).mean(dim=-2)
+        x_streams = x.unflatten(-1, (self.n // self.m, self.dim))  # [B, seq_len, n, dim]
+        mean = x_streams.mean(dim=-2)
+        if self.learned:
+            delta = self.proj(x_streams.transpose(-2, -1)).squeeze(-1)  # [B, seq_len, dim]
+            return mean + delta
+        return mean
 
 
 class MLPMixer(nn.Module):
@@ -151,6 +170,7 @@ class MLPMixer(nn.Module):
         hc_cls=None,
         n: int = 4,
         m: int = 2,
+        learned_expand_contract: bool = False,
         **hc_kwargs,
     ) -> None:
         super().__init__()
@@ -165,8 +185,8 @@ class MLPMixer(nn.Module):
                 torch.compile(HyperConnectedMixerBlock(hidden_dim, seq_len, hc_cls, n, m, **hc_kwargs))
                 for _ in range(depth)
             ])
-            self.expand = HCExpand(hidden_dim, n, m)
-            self.contract = HCContract(hidden_dim, n, m)
+            self.expand = HCExpand(hidden_dim, n, m, learned=learned_expand_contract)
+            self.contract = HCContract(hidden_dim, n, m, learned=learned_expand_contract)
         else:
             self.blocks = nn.Sequential(*[
                 torch.compile(MixerBlock(hidden_dim, seq_len)) for _ in range(depth)
@@ -294,6 +314,10 @@ def make_run_dir(args, n_params: int = 0) -> Path:
         name += f"_n{args.n}m{args.m}"
     if args.hc_type == "cghc":
         name += f"_{_GENERATOR_SHORT.get(args.generator_type, args.generator_type)}"
+        if args.projection != "none":
+            name += f"_proj_{args.projection}"
+    if getattr(args, "learned_expand_contract", False):
+        name += "_lec"
     run_dir = Path(__file__).parent / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(OmegaConf.create({**vars(args), "n_params": n_params}), run_dir / "config.yaml")
@@ -315,6 +339,80 @@ def sample_per_class(dataset, n_per_class: int = 10, seed: int = 42) -> list:
     return selected
 
 
+def _stream_diversity_stats(x: torch.Tensor, n: int, block_size: int, x0_mean_energy: float) -> dict:
+    """Three diversity metrics for a single layer's input tensor.
+
+    - orth_frac_total : ||x_orth||² / ||x||²          — share of current energy that is cross-stream
+    - orth_vs_mean    : ||x_orth||² / (n·||x_mean||²) — cross-stream energy relative to current mean
+    - orth_vs_x0      : ||x_orth||² / (n·||x0_mean||²)— cross-stream energy relative to initial signal
+    """
+    x_streams = x.detach().float().reshape(-1, n, block_size)
+    x_mean = x_streams.mean(dim=1, keepdim=True)
+    x_orth = x_streams - x_mean
+    orth_energy = x_orth.pow(2).sum().item()
+    total_energy = x_streams.pow(2).sum().item()
+    mean_energy = n * x_mean.pow(2).sum().item()
+    return {
+        "orth_frac_total": orth_energy / total_energy if total_energy > 0 else 0.0,
+        "orth_vs_mean":    orth_energy / mean_energy if mean_energy > 0 else 0.0,
+        "orth_vs_x0":      orth_energy / x0_mean_energy if x0_mean_energy > 0 else 0.0,
+    }
+
+
+def compute_stream_diversity(model, val_ds, device, n: int, seed: int = 42):
+    """Three diversity metrics per HC layer, plus aggregate stats for logging.
+
+    Returns (stats_dict, layerwise) where layerwise is a dict of three lists,
+    each of length depth*2, ordered [block0/token, block0/channel, block1/token, ...]:
+        - orth_frac_total, orth_vs_mean, orth_vs_x0
+
+    Runs the forward pass through the uncompiled blocks so that intermediate
+    activations are accessible — torch.compile inlines submodule ops, making
+    forward hooks on child modules unreliable.
+    """
+    indices = sample_per_class(val_ds, n_per_class=3, seed=seed)
+    subset = Subset(val_ds, indices)
+    images = torch.stack([subset[i]["img"] for i in range(len(subset))]).to(device)
+
+    layerwise: dict[str, list[float]] = {"orth_frac_total": [], "orth_vs_mean": [], "orth_vs_x0": []}
+    model.eval()
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            x = model.patch_embed(images)
+            x = model.expand(x)
+
+            # Capture the energy of the initial mean signal (x_0, after expand)
+            bs_first = next(
+                getattr(b, "_orig_mod", b).hc_token_mixer.block_size
+                for b in model.blocks if hasattr(getattr(b, "_orig_mod", b), "hc_token_mixer")
+            )
+            x0_streams = x.detach().float().reshape(-1, n, bs_first)
+            x0_mean_energy = n * x0_streams.mean(dim=1).pow(2).sum().item()
+
+            for block in model.blocks:
+                orig = getattr(block, "_orig_mod", block)
+                if hasattr(orig, "hc_token_mixer"):
+                    bs = orig.hc_token_mixer.block_size
+                    for key, val in _stream_diversity_stats(x, n, bs, x0_mean_energy).items():
+                        layerwise[key].append(val)
+                    x = orig.hc_token_mixer(x)
+                    for key, val in _stream_diversity_stats(x, n, bs, x0_mean_energy).items():
+                        layerwise[key].append(val)
+                    x = orig.hc_channel_mixer(x)
+                else:
+                    x = orig(x)
+
+    if not layerwise["orth_frac_total"]:
+        return {}, layerwise
+
+    stats = {}
+    for metric, vals in layerwise.items():
+        t = torch.tensor(vals)
+        for stat, v in [("mean", t.mean()), ("std", t.std()), ("min", t.min()), ("max", t.max())]:
+            stats[f"stream_diversity/{metric}/{stat}"] = v.item()
+    return stats, layerwise
+
+
 def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, init: bool = False):
     """Sample 10 images per class and compute per-layer HC mixing matrices."""
     indices = sample_per_class(val_ds, n_per_class=3, seed=seed)
@@ -325,7 +423,16 @@ def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, in
     model.eval()
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            _, mixing_matrices = model(images.to(device), return_mixing=True)
+            # Bypass torch.compile by running uncompiled blocks directly —
+            # passing return_mixing=True to compiled blocks triggers retracing
+            # which fails on the installed Triton version.
+            x = model.patch_embed(images.to(device))
+            x = model.expand(x)
+            mixing_matrices = []
+            for block in model.blocks:
+                orig = getattr(block, "_orig_mod", block)
+                x, m = orig(x, return_mixing=True)
+                mixing_matrices.append(m)
 
     # Stack per-layer matrices: [depth, B*seq, n, n]
     token_mixing = torch.stack([m["token"] for m in mixing_matrices])
@@ -393,6 +500,7 @@ def main():
         "--projection", type=str, default="none", choices=["none", "mean", "v"]
     )
     parser.add_argument("--use_triton", action="store_true", default=False)
+    parser.add_argument("--vec_dt", action="store_true", default=False)
 
     # Training
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -404,6 +512,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--seed", type=int, default=42, help="seed for analysis sampling")
     parser.add_argument("--mixing_only", action="store_true", help="skip training and run mixing analysis on the initialized model")
+    parser.add_argument("--learned_expand_contract", action="store_true", help="learned additive mixing in HCExpand (n→n) and HCContract (n→1)")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -421,6 +530,7 @@ def main():
             generator_type=args.generator_type,
             projection=args.projection,
             use_triton=args.use_triton,
+            vec_dt=args.vec_dt,
         )
 
     model = MLPMixer(
@@ -430,6 +540,7 @@ def main():
         hc_cls=hc_cls,
         n=args.n,
         m=args.m,
+        learned_expand_contract=args.learned_expand_contract,
         **hc_kwargs,
     ).to(device).to(torch.bfloat16)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -459,9 +570,17 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     run_name = run_dir.name
-    trackio.init(project="mlpmixer-cifar10", name=run_name, config=vars(args))
+    trackio.init(project="mlpmixer-cifar10", name=run_name, config=vars(args), resume="allow")
 
     global_step = 0
+    layerwise_diversity = {}  # epoch -> dict of metric lists, saved at end
+
+    if args.hc_type == "cghc" and args.projection != "none":
+        diversity_stats, diversity_layerwise = compute_stream_diversity(model, val_ds, device, args.n, seed=args.seed)
+        trackio.log(diversity_stats, step=global_step)
+        layerwise_diversity[0] = diversity_layerwise
+        print(f"init stream_diversity: {diversity_stats}")
+
     for epoch in range(1, args.epochs + 1):
         train_loss, global_step = train_one_epoch(model, train_loader, optimizer, criterion, device, global_step)
         if math.isnan(train_loss):
@@ -470,16 +589,34 @@ def main():
             (run_dir / "diverged.txt").write_text(msg)
             break
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        trackio.log(
-            {"val_loss": val_loss, "val_acc": val_acc},
-            step=global_step,
-        )
+        epoch_metrics = {"val_loss": val_loss, "val_acc": val_acc}
+        diversity_str = ""
+        if args.hc_type == "cghc" and args.projection != "none":
+            diversity_stats, diversity_layerwise = compute_stream_diversity(model, val_ds, device, args.n, seed=args.seed)
+            epoch_metrics.update(diversity_stats)
+            layerwise_diversity[epoch] = diversity_layerwise
+            diversity_str = "  |  " + "  ".join(
+                f"{m}(mean={diversity_stats[f'stream_diversity/{m}/mean']:.4f}"
+                f" std={diversity_stats[f'stream_diversity/{m}/std']:.4f})"
+                for m in ("orth_frac_total", "orth_vs_mean", "orth_vs_x0")
+            )
+        trackio.log(epoch_metrics, step=global_step)
         print(
             f"epoch {epoch:3d}/{args.epochs}"
             f"  train_loss={train_loss:.4f}"
             f"  val_loss={val_loss:.4f}"
             f"  val_acc={val_acc:.4f}"
+            + diversity_str
         )
+
+    if layerwise_diversity:
+        depth = args.depth
+        labels = [f"block{i}/{t}" for i in range(depth) for t in ("token", "channel")]
+        torch.save(
+            {"labels": labels, "epochs": layerwise_diversity},
+            run_dir / "stream_diversity_layerwise.pt",
+        )
+        print(f"Layerwise diversity saved to {run_dir / 'stream_diversity_layerwise.pt'}")
 
     torch.save(model.state_dict(), run_dir / "model.pt")
     print(f"Weights saved to {run_dir / 'model.pt'}")
