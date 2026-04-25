@@ -78,8 +78,8 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     original_dtype = A.dtype
     A = A.to(torch.float32)
 
-    # Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
-    # Kept as float32 so the comparison (s > i) and division stay on-device.
+    ### Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
+    ### Kept as float32 so the comparison (s > i) and division stay on-device.
     with torch.no_grad():
         A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
         s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
@@ -100,8 +100,8 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     A_9 = B_1 @ B_5 + B_4
     T_18 = B_2 + (B_3 + A_9) @ A_9
 
-    # Unrolled repeated squaring (max 8 doublings covers ||A||_1 up to ~386).
-    # Gated by torch.where to keep a static graph for torch.compile.
+    ### Unrolled repeated squaring (max 8 doublings covers ||A||_1 up to ~386).
+    ### Gated by torch.where to keep a static graph for torch.compile.
     for i in range(8):
         T_18 = torch.where(s > i, T_18 @ T_18, T_18)
 

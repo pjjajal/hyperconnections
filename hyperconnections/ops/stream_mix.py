@@ -23,21 +23,22 @@ Threshold:  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 0.75 * L2_BYTES
 """
 
 from __future__ import annotations
-
 import torch
-
 from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
 from .stream_mix_big_nb   import stream_mix_add_big_nb   as _big_nb
 
-# A100 L2 capacity in bytes.  Adjust if targeting a different GPU.
+### A100 L2/L1 capacity in bytes.
+### Adjust if targeting a different GPU.
 _SM80_L2_BYTES = 40 * 1024 * 1024
-
+_SM80_L1_PER_SM_BYTES = 192 * 1024
 
 def _use_big_nb(x: torch.Tensor) -> bool:
     B, N, D = x.shape
+    ### If transition matrix is small enough.
+    ### TODO: Add a batch size condition, we can likely also add an L1 memory term
     if N < 16 or N % 16 != 0:
         return False
-    # "Safety" buffer: switch kernels when x occupies > 75% of L2
+    ### "Safety" buffer: switch kernels when x occupies > 75% of L2
     return B * N * D * x.element_size() > _SM80_L2_BYTES * 0.75
 
 
