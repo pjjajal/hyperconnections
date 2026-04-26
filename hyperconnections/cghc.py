@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -8,7 +7,7 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.models.layers import trunc_normal_
 
-from hyperconnections.ops import HAS_TRITON, expm_t18, stream_mix_add
+from hyperconnections.ops import HAS_TRITON, stream_mix_add
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -19,6 +18,7 @@ class ContinuousGenHyperConnections(nn.Module):
         input_dim: int,
         embed_dim: int,
         module: nn.Module,
+        n_heads: int = 1,
         dt: float = 0.01,
         generator_type: Literal[
             "conservative",
@@ -43,7 +43,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.m = m
         self.input_dim = input_dim
         self.embed_dim = embed_dim
-        self.generator_type = generator_type
+        self.n_heads = n_heads
         self.projection = projection
 
         assert embed_dim % m == 0, (
@@ -55,33 +55,38 @@ class ContinuousGenHyperConnections(nn.Module):
 
         self.block_size = embed_dim // m
 
-        # Read/write parameters following mHC convention
+        assert self.block_size % n_heads == 0, (
+            f"block_size ({self.block_size}) must be divisible by n_heads ({n_heads})"
+        )
+        self.head_dim = self.block_size // n_heads
+        # features seen by each head: n streams × head_dim features each
+        self.head_input_dim = n * self.head_dim
+
+        # Read/write parameters following mHC convention.
+        # Predictors take head_input_dim; outputs are [B*n_heads, n, m] (heads in batch).
         self.read_in = nn.Parameter(torch.empty(n, m))
         self.alpha_read_in = nn.Parameter(torch.empty(1))
         self.write_out = nn.Parameter(torch.empty(n, m))
         self.alpha_write_out = nn.Parameter(torch.empty(1))
 
-        self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
-        self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
+        self.proj_read_in = nn.Linear(self.head_input_dim, n * m, bias=bias)
+        self.proj_write_out = nn.Linear(self.head_input_dim, n * m, bias=bias)
 
-        # dt parameters
+        # dt parameters — per-head static bias, shared input-dependent predictor
         assert dt_min < dt < dt_max, (
             f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
         )
-        self.dt_min_cons = dt_min
-        self.dt_max_cons = dt_max
-        self.dt_min_diss = dt_min
-        self.dt_max_diss = dt_max
-        self.log_dt_init_cons = math.log(dt)
-        self.log_dt_init_diss = math.log(dt)
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init = dt
         self.vec_dt = vec_dt
         n_dt = n if vec_dt else 1
-        self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
-        self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
+        self.log_dt_conserv = nn.Parameter(torch.empty(n_heads, n_dt), requires_grad=learn_dt)
+        self.log_dt_diss = nn.Parameter(torch.empty(n_heads, n_dt), requires_grad=learn_dt)
+        self.dt_proj_conserv = nn.Linear(self.head_input_dim, n_dt, bias=True)
+        self.dt_proj_diss = nn.Linear(self.head_input_dim, n_dt, bias=True)
 
-        # Generator parameters — boolean flags drive which components are created
+        # Generator parameters — per-head static bias [n_heads, n, n], shared dynamic predictor
         conserv = generator_type in {
             "conservative",
             "conservative_diag_diss",
@@ -93,33 +98,36 @@ class ContinuousGenHyperConnections(nn.Module):
         laplacian = generator_type in {"laplacian", "conservative_laplacian"}
 
         if conserv:
-            self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conv_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.conserv_A = nn.Parameter(torch.empty(n_heads, n, n))
+            self.conv_pred = nn.Linear(self.head_input_dim, n * n, bias=True)
         if psd_diss:
-            self.diss_A = nn.Parameter(torch.zeros(n, n))
-            self.diss_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.diss_A = nn.Parameter(torch.zeros(n_heads, n, n))
+            self.diss_pred = nn.Linear(self.head_input_dim, n * n, bias=True)
         if diag_diss:
-            # Diagonal dissipation: store only the diagonal entries for efficiency
-            # Initialised to -2.0 in init_weights, giving softplus(-2.0) ≈ 0.127
-            self.diss_diag = nn.Parameter(torch.full((n,), -2.0, requires_grad=True))
-            self.diss_pred = nn.Linear(input_dim, n, bias=True)
+            self.diss_diag = nn.Parameter(torch.full((n_heads, n), -2.0, requires_grad=True))
+            self.diss_pred = nn.Linear(self.head_input_dim, n, bias=True)
         if laplacian:
-            self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.laplacian_A = nn.Parameter(torch.zeros(n_heads, n, n))
+            self.laplacian_pred = nn.Linear(self.head_input_dim, n * n, bias=True)
 
-        # Projection Direction
+        # Projection Direction.
+        # "mean": single shared direction [n], broadcast over all heads.
+        # "v": per-head predictor taking head_input_dim -> n; outputs [B*n_heads, n].
         if projection == "mean":
             self.register_buffer("projection_dir", torch.ones(n) / math.sqrt(n))
         elif projection == "v":
-            self.projection_dir = nn.Linear(input_dim, n, bias=True)
+            self.projection_dir = nn.Linear(self.head_input_dim, n, bias=True)
         elif projection == "none":
             self.projection_dir = None
 
-        self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
+        # Single norm over head_input_dim — each head's features are normalised independently.
+        # When n_heads=1, head_input_dim == input_dim, recovering the original behaviour.
+        self.norm = nn.RMSNorm(self.head_input_dim, elementwise_affine=elementwise_affine)
         self.module = module
+        # Triton kernel expects a single [B, n, n] matrix — only use it for n_heads=1
         self._stream_mix = (
             self._stream_mix_triton
-            if use_triton and HAS_TRITON
+            if use_triton and HAS_TRITON and n_heads == 1
             else self._stream_mix_eager
         )
         self.init_weights()
@@ -138,11 +146,11 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(self.alpha_read_in, 0.01)
         nn.init.constant_(self.alpha_write_out, 0.01)
 
-        # Generator Static Parameters
+        # Generator Static Parameters — each head initialised independently
         if hasattr(self, "conserv_A"):
-            nn.init.eye_(self.conserv_A)
-            # Small asymmetry so skew-sym part is non-zero at init
             with torch.no_grad():
+                for h in range(self.n_heads):
+                    nn.init.eye_(self.conserv_A[h])
                 noise = torch.empty_like(self.conserv_A)
                 trunc_normal_(noise, std=0.01)
                 self.conserv_A.add_(noise)
@@ -157,41 +165,23 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.constant_(self.laplacian_A, -2.0)
 
         # Generator Dynamic Parameters
-        if hasattr(self, "conv_pred"):
-            trunc_normal_(self.conv_pred.weight, std=0.01)
-            nn.init.zeros_(self.conv_pred.bias)
-
-        if hasattr(self, "diss_pred"):
-            trunc_normal_(self.diss_pred.weight, std=0.01)
-            nn.init.zeros_(self.diss_pred.bias)
-
-        if hasattr(self, "laplacian_pred"):
-            trunc_normal_(self.laplacian_pred.weight, std=0.01)
-            nn.init.zeros_(self.laplacian_pred.bias)
+        for pred_name in ("conv_pred", "diss_pred", "laplacian_pred"):
+            if hasattr(self, pred_name):
+                pred = getattr(self, pred_name)
+                trunc_normal_(pred.weight, std=0.01)
+                nn.init.zeros_(pred.bias)
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
-        # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
-        dt_init_cons = math.exp(self.log_dt_init_cons)
-        target = (dt_init_cons - self.dt_min_cons) / (
-            self.dt_max_cons - self.dt_min_cons
-        )
+        # log_dt has shape [n_heads, n_dt]; all heads start at the same value.
+        target = (self.dt_init - self.dt_min) / (self.dt_max - self.dt_min)
         target = min(max(target, 1e-4), 1 - 1e-4)
         bias_init = math.log(target / (1 - target))
         nn.init.constant_(self.log_dt_conserv, bias_init)
-
-        dt_init_diss = math.exp(self.log_dt_init_diss)
-        target = (dt_init_diss - self.dt_min_diss) / (
-            self.dt_max_diss - self.dt_min_diss
-        )
-        target = min(max(target, 1e-4), 1 - 1e-4)
-        bias_init = math.log(target / (1 - target))
         nn.init.constant_(self.log_dt_diss, bias_init)
 
-        # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
-        trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_conserv.bias)
-        trunc_normal_(self.dt_proj_diss.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_diss.bias)
+        for proj in (self.dt_proj_conserv, self.dt_proj_diss):
+            trunc_normal_(proj.weight, std=0.01)
+            nn.init.zeros_(proj.bias)
 
         # Projections: small random init for weights, zero bias so initial mean behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
@@ -216,46 +206,47 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
 
-    def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the effective generator A of shape [B, n, n].
+    def compute_generator(self, x_norm_h: torch.Tensor) -> torch.Tensor:
+        """Return the effective generator A of shape [B*n_heads, n, n].
 
-        When vec_dt=True, each stream has its own time scale and the generator is
-        built via a symmetric congruence sandwich:
+        x_norm_h: [B*n_heads, head_input_dim] — already normalised per-head features.
+
+        Each head sees only its own feature slice and produces an independent [n, n]
+        generator via the same conservative/dissipative construction as the single-head
+        case. The static bias is per-head ([n_heads, n, n]); the dynamic predictor is
+        shared across heads. Stability (exp(A_h) contractive) holds per-head and
+        therefore for the concatenated map.
+
+        When vec_dt=True, the generator is built via a symmetric congruence sandwich:
 
             A = D_S^{1/2} (S) D_S^{1/2}  -  D_Q^{1/2} (Q) D_Q^{1/2}
 
-        where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B, n]
-        and entries in (dt_min, dt_max). The sandwich preserves skew-symmetry of S
-        and PSD-ness of Q, so the Lyapunov stability argument carries through.
-        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d).
-
-        When vec_dt=False, dt_conserv and dt_diss are scalars (shape [B, 1]) shared
-        across all streams, reducing the sandwich to a simple scalar scaling:
-
-            A = dt_conserv * S  -  dt_diss * Q
+        where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B*n_heads, n].
+        When vec_dt=False, dt_conserv and dt_diss are scalars (shape [B*n_heads, 1]).
         """
-        B = x.shape[0]
-        x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
-        A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)
+        Bh = x_norm_h.shape[0]
+        B = Bh // self.n_heads
+        A = torch.zeros(Bh, self.n, self.n, device=x_norm_h.device, dtype=x_norm_h.dtype)
 
         # --- Conservative branch ---
         if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
-            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min_cons + (
-                self.dt_max_cons - self.dt_min_cons
+            # static: [n_heads, n, n] -> [Bh, n, n]
+            static_conserv = self.conserv_A.unsqueeze(0).expand(B, -1, -1, -1).reshape(Bh, self.n, self.n)
+            M = static_conserv + self.conv_pred(x_norm_h).reshape(Bh, self.n, self.n)
+            # log_dt: [n_heads, n_dt] -> [Bh, n_dt]
+            logit_conserv = (
+                self.log_dt_conserv.unsqueeze(0).expand(B, -1, -1).reshape(Bh, -1)
+                + self.dt_proj_conserv(x_norm_h)
+            )
+            dt_conserv = self.dt_min + (
+                self.dt_max - self.dt_min
             ) * torch.sigmoid(logit_conserv)
-            skew = M - M.transpose(-1, -2)  # [B, n, n], skew-symmetric
+            skew = M - M.transpose(-1, -2)  # [Bh, n, n], skew-symmetric
             if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 skew_dt = dt_conserv.unsqueeze(-1) * skew
             else:
-                # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
-                sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
-                skew_dt = (
-                    sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
-                )
-
+                sqrt_dt_conserv = dt_conserv.sqrt()  # [Bh, n]
+                skew_dt = sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
             A = A + skew_dt
 
         # --- Shared dissipative dt ---
@@ -264,38 +255,36 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "diss_diag")
             or hasattr(self, "laplacian_A")
         ):
-            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min_diss + (
-                self.dt_max_diss - self.dt_min_diss
+            logit_diss = (
+                self.log_dt_diss.unsqueeze(0).expand(B, -1, -1).reshape(Bh, -1)
+                + self.dt_proj_diss(x_norm_h)
+            )
+            dt_diss = self.dt_min + (
+                self.dt_max - self.dt_min
             ) * torch.sigmoid(logit_diss)
-            sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
+            sqrt_dt_diss = dt_diss.sqrt()  # [Bh, n_dt]
 
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
-            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD
+            static_diss = self.diss_A.unsqueeze(0).expand(B, -1, -1, -1).reshape(Bh, self.n, self.n)
+            R = static_diss + self.diss_pred(x_norm_h).reshape(Bh, self.n, self.n)
+            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [Bh, n, n], PSD
             if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 diss_dt = dt_diss.unsqueeze(-1) * K
             else:
-                # Per-stream sandwich: (D^{1/2} K D^{1/2})_{ij} = sqrt_dt_i * K_{ij} * sqrt_dt_j
                 diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
             A = A - diss_dt
 
         # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
-            d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
-            # = diag(dt_diss * d)
-            A = A - torch.diag_embed(
-                dt_diss * d
-            )  # dt_diss [B,1] * d [B,n] broadcasts correctly
+            static_diag = self.diss_diag.unsqueeze(0).expand(B, -1, -1).reshape(Bh, self.n)
+            d = F.softplus(static_diag + self.diss_pred(x_norm_h))  # [Bh, n], positive
+            A = A - torch.diag_embed(dt_diss * d)
 
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
-            score_bias = self.laplacian_A
-            scores = self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
-            scores = score_bias + scores
+            static_lap = self.laplacian_A.unsqueeze(0).expand(B, -1, -1, -1).reshape(Bh, self.n, self.n)
+            scores = static_lap + self.laplacian_pred(x_norm_h).reshape(Bh, self.n, self.n)
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
@@ -304,48 +293,39 @@ class ContinuousGenHyperConnections(nn.Module):
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency  # PSD
             if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
             else:
-                laplacian_dt = (
-                    sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
-                )
+                laplacian_dt = sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
             A = A - laplacian_dt
 
         return A
 
-    def compute_transition(self, x: torch.Tensor) -> torch.Tensor:
-        """Return Phi = exp(dt * A), shape [B, n, n]."""
-        A = self.compute_generator(x)
-        # return expm_t18(A).to(x.dtype)
-        return torch.linalg.matrix_exp(A.float()).to(x.dtype)
+    def compute_transition(self, x_norm_h: torch.Tensor) -> torch.Tensor:
+        """x_norm_h: [B*n_heads, head_input_dim] -> Phi: [B*n_heads, n, n]."""
+        A = self.compute_generator(x_norm_h)
+        return torch.linalg.matrix_exp(A.float()).to(x_norm_h.dtype)
 
-    def compute_read_write_weights(self, x: torch.Tensor):
-        """Compute dynamic read/write weights from the current stream state."""
-        B = x.shape[0]
-        x_flat = x.view(B, -1)  # [B, input_dim]
-        x_norm = self.norm(x_flat)  # [B, input_dim]
-
-        h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
-        h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
-
+    def compute_read_write_weights(self, x_norm_h: torch.Tensor):
+        """x_norm_h: [B*n_heads, head_input_dim] -> ([B*n_heads, n, m], [B*n_heads, m, n])."""
+        Bh = x_norm_h.shape[0]
+        h_read_in = self.proj_read_in(x_norm_h).reshape(Bh, self.n, self.m)
+        h_write_out = self.proj_write_out(x_norm_h).reshape(Bh, self.n, self.m)
+        # static biases [n, m] broadcast over Bh
         read_in = torch.sigmoid(
             self.alpha_read_in * h_read_in + self.read_in
-        ).transpose(1, 2)  # [B, m, n]
+        ).transpose(1, 2)  # [Bh, m, n]
         write_out = 2 * torch.sigmoid(
             self.alpha_write_out * h_write_out + self.write_out
-        )  # [B, n, m]
-
+        )  # [Bh, n, m]
         return write_out, read_in
 
-    def compute_projection(self, x: torch.Tensor):
+    def compute_projection(self, x_norm_h: torch.Tensor):
+        """x_norm_h: [B*n_heads, head_input_dim] -> [B*n_heads, n] or [1, n] or None."""
         if self.projection == "mean":
-            return self.projection_dir.unsqueeze(0)  # [1, n]
+            return self.projection_dir.unsqueeze(0)  # [1, n], broadcasts over B*n_heads
         elif self.projection == "v":
-            B = x.shape[0]
-            x_flat = x.view(B, -1)
-            v = self.projection_dir(self.norm(x_flat))  # [B, n]
-            return F.normalize(v, dim=-1)  # [B, n], unit norm
+            v = self.projection_dir(x_norm_h)  # [B*n_heads, n]
+            return F.normalize(v, dim=-1)
         else:
             return None
 
@@ -372,23 +352,19 @@ class ContinuousGenHyperConnections(nn.Module):
         if projection_dir is None:
             x_mixed = einsum(
                 transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [B*, n, block_size]
+            )
         else:
             proj_matrix = einsum(
                 projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
-            )  # [b, n, n]
+            )
             orthogonal_proj = (
                 torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
-            )  # [b, n, n]
-            x_proj = einsum(
-                proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [b, n, block_size]
-            x_orth = einsum(
-                orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [b, n, block_size]
+            )
+            x_proj = einsum(proj_matrix, x, "b n1 n2, b n2 d -> b n1 d")
+            x_orth = einsum(orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d")
             x_mixed = x_proj + einsum(
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
-            )  # [B*, n, block_size]
+            )
         return x_mixed + Y
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -398,60 +374,58 @@ class ContinuousGenHyperConnections(nn.Module):
         Returns:
             [B, *, input_dim]
         """
-        ### x: [B, *, input_dim]
         leading = x.shape[:-1]
-        x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
+        x = x.reshape(-1, self.n, self.block_size)  # [B, n, block_size]
         B = x.shape[0]
+        Bh = B * self.n_heads
 
-        write_out, read_in = self.compute_read_write_weights(x)
+        # Fold heads into batch and normalise once
+        x_h = (
+            x.reshape(B, self.n, self.n_heads, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(Bh, self.n, self.head_dim)
+        )  # [Bh, n, head_dim]
+        x_norm_h = self.norm(x_h.reshape(Bh, self.head_input_dim))  # [Bh, head_input_dim]
+
+        write_out_h, read_in_h = self.compute_read_write_weights(x_norm_h)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
-        ### Read in from over-width space to backbone width
-        x_read = einsum(read_in, x, "b m n, b n d -> b m d")  ### [B*, m, block_size]
+        ### Read: [Bh, m, n] x [Bh, n, head_dim] -> [Bh, m, head_dim]
+        x_read_h = einsum(read_in_h, x_h, "b m n, b n d -> b m d")
 
-        ### Process through the backbone module
-        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
-
-        ### Write out from backbone width back to the over-width space
-        out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
-        Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
-
-        ### Steam Mixing
-        ### Mixing: X_new_mix = Phi @ X  (or protected variant)
-        transition_matrix = self.compute_transition(x)  ### [B, n, n]
-
-        ### compute projection direction for projected mixing
-        projection_dir = self.compute_projection(x)  ### [B, n] or None
-
-        # if projection_dir is None:
-        #     x_mixed = einsum(
-        #         transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-        #     )  # [B*, n, block_size]
-        # else:
-        #     proj_matrix = einsum(
-        #         projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
-        #     )  # [b, n, n]
-        #     orthogonal_proj = (
-        #         torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
-        #     )  # [b, n, n]
-        #     x_proj = einsum(
-        #         proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-        #     )  # [b, n, block_size]
-        #     x_orth = einsum(
-        #         orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
-        #     )  # [b, n, block_size]
-        #     x_mixed = x_proj + einsum(
-        #         transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
-        #     )  # [B*, n, block_size]
-        # return (x_mixed + Y).unflatten(0, leading).flatten(-2)
-
-        return (
-            self._stream_mix(
-                x=x,
-                transition_matrix=transition_matrix,
-                Y=Y,
-                projection_dir=projection_dir,
-            )
-            .unflatten(0, leading)
-            .flatten(-2)
+        ### Reshape for module: [Bh, m, head_dim] -> [B, m, n_heads, head_dim] -> [*, embed_dim]
+        out = self.module(
+            x_read_h.reshape(B, self.n_heads, self.m, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(*leading, self.embed_dim),
+            **kwargs,
         )
+
+        ### Reshape module output back: [B, embed_dim] -> [Bh, m, head_dim]
+        out_h = (
+            out.reshape(B, self.m, self.n_heads, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(Bh, self.m, self.head_dim)
+        )
+
+        ### Write: [Bh, n, m] x [Bh, m, head_dim] -> [Bh, n, head_dim]
+        Y_h = einsum(write_out_h, out_h, "b n m, b m d -> b n d")
+
+        ### Stream Mixing
+        transition_matrix = self.compute_transition(x_norm_h)  # [Bh, n, n]
+        projection_dir = self.compute_projection(x_norm_h)     # [Bh, n] or [1, n] or None
+
+        mixed_h = self._stream_mix(
+            x=x_h,
+            transition_matrix=transition_matrix,
+            Y=Y_h,
+            projection_dir=projection_dir,
+        )  # [Bh, n, head_dim]
+
+        ### Unfold heads from batch: [Bh, n, head_dim] -> [B, n, block_size]
+        result = (
+            mixed_h.reshape(B, self.n_heads, self.n, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(B, self.n, self.block_size)
+        )
+        return result.unflatten(0, leading).flatten(-2)
