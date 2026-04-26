@@ -34,8 +34,8 @@ from .numbers import (
 
 def _use_big_nb(x: torch.Tensor) -> bool:
     B, N, D = x.shape
-    ### "Safety" buffer: switch kernels when x occupies > T% of L2
-    c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 85 // 100
+    ### "Safety" buffer: switch kernels when x occupies > 75% of L2
+    c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
     # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
     return c
 

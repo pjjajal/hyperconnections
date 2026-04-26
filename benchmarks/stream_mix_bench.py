@@ -248,7 +248,7 @@ def run_correctness(
     """Run forward + backward correctness checks and print a summary table."""
     print()
     print(bold("=" * 90))
-    print(bold("  CORRECTNESS — random Phi"))
+    print(bold(" CORRECTNESS — random Phi"))
     print(bold("=" * 90))
     print(_CORR_HDR)
     print(_CORR_SEP)
@@ -275,29 +275,31 @@ def run_correctness(
         print(_CORR_SEP)
 
     ### Structured Phi correctness
-    # Focused config set to keep the table concise.
+    ### Focused config set to keep the table concise.
     print()
     print(bold("=" * 90))
-    print(bold("  CORRECTNESS — structured Phi  (fp32 only)"))
+    print(bold("  CORRECTNESS — Structured Phi"))
     print(bold("=" * 90))
     print(_CORR_HDR)
     print(_CORR_SEP)
 
-    struct_D_vals = _derive_D_vals(ms, embed_dims)
-    struct_configs = list(product(bs, ns, struct_D_vals))
-    dtype = torch.float32
-    atol_f, atol_b = 1e-3, 2e-3
+    for dtype_name in dtypes:
+        dtype  = _dtype(dtype_name)
+        struct_D_vals = _derive_D_vals(ms, embed_dims)
+        struct_configs = list(product(bs, ns, struct_D_vals))
+        # dtype = torch.float32
+        atol_f, atol_b = 1e-3, 2e-3
 
-    for phi_type, (B, N, D) in product(
-        ["skew_sym", "psd", "diagonal"], struct_configs
-    ):
-        factory = _PHI_FACTORIES[phi_type]
-        # Generate Phi with appropriate structure; x, Y are always random
-        _, x, Y = _make(B, N, D, dtype, seed=42)
-        Phi = factory(B, N, dtype).contiguous()
-        v   = _make_v(B, N, dtype)
-        cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D}"
-        all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
+        for phi_type, (B, N, D) in product(
+            ["skew_sym", "psd", "diagonal"], struct_configs
+        ):
+            factory = _PHI_FACTORIES[phi_type]
+            # Generate Phi with appropriate structure; x, Y are always random
+            _, x, Y = _make(B, N, D, dtype, seed=42)
+            Phi = factory(B, N, dtype).contiguous()
+            v   = _make_v(B, N, dtype)
+            cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D} {dtype_name}"
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
     print(_CORR_SEP)
     print()
