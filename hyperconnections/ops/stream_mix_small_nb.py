@@ -48,22 +48,21 @@ import triton.language as tl
 ### num_stages enables software pipelining; narrower BLOCK_D options give the
 ### autotuner room to avoid register spill at large N.
 ###
-
 _FWD_CONFIGS = [
-    triton.Config({"BLOCK_D": 32},  num_warps=2, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
-    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
 ]
 
 _DPHI_CONFIGS = [
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 128}, num_warps=1, num_stages=3),
+    triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_D": 512}, num_warps=8, num_stages=2),
 ]
 
 
@@ -100,7 +99,7 @@ def _stream_mix_fwd(
         phi_v = 0.0   # Phi[n1,:] @ v  (scalar)
         v_n1  = tl.load(v_ptr + b * stride_v_b + n1 * stride_v_n).to(tl.float32)
 
-    # Inner loop — fully unrolled at compile time (N_STREAMS is constexpr)
+    ### Inner loop — fully unrolled at compile time (N_STREAMS is constexpr)
     for n2 in tl.static_range(N_STREAMS):
         phi_val = tl.load(
             Phi_ptr + b * stride_phi_b + n1 * stride_phi_n1 + n2 * stride_phi_n2
@@ -142,7 +141,6 @@ def _stream_mix_fwd(
 ### beta is precomputed in Python and passed as beta_ptr.
 ### This removes the O(N²) nested loop from the original implementation.
 ###
-
 @triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_bwd_dx(
@@ -353,10 +351,10 @@ class _StreamMixFn(torch.autograd.Function):
         # which do their own .to(tl.float32) on loads).
         alpha = beta = phi_v = c = None
         if use_proj:
-            alpha = torch.einsum("bn,bnd->bd", v.float(), x.float())            # [B, D]
-            phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1) # [B, N]
+            alpha = torch.einsum("bn,bnd->bd", v.float(), x.float())             # [B, D]
+            phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1)  # [B, N]
             c     = v.float() - phi_v                                            # [B, N]
-            beta  = torch.einsum("bnd,bn->bd", G, c)                            # [B, D]
+            beta  = torch.einsum("bnd,bn->bd", G, c)                             # [B, D]
 
         ### grad_x (Triton)
         grad_x = torch.empty_like(x)
@@ -373,14 +371,14 @@ class _StreamMixFn(torch.autograd.Function):
         # Differentiating through both alpha = v^T x and c = v - Phi@v:
         #
         #   rho[b,n]    = Σ_d G[b,n,d] * alpha[b,d]
-        #   rho_part    = (I - Phi^T) @ rho          [d/dv of the c-term]
+        #   rho_part    = (I - Phi^T) @ rho              [d/dv of the c-term]
         #   beta_part   = einsum("bd,bnd->bn", beta, x)  [d/dv of the alpha-term]
         #   grad_v      = rho_part + beta_part
         grad_v = None
         if use_proj and ctx.needs_input_grad[3]:
             rho       = (G * alpha.unsqueeze(1)).sum(dim=2)                             # [B, N]
-            rho_part  = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1) # [B, N]
-            beta_part = torch.einsum("bd,bnd->bn", beta, x.float())                    # [B, N]
+            rho_part  = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)  # [B, N]
+            beta_part = torch.einsum("bd,bnd->bn", beta, x.float())                     # [B, N]
             grad_v    = (rho_part + beta_part).to(v.dtype)
 
         return (

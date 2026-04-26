@@ -58,6 +58,7 @@ def bold(s):
 def _dtype(name: str) -> torch.dtype:
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
+
 def _make(B, N, D, dtype, seed=0):
     torch.manual_seed(seed)
     Phi = torch.randn(B, N, N, device=DEVICE, dtype=dtype)
@@ -510,7 +511,6 @@ def run_structured_perf(
 ###
 ### Entry point
 ###
-
 def main():
     parser = argparse.ArgumentParser(description="stream_mix_add benchmark")
     parser.add_argument(
@@ -523,14 +523,14 @@ def main():
     )
     parser.add_argument(
         "--m", type=int, nargs="+", default=[1],
-        metavar="M", help="m values (modules per HC layer, default: 1 4)",
+        metavar="M", help="m values (modules per HC layer, default: 1)",
     )
     parser.add_argument(
         "--b", type=int, nargs="+", default=[1024],
         metavar="B", help="batch size values, shared across correctness and perf (default: 64 512 2048)",
     )
     parser.add_argument(
-        "--embed_dim", type=int, nargs="+", default=[1024],
+        "--embed-dim", type=int, nargs="+", default=[1024],
         metavar="E",
         help="embed_dim values; D = embed_dim // m (default: 128 256 512)",
     )
@@ -540,11 +540,11 @@ def main():
         help="dtypes to test (default: fp32 fp16)",
     )
     parser.add_argument(
-        "--warmup", type=int, default=25,
+        "--warmup", type=int, default=24,
         help="Triton do_bench warmup iterations (default: 25)",
     )
     parser.add_argument(
-        "--rep", type=int, default=200,
+        "--rep", type=int, default=256,
         help="Triton do_bench repetitions (default: 200)",
     )
     args = parser.parse_args()
