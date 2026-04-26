@@ -51,20 +51,29 @@ import triton.language as tl
 ###
 _BIG_NB_FWD_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
-    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
-    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
 
 _BIG_NB_DPHI_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
-    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
-    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=4),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
 
 

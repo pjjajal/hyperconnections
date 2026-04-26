@@ -31,13 +31,22 @@ from .numbers import (
     _SM80_A100_L2_BYTES,
 )
 
+### Playing around with new version
+# def _use_big_nb(x: torch.Tensor) -> bool:
+#     B, N, D = x.shape
+#     ### "Safety" buffer: switch kernels when x occupies > 75% of L2
+#     c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
+#     # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
+#     return c
+
 
 def _use_big_nb(x: torch.Tensor) -> bool:
     B, N, D = x.shape
-    ### "Safety" buffer: switch kernels when x occupies > 75% of L2
-    c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
-    # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
-    return c
+    if N < 16 or N % 16 != 0:
+        return False
+    # "Safety" buffer: switch kernels when x occupies > 75% of L2
+    return B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 0.75
+
 
 def stream_mix_add(
     Phi: torch.Tensor,
