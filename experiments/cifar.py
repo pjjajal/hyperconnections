@@ -413,8 +413,13 @@ def compute_stream_diversity(model, val_ds, device, n: int, seed: int = 42):
     return stats, layerwise
 
 
-def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, init: bool = False):
-    """Sample 10 images per class and compute per-layer HC mixing matrices."""
+def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, init: bool = False,
+                        projection: str = "none"):
+    """Sample images per class and compute per-layer HC mixing matrices.
+
+    When projection != 'none', also saves P + A(I-P) — the effective mixing
+    after the mean projection is applied, where P = (1/n) 11^T.
+    """
     indices = sample_per_class(val_ds, n_per_class=3, seed=seed)
     subset = Subset(val_ds, indices)
     images = torch.stack([subset[i]["img"] for i in range(len(subset))])
@@ -434,20 +439,28 @@ def run_mixing_analysis(model, val_ds, device, run_dir: Path, seed: int = 42, in
                 x, m = orig(x, return_mixing=True)
                 mixing_matrices.append(m)
 
-    # Stack per-layer matrices: [depth, B*seq, n, n]
+    # Stack per-layer matrices: [depth, B, seq_len, n, n]
     token_mixing = torch.stack([m["token"] for m in mixing_matrices])
     channel_mixing = torch.stack([m["channel"] for m in mixing_matrices])
 
-    torch.save(
-        {
-            "token_mixing": token_mixing,
-            "channel_mixing": channel_mixing,
-            "labels": labels,
-            "indices": indices,
-        },
-        run_dir / ("mixing_analysis_init.pt" if init else "mixing_analysis.pt"),
-    )
-    print(f"Mixing analysis saved: {token_mixing.shape} (depth, B, seq_len, n, n)")
+    save_dict = {
+        "token_mixing": token_mixing,
+        "channel_mixing": channel_mixing,
+        "labels": labels,
+        "indices": indices,
+    }
+
+    if projection != "none":
+        n = token_mixing.shape[-1]
+        dev = token_mixing.device
+        P   = torch.ones(n, n, device=dev) / n
+        I_P = torch.eye(n, device=dev) - P
+        save_dict["token_mixing_proj"]   = (P + token_mixing.float()   @ I_P).cpu()
+        save_dict["channel_mixing_proj"] = (P + channel_mixing.float() @ I_P).cpu()
+
+    torch.save(save_dict, run_dir / ("mixing_analysis_init.pt" if init else "mixing_analysis.pt"))
+    print(f"Mixing analysis saved: {token_mixing.shape} (depth, B, seq_len, n, n)"
+          + (f"  [+proj]" if projection != "none" else ""))
 
 
 def main():
@@ -542,7 +555,7 @@ def main():
         m=args.m,
         learned_expand_contract=args.learned_expand_contract,
         **hc_kwargs,
-    ).to(device).to(torch.bfloat16)
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     # model = torch.compile(model)
 
@@ -558,7 +571,8 @@ def main():
     ) if args.mixing_only else (None, None, None)
 
     if args.mixing_only:
-        run_mixing_analysis(model, val_ds, device, run_dir, seed=args.seed, init=True)
+        projection = args.projection if args.hc_type == "cghc" else "none"
+        run_mixing_analysis(model, val_ds, device, run_dir, seed=args.seed, init=True, projection=projection)
         return
 
     train_loader, val_loader, val_ds = get_cifar10_loaders(
@@ -622,7 +636,8 @@ def main():
     print(f"Weights saved to {run_dir / 'model.pt'}")
 
     if args.hc_type != "none":
-        run_mixing_analysis(model, val_ds, device, run_dir, seed=args.seed)
+        projection = args.projection if args.hc_type == "cghc" else "none"
+        run_mixing_analysis(model, val_ds, device, run_dir, seed=args.seed, projection=projection)
 
 
 if __name__ == "__main__":
