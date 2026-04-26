@@ -50,7 +50,8 @@ import triton.language as tl
 ### BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
 ###
 _BIG_NB_FWD_CONFIGS = [
-    triton.Config({"BLOCK_D": 32},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=8, num_stages=4),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
@@ -59,7 +60,8 @@ _BIG_NB_FWD_CONFIGS = [
 ]
 
 _BIG_NB_DPHI_CONFIGS = [
-    triton.Config({"BLOCK_D": 32},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
@@ -247,12 +249,12 @@ def _stream_mix_bwd_dPhi_big_nb(
     pid_b = tl.program_id(0)
     n_idx = tl.arange(0, N_STREAMS)
 
-    # Load v once — it is [N] and loop-invariant over d_tiles
+    ### Load v once — it is [N] and loop-invariant over d_tiles
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
         v_tile = tl.load(v_ptrs).to(tl.float32)   # [N]
 
-    # Accumulate grad_Phi[b] = Σ_tiles  G_tile @ x_eff_tile^T
+    ### Accumulate grad_Phi[b] = Σ_tiles  G_tile @ x_eff_tile^T
     acc = tl.zeros([N_STREAMS, N_STREAMS], dtype=tl.float32)
 
     n_blocks = tl.cdiv(D, BLOCK_D)
@@ -267,7 +269,7 @@ def _stream_mix_bwd_dPhi_big_nb(
             + n_idx[:, None] * stride_g_n
             + d_idx[None, :] * stride_g_d
         )
-        G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+        G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)     # [N, BLOCK_D]
 
         x_ptrs = (
             x_ptr
@@ -275,7 +277,7 @@ def _stream_mix_bwd_dPhi_big_nb(
             + n_idx[:, None] * stride_x_n
             + d_idx[None, :] * stride_x_d
         )
-        x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+        x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)     # [N, BLOCK_D]
 
         if USE_PROJ:
             alpha_ptrs = alpha_ptr + pid_b * stride_alpha_b + d_idx * stride_alpha_d
@@ -284,7 +286,7 @@ def _stream_mix_bwd_dPhi_big_nb(
         else:
             x_eff = x_tile
 
-        # [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
+        ### [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
         acc = tl.dot(G_tile, tl.trans(x_eff), acc=acc, allow_tf32=False)
 
     ### Store grad_Phi[b]
