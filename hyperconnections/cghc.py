@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.models.layers import trunc_normal_
 
-from hyperconnections.ops import stream_mix_add, expm_t18
+from hyperconnections.ops import HAS_TRITON, expm_t18, stream_mix_add
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -101,18 +101,11 @@ class ContinuousGenHyperConnections(nn.Module):
         if diag_diss:
             # Diagonal dissipation: store only the diagonal entries for efficiency
             # Initialised to -2.0 in init_weights, giving softplus(-2.0) ≈ 0.127
-            self.diss_diag = nn.Parameter(torch.full((n,), -5.0, requires_grad=True))
+            self.diss_diag = nn.Parameter(torch.full((n,), -2.0, requires_grad=True))
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_q = nn.Linear(
-                self.block_size, self.block_size // 4, bias=True
-            )
-            self.laplacian_k = nn.Linear(
-                self.block_size, self.block_size // 4, bias=True
-            )
-            self.laplacian_scale = (self.block_size // 4) ** -0.5
-            self.norm_lap = nn.RMSNorm(self.block_size, elementwise_affine=True)
+            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=True)
 
         # Projection Direction
         if projection == "mean":
@@ -125,7 +118,9 @@ class ContinuousGenHyperConnections(nn.Module):
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
         self._stream_mix = (
-            self._stream_mix_triton if use_triton else self._stream_mix_eager
+            self._stream_mix_triton
+            if use_triton and HAS_TRITON
+            else self._stream_mix_eager
         )
         self.init_weights()
 
@@ -159,7 +154,7 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.constant_(self.diss_diag, -2.0)
 
         if hasattr(self, "laplacian_A"):
-            nn.init.zeros_(self.laplacian_A)
+            nn.init.constant_(self.laplacian_A, -2.0)
 
         # Generator Dynamic Parameters
         if hasattr(self, "conv_pred"):
@@ -170,11 +165,9 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(self.diss_pred.weight, std=0.01)
             nn.init.zeros_(self.diss_pred.bias)
 
-        if hasattr(self, "laplacian_q"):
-            trunc_normal_(self.laplacian_q.weight, std=0.01)
-            nn.init.zeros_(self.laplacian_q.bias)
-            trunc_normal_(self.laplacian_k.weight, std=0.01)
-            nn.init.zeros_(self.laplacian_k.bias)
+        if hasattr(self, "laplacian_pred"):
+            trunc_normal_(self.laplacian_pred.weight, std=0.01)
+            nn.init.zeros_(self.laplacian_pred.bias)
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
         # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
@@ -222,12 +215,6 @@ class ContinuousGenHyperConnections(nn.Module):
         # RMSNorm weights: must be ones for proper normalization
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
-        if (
-            hasattr(self, "norm_lap")
-            and hasattr(self.norm_lap, "weight")
-            and self.norm_lap.weight is not None
-        ):
-            nn.init.ones_(self.norm_lap.weight)
 
     def compute_generator(self, x: torch.Tensor) -> torch.Tensor:
         """Return the effective generator A of shape [B, n, n].
@@ -248,8 +235,6 @@ class ContinuousGenHyperConnections(nn.Module):
             A = dt_conserv * S  -  dt_diss * Q
         """
         B = x.shape[0]
-        if hasattr(self, "laplacian_A"):
-            x_lap_norm = self.norm_lap(x)
         x_norm = self.norm(x.view(B, -1))  # [B, input_dim]
         A = torch.zeros(B, self.n, self.n, device=x.device, dtype=x.dtype)
 
@@ -309,9 +294,7 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
             score_bias = self.laplacian_A
-            lap_q = self.laplacian_q(x_lap_norm)
-            lap_k = self.laplacian_k(x_lap_norm)
-            scores = lap_q @ lap_k.transpose(-1, -2) * self.laplacian_scale
+            scores = self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
             scores = score_bias + scores
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = F.softplus(scores)
