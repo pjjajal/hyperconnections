@@ -49,29 +49,42 @@ import triton.language as tl
 ### Autotune configs
 ### BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
 ###
-_BIG_NB_FWD_CONFIGS = [
+_FWD_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=8, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
 
-_BIG_NB_DPHI_CONFIGS = [
+_DPHI_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=4),
-    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
@@ -80,7 +93,7 @@ _BIG_NB_DPHI_CONFIGS = [
 ###
 ### Forward kernel
 ###
-@triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_fwd_big_nb(
     Phi_ptr, x_ptr, Y_ptr, out_ptr, v_ptr,
@@ -165,7 +178,7 @@ def _stream_mix_fwd_big_nb(
 ###
 ### beta precomputed in Python — single load per d_tile, no nested N loop.
 ###
-@triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_bwd_dx_big_nb(
     G_ptr, Phi_ptr, v_ptr, beta_ptr, grad_x_ptr,
@@ -241,7 +254,7 @@ def _stream_mix_bwd_dx_big_nb(
 ### v is [N], loop-invariant → loaded once before the D loop.
 ### alpha is [B, D]          → loaded per d_tile inside the loop.
 ###
-@triton.autotune(configs=_BIG_NB_DPHI_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"])
 @triton.jit
 def _stream_mix_bwd_dPhi_big_nb(
     G_ptr, x_ptr, v_ptr, alpha_ptr, grad_Phi_ptr,

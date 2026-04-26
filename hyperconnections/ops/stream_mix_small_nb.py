@@ -48,15 +48,26 @@ import triton.language as tl
 ### num_stages enables software pipelining; narrower BLOCK_D options give the
 ### autotuner room to avoid register spill at large N.
 ###
+###
+### Autotune configs
+### BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
+###
 _FWD_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=8, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
@@ -64,13 +75,19 @@ _FWD_CONFIGS = [
 _DPHI_CONFIGS = [
     triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=4),
-    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
     triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
     triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]

@@ -1,3 +1,4 @@
+### Hardware and Kernel Constants
 ### A100 L2/L1 capacity in bytes
 _SM80_A100_NUM_SM = 108 
 _SM80_A100_L2_BYTES = 40 * 1024 * 1024
