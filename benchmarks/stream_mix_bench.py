@@ -31,6 +31,7 @@ from typing import Sequence
 import torch
 import triton
 import triton.testing
+from einops import einsum
 
 from hyperconnections.ops import stream_mix_add
 
@@ -97,8 +98,9 @@ def _make_diag_phi(B: int, N: int, dtype: torch.dtype, seed: int = 3) -> torch.T
     d = torch.randn(B, N, device=DEVICE, dtype=dtype)
     return torch.diag_embed(d)
 
-
-# Maps a short name to a factory (B, N, dtype) -> Phi
+###
+### Maps a short name to a factory (B, N, dtype) -> Phi
+###
 _PHI_FACTORIES = {
     "random":   lambda B, N, dt: _make(B, N, 1, dt, seed=0)[0],  # D unused
     "skew_sym": _make_skew_phi,
@@ -117,9 +119,9 @@ _PHI_LABEL = {
 ###
 ### Reference implementations
 ###
-
 def ref_no_proj(Phi, x, Y):
-    return torch.bmm(Phi, x) + Y
+    x_mixed = einsum(Phi, x, "b n1 n2, b n2 d -> b n1 d") + Y
+    return x_mixed
 
 
 def ref_diagonal_add(Phi, x, Y):
@@ -129,9 +131,22 @@ def ref_diagonal_add(Phi, x, Y):
 
 
 def ref_proj(Phi, x, Y, v):
-    alpha = torch.einsum("bn, bnd -> bd", v, x)
-    Phi_v = torch.bmm(Phi, v.unsqueeze(-1)).squeeze(-1)
-    return torch.bmm(Phi, x) + (v - Phi_v).unsqueeze(2) * alpha.unsqueeze(1) + Y
+    proj_matrix = einsum(
+        v, v, "b n1, b n2 -> b n1 n2"
+    )  # [b, n, n]
+    orthogonal_proj = (
+        torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
+    )  # [b, n, n]
+    x_proj = einsum(
+        proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+    )  # [b, n, block_size]
+    x_orth = einsum(
+        orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
+    )  # [b, n, block_size]
+    x_mixed = x_proj + einsum(
+        Phi, x_orth, "b n1 n2, b n2 d -> b n1 d"
+    )  # [B*, n, block_size]
+    return x_mixed + Y
 
 
 # torch.compile baselines — compiled once at import time.
