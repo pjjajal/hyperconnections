@@ -131,11 +131,12 @@ def ref_diagonal_add(Phi, x, Y):
 
 
 def ref_proj(Phi, x, Y, v):
+    b,n,d = x.shape 
     proj_matrix = einsum(
         v, v, "b n1, b n2 -> b n1 n2"
     )  # [b, n, n]
     orthogonal_proj = (
-        torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
+        torch.eye(n, device=x.device, dtype=x.dtype) - proj_matrix
     )  # [b, n, n]
     x_proj = einsum(
         proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
@@ -299,11 +300,12 @@ def run_correctness(
     print(_CORR_SEP)
 
     for dtype_name in dtypes:
-        dtype  = _dtype(dtype_name)
         struct_D_vals = _derive_D_vals(ms, embed_dims)
         struct_configs = list(product(bs, ns, struct_D_vals))
-        # dtype = torch.float32
-        atol_f, atol_b = 1e-3, 2e-3
+        
+        dtype  = _dtype(dtype_name)
+        atol_f = 1e-3 if dtype == torch.float32 else 2e-2
+        atol_b = 2e-3 if dtype == torch.float32 else 4e-2
 
         for phi_type, (B, N, D) in product(
             ["skew_sym", "psd", "diagonal"], struct_configs
@@ -420,9 +422,7 @@ def run_perf(
             )
             bw_p = _bytes_proj(B, N, D, elem) / (t_tri_p * 1e-3) / 1e9
             print(_perf_row(cfg_str, "proj", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
-
         print(_PERF_SEP)
-
     print()
 
 
