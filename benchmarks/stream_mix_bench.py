@@ -150,10 +150,10 @@ def ref_proj(Phi, x, Y, v):
     return x_mixed + Y
 
 
-# torch.compile baselines — compiled once at import time.
-# mode="reduce-overhead" enables CUDA graph capture and op fusion.
-_ref_no_proj_compiled = torch.compile(ref_no_proj, mode="reduce-overhead")
-_ref_proj_compiled    = torch.compile(ref_proj,    mode="reduce-overhead")
+### torch.compile baselines — compiled once at import time.
+### mode="reduce-overhead" enables CUDA graph capture and op fusion.
+_ref_no_proj_compiled = torch.compile(ref_no_proj)
+_ref_proj_compiled = torch.compile(ref_proj)
 
 
 def ref_proj_backward(Phi, x, Y, v):
@@ -558,11 +558,11 @@ def main():
     )
     parser.add_argument(
         "--warmup", type=int, default=24,
-        help="Triton do_bench warmup iterations (default: 25)",
+        help="Triton do_bench warmup iterations (default: 24)",
     )
     parser.add_argument(
-        "--rep", type=int, default=256,
-        help="Triton do_bench repetitions (default: 200)",
+        "--rep", type=int, default=128,
+        help="Triton do_bench repetitions (default: 128)",
     )
     args = parser.parse_args()
 
