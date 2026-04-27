@@ -93,7 +93,7 @@ _DPHI_CONFIGS = [
 ###
 ### Forward kernel
 ###
-@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_fwd_big_nb(
     Phi_ptr, x_ptr, Y_ptr, out_ptr, v_ptr,
@@ -327,13 +327,13 @@ def _stream_mix_bwd_dPhi_big_nb(
 def _make_v_arg(v: torch.Tensor | None, B: int, N: int, device, dtype):
     if v is not None:
         return v.contiguous()
-    return torch.zeros(B, N, dtype=dtype, device=device)
+    return torch.empty(B, N, dtype=dtype, device=device)
 
 
 def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
     if t is not None:
         return t.contiguous()
-    return torch.zeros(B, D, dtype=torch.float32, device=device)
+    return torch.empty(B, D, dtype=torch.float32, device=device)
 
 
 ###
