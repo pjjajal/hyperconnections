@@ -35,6 +35,7 @@ Thumbs.db
 # Project-specific
 .claude/
 *.pdf
+*.ncu-rep
 snr_analysis.py
 cutile-python/
 ptx_ir_dump/
