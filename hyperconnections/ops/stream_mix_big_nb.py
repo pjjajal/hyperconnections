@@ -132,23 +132,23 @@ def _stream_mix_fwd_big_nb(
         + n_idx[:, None] * stride_x_n
         + d_idx[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+    x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32) ### [N, BLOCK_D]
 
     ### acc = Phi @ x_tile [N, BLOCK_D] via tensor cores
-    acc = tl.dot(Phi_tile, x_tile, allow_tf32=False)  # [N, BLOCK_D], fp32
+    acc = tl.dot(Phi_tile, x_tile, allow_tf32=False) # [N, BLOCK_D], fp32
 
     ### Optional projection correction
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
-        v_tile = tl.load(v_ptrs).to(tl.float32)                       # [N]
+        v_tile = tl.load(v_ptrs).to(tl.float32)
 
-        # alpha[d] = v^T x_tile[:, d]  (partial sum over N; shape [BLOCK_D])
-        alpha = tl.sum(v_tile[:, None] * x_tile, axis=0)              # [BLOCK_D]
+        ### alpha[d] = v^T x_tile[:, d]  (partial sum over N; shape [BLOCK_D])
+        alpha = tl.sum(v_tile[:, None] * x_tile, axis=0) # [BLOCK_D]
 
-        # phi_v[n1] = Phi[n1, :] . v  (element-wise row dot; shape [N])
-        phi_v = tl.sum(Phi_tile * v_tile[None, :], axis=1)            # [N]
+        ### phi_v[n1] = Phi[n1, :] . v  (element-wise row dot; shape [N])
+        phi_v = tl.sum(Phi_tile * v_tile[None, :], axis=1) # [N]
 
-        # correction = (v - phi_v) * alpha  [N, BLOCK_D]
+        ### correction = (v - phi_v) * alpha  [N, BLOCK_D]
         acc = acc + (v_tile - phi_v)[:, None] * alpha[None, :]
 
     ### Add Y[b, :, d_tile]
@@ -178,7 +178,7 @@ def _stream_mix_fwd_big_nb(
 ###
 ### beta precomputed in Python — single load per d_tile, no nested N loop.
 ###
-@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dx_big_nb(
     G_ptr, Phi_ptr, v_ptr, beta_ptr, grad_x_ptr,
@@ -254,7 +254,7 @@ def _stream_mix_bwd_dx_big_nb(
 ### v is [N], loop-invariant → loaded once before the D loop.
 ### alpha is [B, D]          → loaded per d_tile inside the loop.
 ###
-@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dPhi_big_nb(
     G_ptr, x_ptr, v_ptr, alpha_ptr, grad_Phi_ptr,

@@ -29,7 +29,7 @@ NCU_PYTHON_VENV="/scratch/gilbreth/neliopou/venvs/hypercons/bin/python"
 ### Dispatch note: big_nb path activates when N>=16, N%16==0, and B*N*D*2 > 30 MB
 ###   e.g. B=512, N=32, D=1024 → 33 MB → big_nb; B=64, N=4, D=1024 → 0.5 MB → small_nb
 B=1024
-N=16
+N=8
 D=1024
 export B N D
 

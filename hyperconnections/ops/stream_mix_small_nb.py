@@ -96,7 +96,7 @@ _DPHI_CONFIGS = [
 ###
 ### Forward kernel
 ###
-@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_fwd(
     Phi_ptr, x_ptr, Y_ptr, out_ptr, v_ptr,
@@ -168,7 +168,7 @@ def _stream_mix_fwd(
 ### beta is precomputed in Python and passed as beta_ptr.
 ### This removes the O(N²) nested loop from the original implementation.
 ###
-@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dx(
     G_ptr, Phi_ptr, v_ptr, beta_ptr, grad_x_ptr,
@@ -233,7 +233,7 @@ def _stream_mix_bwd_dx(
 ### alpha[b, d] = Σ_n( v[b,n] * x[b,n,d] )
 ### Passing alpha as alpha_ptr removes the O(N³) inner static_range(N) loop.
 ###
-@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dPhi(
     G_ptr, x_ptr, v_ptr, alpha_ptr, grad_Phi_ptr,
