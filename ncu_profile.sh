@@ -67,7 +67,7 @@ torch.cuda.nvtx.range_pop()
 PYEOF
 
 echo "==> Pre-warming Triton autotune cache ..."
-TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton.py
+TRITON_ALWAYS_COMPILE=1 TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton.py
 
 echo "==> Profiling: Triton small_nb ..."
 TRITON_SKIP_AUTOTUNING=1 "${NCU_COMMON[@]}" \
