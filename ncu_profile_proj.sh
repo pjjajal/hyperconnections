@@ -1,7 +1,7 @@
 #!/bin/bash
-# ncu_profile.sh — NSight Compute profiling for stream_mix_add (fwd + bwd)
+# ncu_profile_proj.sh — NSight Compute profiling for stream_mix_add projection variant (fwd + bwd)
 #
-# Output: ncu_reports/{triton,eager,compiled}_{fwd,bwd}_B*_N*_D*_bfloat16.ncu-rep
+# Output: ncu_reports/{triton,eager,compiled}_proj_{fwd,bwd}_B*_N*_D*_bfloat16.ncu-rep
 #
 # Download and view:
 #   scp <user>@<host>:<projdir>/ncu_reports/*.ncu-rep .
@@ -42,8 +42,8 @@ NCU_COMMON=(
     --force-overwrite
 )
 
-### ── 1. Triton ──────────────────────────────────────────────────────
-cat > /tmp/_profile_triton.py << 'PYEOF'
+### ── 1. Triton proj forward ──────────────────────────────────────────────────
+cat > /tmp/_profile_triton_proj.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from hyperconnections.ops import stream_mix_add
@@ -52,26 +52,29 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
 torch.cuda.synchronize()
 
 ### profiled region
 torch.cuda.nvtx.range_push('profile_region')
-stream_mix_add(Phi, x, Y)
+stream_mix_add(Phi, x, Y, v=v)
 torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Pre-warming Triton autotune cache ..."
-TRITON_ALWAYS_COMPILE=1 TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton.py
+echo "==> Pre-warming Triton proj forward autotune cache ..."
+TRITON_ALWAYS_COMPILE=1 TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton_proj.py
 
-echo "==> Profiling: Triton small_nb ..."
+echo "==> Profiling: Triton proj forward ..."
 TRITON_SKIP_AUTOTUNING=1 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/triton_fwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_triton.py
-### ── 2. PyTorch eager ────────────────────────────────────────────────────────
-cat > /tmp/_profile_eager.py << 'PYEOF'
+    --export "${REPORTS}/triton_proj_fwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_triton_proj.py
+echo " "
+
+### ── 2. PyTorch eager proj forward ──────────────────────────────────────────
+cat > /tmp/_profile_eager_proj.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from einops import einsum
@@ -80,26 +83,33 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
-def f():
-    return einsum(Phi, x, 'b n1 n2, b n2 d -> b n1 d') + Y
+def f(Phi, x, Y, v):
+    n = x.shape[1]
+    proj_matrix    = einsum(v, v, 'b n1, b n2 -> b n1 n2')
+    orthogonal_proj = torch.eye(n, device=x.device, dtype=x.dtype) - proj_matrix
+    x_proj = einsum(proj_matrix,    x,     'b n1 n2, b n2 d -> b n1 d')
+    x_orth = einsum(orthogonal_proj, x,    'b n1 n2, b n2 d -> b n1 d')
+    x_mixed = x_proj + einsum(Phi, x_orth, 'b n1 n2, b n2 d -> b n1 d')
+    return x_mixed + Y
 
 ### profiled region
 torch.cuda.nvtx.range_push('profile_region')
-f()
+f(Phi, x, Y, v)
 torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Profiling: PyTorch eager ..."
+echo "==> Profiling: PyTorch eager proj forward ..."
 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/eager_fwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_eager.py
+    --export "${REPORTS}/eager_proj_fwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_eager_proj.py
 echo " "
 
-### ── 3. torch.compile ────────────────────────────────────────────────────────
-cat > /tmp/_profile_compiled.py << 'PYEOF'
+### ── 3. torch.compile proj forward ──────────────────────────────────────────
+cat > /tmp/_profile_compiled_proj.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from einops import einsum
@@ -108,27 +118,34 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
 @torch.compile
-def f(Phi, x, Y):
-    return einsum(Phi, x, 'b n1 n2, b n2 d -> b n1 d') + Y
+def f(Phi, x, Y, v):
+    n = x.shape[1]
+    proj_matrix    = einsum(v, v, 'b n1, b n2 -> b n1 n2')
+    orthogonal_proj = torch.eye(n, device=x.device, dtype=x.dtype) - proj_matrix
+    x_proj = einsum(proj_matrix,    x,     'b n1 n2, b n2 d -> b n1 d')
+    x_orth = einsum(orthogonal_proj, x,    'b n1 n2, b n2 d -> b n1 d')
+    x_mixed = x_proj + einsum(Phi, x_orth, 'b n1 n2, b n2 d -> b n1 d')
+    return x_mixed + Y
 
 ### profiled region
 torch.cuda.nvtx.range_push('profile_region')
-f(Phi, x, Y)
+f(Phi, x, Y, v)
 torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Profiling: torch.compile ..."
+echo "==> Profiling: torch.compile proj forward ..."
 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/compiled_fwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_compiled.py
+    --export "${REPORTS}/compiled_proj_fwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_compiled_proj.py
 echo " "
 
-### ── 4. Triton backward ─────────────────────────────────────────────────────
-cat > /tmp/_profile_triton_bwd.py << 'PYEOF'
+### ── 4. Triton proj backward ────────────────────────────────────────────────
+cat > /tmp/_profile_triton_proj_bwd.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from hyperconnections.ops import stream_mix_add
@@ -137,15 +154,16 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
 ### warmup: prime autotune caches for both fwd and bwd kernels
-out = stream_mix_add(Phi, x, Y)
+out = stream_mix_add(Phi, x, Y, v=v)
 out.sum().backward()
 Phi.grad = x.grad = Y.grad = None
 torch.cuda.synchronize()
 
 ### run forward outside profiled region — saves tensors needed by backward
-out = stream_mix_add(Phi, x, Y)
+out = stream_mix_add(Phi, x, Y, v=v)
 torch.cuda.synchronize()
 
 ### profiled region: backward only
@@ -155,18 +173,18 @@ torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Pre-warming Triton backward autotune cache ..."
-TRITON_ALWAYS_COMPILE=1 TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton_bwd.py
+echo "==> Pre-warming Triton proj backward autotune cache ..."
+TRITON_ALWAYS_COMPILE=1 TRITON_CACHE_AUTOTUNING=1 "${NCU_PYTHON_VENV}" /tmp/_profile_triton_proj_bwd.py
 
-echo "==> Profiling: Triton backward ..."
+echo "==> Profiling: Triton proj backward ..."
 TRITON_SKIP_AUTOTUNING=1 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/triton_bwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_triton_bwd.py
+    --export "${REPORTS}/triton_proj_bwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_triton_proj_bwd.py
 echo " "
 
-### ── 5. PyTorch eager backward ──────────────────────────────────────────────
-cat > /tmp/_profile_eager_bwd.py << 'PYEOF'
+### ── 5. PyTorch eager proj backward ─────────────────────────────────────────
+cat > /tmp/_profile_eager_proj_bwd.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from einops import einsum
@@ -175,12 +193,19 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
-def f(Phi, x, Y):
-    return einsum(Phi, x, 'b n1 n2, b n2 d -> b n1 d') + Y
+def f(Phi, x, Y, v):
+    n = x.shape[1]
+    proj_matrix    = einsum(v, v, 'b n1, b n2 -> b n1 n2')
+    orthogonal_proj = torch.eye(n, device=x.device, dtype=x.dtype) - proj_matrix
+    x_proj = einsum(proj_matrix,    x,     'b n1 n2, b n2 d -> b n1 d')
+    x_orth = einsum(orthogonal_proj, x,    'b n1 n2, b n2 d -> b n1 d')
+    x_mixed = x_proj + einsum(Phi, x_orth, 'b n1 n2, b n2 d -> b n1 d')
+    return x_mixed + Y
 
 ### run forward outside profiled region
-out = f(Phi, x, Y)
+out = f(Phi, x, Y, v)
 torch.cuda.synchronize()
 
 ### profiled region: backward only
@@ -190,15 +215,15 @@ torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Profiling: PyTorch eager backward ..."
+echo "==> Profiling: PyTorch eager proj backward ..."
 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/eager_bwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_eager_bwd.py
+    --export "${REPORTS}/eager_proj_bwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_eager_proj_bwd.py
 echo " "
 
-### ── 6. torch.compile backward ──────────────────────────────────────────────
-cat > /tmp/_profile_compiled_bwd.py << 'PYEOF'
+### ── 6. torch.compile proj backward ─────────────────────────────────────────
+cat > /tmp/_profile_compiled_proj_bwd.py << 'PYEOF'
 import sys, os; sys.path.insert(0, '.')
 import torch
 from einops import einsum
@@ -207,19 +232,26 @@ B, N, D = int(os.environ['B']), int(os.environ['N']), int(os.environ['D'])
 Phi = torch.randn(B, N, N, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 x   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
 Y   = torch.randn(B, N, D, device='cuda', dtype=torch.bfloat16).requires_grad_(True)
+v   = torch.nn.functional.normalize(torch.randn(B, N, device='cuda', dtype=torch.bfloat16), dim=-1)
 
 @torch.compile
-def f(Phi, x, Y):
-    return einsum(Phi, x, 'b n1 n2, b n2 d -> b n1 d') + Y
+def f(Phi, x, Y, v):
+    n = x.shape[1]
+    proj_matrix    = einsum(v, v, 'b n1, b n2 -> b n1 n2')
+    orthogonal_proj = torch.eye(n, device=x.device, dtype=x.dtype) - proj_matrix
+    x_proj = einsum(proj_matrix,    x,     'b n1 n2, b n2 d -> b n1 d')
+    x_orth = einsum(orthogonal_proj, x,    'b n1 n2, b n2 d -> b n1 d')
+    x_mixed = x_proj + einsum(Phi, x_orth, 'b n1 n2, b n2 d -> b n1 d')
+    return x_mixed + Y
 
 ### warmup: trigger compile and prime backward graph
-out = f(Phi, x, Y)
+out = f(Phi, x, Y, v)
 out.sum().backward()
 Phi.grad = x.grad = Y.grad = None
 torch.cuda.synchronize()
 
 ### run forward outside profiled region
-out = f(Phi, x, Y)
+out = f(Phi, x, Y, v)
 torch.cuda.synchronize()
 
 ### profiled region: backward only
@@ -229,11 +261,11 @@ torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()
 PYEOF
 
-echo "==> Profiling: torch.compile backward ..."
+echo "==> Profiling: torch.compile proj backward ..."
 "${NCU_COMMON[@]}" \
     --kernel-name-base function \
-    --export "${REPORTS}/compiled_bwd_B${B}_N${N}_D${D}_bfloat16" \
-    "${NCU_PYTHON_VENV}" /tmp/_profile_compiled_bwd.py
+    --export "${REPORTS}/compiled_proj_bwd_B${B}_N${N}_D${D}_bfloat16" \
+    "${NCU_PYTHON_VENV}" /tmp/_profile_compiled_proj_bwd.py
 echo " "
 
 ### ── Summary ────────────────────────────────────────────────────────────────
