@@ -230,13 +230,8 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
 
         # Feature mixing parameters
         torch.nn.init.zeros_(self.omega)
-        torch.nn.init.zeros_(self.log_alpha)
+        nn.init.constant_(self.log_alpha, -7.0)
         trunc_normal_(self.alpha_omega_proj.weight, std=0.01)
-
-        self.register_buffer("omega_mask", torch.ones_like(self.omega))
-        self.omega_mask[:, 0] = 0.0
-        if self.block_size % 2 == 0:
-            self.omega_mask[:, self.block_size // 2] = 0.0
 
         # RMSNorm weights: must be ones for proper normalization
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
@@ -427,9 +422,8 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
         alpha = alpha.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
         omega = omega.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
 
-        decay = torch.exp(-(log_alpha_bias.unsqueeze(0) + alpha))
+        decay = torch.exp(-torch.exp(log_alpha_bias.unsqueeze(0) + alpha))
         omega = omega_bias.unsqueeze(0) + omega
-        omega = self.omega_mask * omega
 
         # Euler form of `decay * exp(1j * omega)` — avoids the Python `1j`
         # literal that breaks torch._inductor's FallbackKernel codegen.

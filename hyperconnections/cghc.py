@@ -100,8 +100,8 @@ class ContinuousGenHyperConnections(nn.Module):
             self.diss_pred = nn.Linear(input_dim, n * n, bias=True)
         if diag_diss:
             # Diagonal dissipation: store only the diagonal entries for efficiency
-            # Initialised to -2.0 in init_weights, giving softplus(-2.0) ≈ 0.127
-            self.diss_diag = nn.Parameter(torch.full((n,), -2.0, requires_grad=True))
+            # Initialised to -8.0 in init_weights, giving softplus(-8.0) ≈ 0.000335
+            self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
             self.diss_pred = nn.Linear(input_dim, n, bias=True)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
@@ -151,7 +151,7 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(self.diss_A, std=0.01)
 
         if hasattr(self, "diss_diag"):
-            nn.init.constant_(self.diss_diag, -2.0)
+            nn.init.constant_(self.diss_diag, -8.0)
 
         if hasattr(self, "laplacian_A"):
             nn.init.constant_(self.laplacian_A, -2.0)
