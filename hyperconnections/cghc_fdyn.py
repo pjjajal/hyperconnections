@@ -167,7 +167,7 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
             trunc_normal_(self.diss_A, std=0.01)
 
         if hasattr(self, "diss_diag"):
-            nn.init.constant_(self.diss_diag, -2.0)
+            nn.init.constant_(self.diss_diag, -7.0)
 
         if hasattr(self, "laplacian_A"):
             nn.init.constant_(self.laplacian_A, -2.0)
@@ -422,7 +422,8 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
         alpha = alpha.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
         omega = omega.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
 
-        decay = torch.exp(-torch.exp(log_alpha_bias.unsqueeze(0) + alpha))
+        # decay = torch.exp(-torch.exp(log_alpha_bias.unsqueeze(0) + alpha))
+        decay = 1
         omega = omega_bias.unsqueeze(0) + omega
 
         # Euler form of `decay * exp(1j * omega)` — avoids the Python `1j`
