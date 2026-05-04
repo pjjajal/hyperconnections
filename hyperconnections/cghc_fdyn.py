@@ -119,10 +119,16 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
         # Spectral parameters: only k = 0, ..., d//2 are free (Hermitian symmetry)
         # Stored as real tensors of shape [d//2 + 1]
         # Each stream has its own set of spectral parameters, so total shape is [(d//2 + 1) * n]
-        self.omega = nn.Parameter(torch.zeros((self.n, self.block_size // 2 + 1)))   # ω_k, real
-        self.log_alpha = nn.Parameter(torch.zeros((self.n, self.block_size // 2 + 1)))   # log a_k → a_k = exp(log_a) ≥ 0
+        self.omega = nn.Parameter(
+            torch.zeros((self.n, self.block_size // 2 + 1))
+        )  # ω_k, real
+        self.log_alpha = nn.Parameter(
+            torch.zeros((self.n, self.block_size // 2 + 1))
+        )  # log a_k → a_k = exp(log_a) ≥ 0
 
-        pred_output = 2 * (self.block_size // 2 + 1) * self.n # predict real and imaginary parts for each frequency and stream
+        pred_output = (
+            2 * (self.block_size // 2 + 1) * self.n
+        )  # predict real and imaginary parts for each frequency and stream
         self.alpha_omega_proj = nn.Linear(input_dim, pred_output, bias=False)
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
@@ -405,10 +411,10 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
             )  # [B*, n, block_size]
         return x_mixed + Y
-    
 
     def feature_mix(self, x: torch.Tensor, x_norm: torch.Tensor) -> torch.Tensor:
-        """Apply feature-wise mixing to x, using input-dependent spectral parameters."""
+        """Apply feature-wise mixing to x, using input-dependent spectral
+        parameters."""
         B = x.shape[0]
         K = self.block_size // 2 + 1
 
@@ -416,21 +422,27 @@ class ContinuousHyperConnectionsFeatDyn(nn.Module):
         omega_bias = self.omega  # [n, block_size//2 + 1]
 
         alpha_omega = self.alpha_omega_proj(x_norm)  # [B, pred_output]
-        alpha, omega = torch.chunk(alpha_omega, 2, dim=-1)  # each [B, n * (block_size//2 + 1)]
-        
+        alpha, omega = torch.chunk(alpha_omega, 2, dim=-1)
+
         alpha = alpha.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
         omega = omega.reshape(B, self.n, K)  # [B, n, block_size//2 + 1]
 
-        decay = torch.exp(-(log_alpha_bias.unsqueeze(0) + alpha))  # [B, n, block_size//2 + 1]
-        omega = omega_bias.unsqueeze(0) + omega  # [B, n, block_size//2 + 1]
+        decay = torch.exp(-(log_alpha_bias.unsqueeze(0) + alpha))
+        omega = omega_bias.unsqueeze(0) + omega
+        omega = self.omega_mask * omega
 
-        omega = self.omega_mask * omega  # Apply mask to frequencies
-
-        H_dft = decay * torch.exp(1j * omega)  # [B, n, block_size//2 + 1]
+        # Euler form of `decay * exp(1j * omega)` — avoids the Python `1j`
+        # literal that breaks torch._inductor's FallbackKernel codegen.
+        H_real = decay * torch.cos(omega)
+        H_imag = decay * torch.sin(omega)
 
         X_dft = torch.fft.rfft(x.float(), dim=-1)
-        Y_dft = H_dft * X_dft  # [B, n, block_size//2 + 1]
-        y = torch.fft.irfft(Y_dft, n=self.block_size, dim=-1).to(x.dtype)  # [B, n, block_size]
+        # (a + ib)(c + id) = (ac - bd) + i(ad + bc)
+        Y_real = H_real * X_dft.real - H_imag * X_dft.imag
+        Y_imag = H_real * X_dft.imag + H_imag * X_dft.real
+        Y_dft = torch.complex(Y_real, Y_imag)
+
+        y = torch.fft.irfft(Y_dft, n=self.block_size, dim=-1).to(x.dtype)
         return y
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
