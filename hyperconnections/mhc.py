@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
+from timm.models.layers import trunc_normal_
 
 
 # Input Dimension: d_in = (n / m) * embed_dim
@@ -12,9 +13,9 @@ from einops import einsum
 # when m = n, we get the regular connections, where the input dimension is embed_dim.
 # when n > m > 1, we get a generalized version of hyperconnections, where the input dimension is (n / m) * embed_dim.
 
-# Sinkhorn-Knopp bias init: exp(5 · I_n) is strongly diagonally dominant so
-# Sinkhorn(exp(5 · I_n)) ≈ I_n, matching the identity-mapping starting point.
-_SINKHORN_BIAS_INIT = 5.0
+# Sinkhorn-Knopp bias init: exp(1 · I_n) is strongly diagonally dominant so
+# Sinkhorn(exp(1 · I_n)) ≈ I_n, matching the identity-mapping starting point.
+_SINKHORN_BIAS_INIT = 0.
 
 
 class ManifoldHyperConnections(nn.Module):
@@ -89,7 +90,7 @@ class ManifoldHyperConnections(nn.Module):
         # Projection weights: zero so the dynamic component starts negligible and
         # the initial behaviour is entirely determined by the static biases above.
         for proj in (self.proj_read_in, self.proj_write_out, self.proj_stream_mixing):
-            nn.init.zeros_(proj.weight)
+            trunc_normal_(proj.weight, std=0.01)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
 
