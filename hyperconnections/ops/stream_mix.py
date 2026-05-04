@@ -26,8 +26,17 @@ from __future__ import annotations
 
 import torch
 
-from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
-from .stream_mix_big_nb   import stream_mix_add_big_nb   as _big_nb
+try:
+    from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
+    from .stream_mix_big_nb import stream_mix_add_big_nb as _big_nb
+
+    HAS_TRITON = True
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _small_nb = None
+    _big_nb = None
+    HAS_TRITON = False
 
 # A100 L2 capacity in bytes.  Adjust if targeting a different GPU.
 _SM80_L2_BYTES = 40 * 1024 * 1024
@@ -58,6 +67,8 @@ def stream_mix_add(
     Returns:
         out: [B, N, D]
     """
+    if not HAS_TRITON:
+        raise RuntimeError("stream_mix_add requires Triton")
     if not x.is_cuda:
         raise RuntimeError("stream_mix_add requires CUDA tensors")
     B, N, D = x.shape

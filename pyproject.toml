@@ -17,6 +17,7 @@ experiments = [
     "transformers",
     "omegaconf",
     "trackio",
+    "matplotlib",
 ]
 
 [build-system]
