@@ -15,7 +15,7 @@ from timm.models.layers import trunc_normal_
 
 # Sinkhorn-Knopp bias init: exp(1 · I_n) is strongly diagonally dominant so
 # Sinkhorn(exp(1 · I_n)) ≈ I_n, matching the identity-mapping starting point.
-_SINKHORN_BIAS_INIT = 0.
+_SINKHORN_BIAS_INIT = 5.0
 
 
 class ManifoldHyperConnections(nn.Module):
