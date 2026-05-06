@@ -94,18 +94,18 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if conserv:
             self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conv_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.conv_pred = nn.Linear(input_dim, n * n, bias=False)
         if psd_diss:
             self.diss_A = nn.Parameter(torch.zeros(n, n))
-            self.diss_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
         if diag_diss:
             # Diagonal dissipation: store only the diagonal entries for efficiency
             # Initialised to -8.0 in init_weights, giving softplus(-8.0) ≈ 0.000335
             self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
-            self.diss_pred = nn.Linear(input_dim, n, bias=True)
+            self.diss_pred = nn.Linear(input_dim, n, bias=False)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=True)
+            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=False)
 
         # Projection Direction
         if projection == "mean":
@@ -154,20 +154,17 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.constant_(self.diss_diag, -8.0)
 
         if hasattr(self, "laplacian_A"):
-            nn.init.constant_(self.laplacian_A, -2.0)
+            nn.init.constant_(self.laplacian_A, -8.0)
 
         # Generator Dynamic Parameters
         if hasattr(self, "conv_pred"):
-            trunc_normal_(self.conv_pred.weight, std=0.01)
-            nn.init.zeros_(self.conv_pred.bias)
+            nn.init.zeros_(self.conv_pred.weight)
 
         if hasattr(self, "diss_pred"):
-            trunc_normal_(self.diss_pred.weight, std=0.01)
-            nn.init.zeros_(self.diss_pred.bias)
+            nn.init.zeros_(self.diss_pred.weight)
 
         if hasattr(self, "laplacian_pred"):
-            trunc_normal_(self.laplacian_pred.weight, std=0.01)
-            nn.init.zeros_(self.laplacian_pred.bias)
+            nn.init.zeros_(self.laplacian_pred.weight)
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
         # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
