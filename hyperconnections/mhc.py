@@ -90,7 +90,7 @@ class ManifoldHyperConnections(nn.Module):
         # Projection weights: zero so the dynamic component starts negligible and
         # the initial behaviour is entirely determined by the static biases above.
         for proj in (self.proj_read_in, self.proj_write_out, self.proj_stream_mixing):
-            trunc_normal_(proj.weight, std=0.01)
+            nn.init.zeros_(proj.weight)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
 
