@@ -142,10 +142,9 @@ def ref_torch_matrix_exp_backward(A: torch.Tensor):
     return A_r.grad
 
 
-### Eager (non-compiled) T18 baseline.  expm_t18 is @torch.compile'd in
-### expm.py; using it directly triggers inductor bmm autotuning noise.
-### __wrapped__ gives the original Python function without the compiler.
-_eager_t18 = expm_t18.__wrapped__
+### Eager (non-compiled) T18 baseline — same algorithm as expm_t18 but
+### without torch.compile, so inductor never runs.
+# expm_t18 = t18
 
 
 ###
@@ -186,8 +185,8 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     all_passed &= passed
     print(_corr_row(cfg_str, "triton", "fwd", err, atol_f, passed))
 
-    ### forward — Triton vs eager T18 (same algorithm, smaller tolerance)
-    ref_t18 = _eager_t18(A)
+    ### forward — Triton vs compiled T18 (same algorithm, smaller tolerance)
+    ref_t18 = expm_t18(A)
     passed, err = _check(got, ref_t18, atol_f)
     all_passed &= passed
     print(_corr_row(cfg_str, "vs T18", "fwd", err, atol_f, passed))
@@ -315,7 +314,7 @@ def run_perf(
                 if fwd:
                     t_tri   = triton.testing.do_bench(lambda: expm_t18_triton(A),      warmup=warmup, rep=rep)
                     t_torch = triton.testing.do_bench(lambda: ref_torch_matrix_exp(A), warmup=warmup, rep=rep)
-                    t_t18   = triton.testing.do_bench(lambda: _eager_t18(A),           warmup=warmup, rep=rep)
+                    t_t18   = triton.testing.do_bench(lambda: expm_t18(A),           warmup=warmup, rep=rep)
                     print(_perf_row(cfg_str, label, dtype_name, t_tri, t_torch, t_t18))
 
                 if bwd:
@@ -331,7 +330,7 @@ def run_perf(
 
                     def _b_t18():
                         A_g.grad = None
-                        _eager_t18(A_g).sum().backward()
+                        expm_t18(A_g).sum().backward()
 
                     t_b_tri   = triton.testing.do_bench(_b_tri,   warmup=warmup, rep=rep)
                     t_b_torch = triton.testing.do_bench(_b_torch, warmup=warmup, rep=rep)

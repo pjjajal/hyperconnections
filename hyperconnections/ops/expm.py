@@ -62,8 +62,7 @@ _b64 = -0.00001400867981820361
 _THETA_18_F32 = 3.01
 
 
-@torch.compile
-def expm_t18(A: torch.Tensor) -> torch.Tensor:
+def t18(A: torch.Tensor) -> torch.Tensor:
     """Compute the matrix exponential of A using the T_18 Taylor approximation.
 
     Args:
@@ -103,3 +102,6 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
         T_18 = torch.where(s > i, T_18 @ T_18, T_18)
 
     return T_18.to(original_dtype)
+
+
+expm_t18 = torch.compile(t18, fullgraph=True)
