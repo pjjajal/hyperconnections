@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -8,10 +7,10 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.models.layers import trunc_normal_
 
-from hyperconnections.ops import HAS_TRITON, expm_t18, stream_mix_add
+from hyperconnections.ops import HAS_TRITON, stream_mix_add
 
 
-class ContinuousGenHyperConnections(nn.Module):
+class ContinuousGenHyperConnectionsStrang(nn.Module):
     def __init__(
         self,
         n: int,
@@ -20,15 +19,7 @@ class ContinuousGenHyperConnections(nn.Module):
         embed_dim: int,
         module: nn.Module,
         dt: float = 0.01,
-        generator_type: Literal[
-            "conservative",
-            "psd_diss",
-            "diagonal_diss",
-            "laplacian",
-            "conservative_diag_diss",
-            "conservative_psd_diss",
-            "conservative_laplacian",
-        ] = "conservative_psd_diss",
+        generator_type: Literal["conservative_diag_diss"] = "conservative_diag_diss",
         projection: Literal["mean", "v", "none"] = "none",
         learn_dt: bool = False,
         dt_min: float = 0.001,
@@ -37,7 +28,6 @@ class ContinuousGenHyperConnections(nn.Module):
         elementwise_affine: bool = False,
         use_triton: bool = True,
         vec_dt: bool = False,
-        use_expm_t18: bool = False,
     ):
         super().__init__()
         self.n = n
@@ -46,7 +36,6 @@ class ContinuousGenHyperConnections(nn.Module):
         self.embed_dim = embed_dim
         self.generator_type = generator_type
         self.projection = projection
-        self.use_expm_t18 = use_expm_t18
 
         assert embed_dim % m == 0, (
             f"embed_dim ({embed_dim}) must be divisible by m ({m})"
@@ -83,29 +72,11 @@ class ContinuousGenHyperConnections(nn.Module):
         self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
         self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
 
-        # Generator parameters — boolean flags drive which components are created
-        conserv = generator_type in {
-            "conservative",
-            "conservative_diag_diss",
-            "conservative_psd_diss",
-            "conservative_laplacian",
-        }
-        psd_diss = generator_type in {"psd_diss", "conservative_psd_diss"}
-        diag_diss = generator_type in {"diagonal_diss", "conservative_diag_diss"}
-        laplacian = generator_type in {"laplacian", "conservative_laplacian"}
-
-        if conserv:
-            self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conv_pred = nn.Linear(input_dim, n * n, bias=False)
-        if psd_diss:
-            self.diss_A = nn.Parameter(torch.zeros(n, n))
-            self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
-        if diag_diss:
-            self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
-            self.diss_pred = nn.Linear(input_dim, n, bias=False)
-        if laplacian:
-            self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=False)
+        # Generator parameters: conservative + diagonal dissipation
+        self.conserv_A = nn.Parameter(torch.eye(n, n))
+        self.conv_pred = nn.Linear(input_dim, n * n, bias=False)
+        self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
+        self.diss_pred = nn.Linear(input_dim, n, bias=False)
 
         # Projection Direction
         if projection == "mean":
@@ -140,32 +111,18 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(self.alpha_write_out, 0.01)
 
         # Generator Static Parameters
-        if hasattr(self, "conserv_A"):
-            nn.init.eye_(self.conserv_A)
-            # Small asymmetry so skew-sym part is non-zero at init
-            with torch.no_grad():
-                noise = torch.empty_like(self.conserv_A)
-                trunc_normal_(noise, std=0.01)
-                self.conserv_A.add_(noise)
+        nn.init.eye_(self.conserv_A)
+        # Small asymmetry so skew-sym part is non-zero at init
+        with torch.no_grad():
+            noise = torch.empty_like(self.conserv_A)
+            trunc_normal_(noise, std=0.01)
+            self.conserv_A.add_(noise)
 
-        if hasattr(self, "diss_A"):
-            trunc_normal_(self.diss_A, std=0.01)
-
-        if hasattr(self, "diss_diag"):
-            nn.init.constant_(self.diss_diag, -8.0)
-
-        if hasattr(self, "laplacian_A"):
-            nn.init.constant_(self.laplacian_A, -8.0)
+        nn.init.constant_(self.diss_diag, -8.0)
 
         # Generator Dynamic Parameters
-        if hasattr(self, "conv_pred"):
-            nn.init.zeros_(self.conv_pred.weight)
-
-        if hasattr(self, "diss_pred"):
-            nn.init.zeros_(self.diss_pred.weight)
-
-        if hasattr(self, "laplacian_pred"):
-            nn.init.zeros_(self.laplacian_pred.weight)
+        nn.init.zeros_(self.conv_pred.weight)
+        nn.init.zeros_(self.diss_pred.weight)
 
         # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
         # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
@@ -212,129 +169,78 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
 
-    def compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Return the effective generator A of shape [B, n, n].
+    def compute_conservative(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Compute the conservative (skew-symmetric) part of the generator.
 
         Args:
             x_norm: Normalized input of shape [B, input_dim]
 
-        When vec_dt=True, each stream has its own time scale and the generator is
-        built via a symmetric congruence sandwich:
-
-            A = D_S^{1/2} (S) D_S^{1/2}  -  D_Q^{1/2} (Q) D_Q^{1/2}
-
-        where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B, n]
-        and entries in (dt_min, dt_max). The sandwich preserves skew-symmetry of S
-        and PSD-ness of Q, so the Lyapunov stability argument carries through.
-        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d).
-
-        When vec_dt=False, dt_conserv and dt_diss are scalars (shape [B, 1]) shared
-        across all streams, reducing the sandwich to a simple scalar scaling:
-
-            A = dt_conserv * S  -  dt_diss * Q
+        Returns:
+            Skew-symmetric matrix of shape [B, n, n] representing the conservative dynamics
         """
         B = x_norm.shape[0]
-        A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=x_norm.dtype)
+        M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
+        skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
 
-        # --- Conservative branch ---
-        if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
-            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min_cons + (
-                self.dt_max_cons - self.dt_min_cons
-            ) * torch.sigmoid(logit_conserv)
-            skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                skew_dt = dt_conserv.unsqueeze(-1) * skew
-            else:
-                # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
-                sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
-                skew_dt = (
-                    sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
-                )
+        # dt scaling for conservative part
+        logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
+        dt_conserv = self.dt_min_cons + (
+            self.dt_max_cons - self.dt_min_cons
+        ) * torch.sigmoid(logit_conserv)
+        if not self.vec_dt:
+            skew = dt_conserv.unsqueeze(-1) * skew
+        else:
+            sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
+            skew = sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
 
-            A = A + skew_dt
+        return skew
 
-        # --- Shared dissipative dt ---
-        if (
-            hasattr(self, "diss_A")
-            or hasattr(self, "diss_diag")
-            or hasattr(self, "laplacian_A")
-        ):
-            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min_diss + (
-                self.dt_max_diss - self.dt_min_diss
-            ) * torch.sigmoid(logit_diss)
-            sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
+    def compute_dissipative(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Compute the dissipative (diagonal) part of the generator.
 
-        # --- PSD dissipative (Gram matrix) branch ---
-        if hasattr(self, "diss_A"):
-            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                diss_dt = dt_diss.unsqueeze(-1) * K
-            else:
-                # Per-stream sandwich: (D^{1/2} K D^{1/2})_{ij} = sqrt_dt_i * K_{ij} * sqrt_dt_j
-                diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
-            A = A - diss_dt
+        Args:
+            x_norm: Normalized input of shape [B, input_dim]
 
-        # --- Diagonal dissipative branch ---
-        if hasattr(self, "diss_diag"):
-            d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
-            # = diag(dt_diss * d)
-            A = A - torch.diag_embed(
-                dt_diss * d
-            )  # dt_diss [B,1] * d [B,n] broadcasts correctly
+        Returns:
+            Diagonal elements of shape [B, n] representing dissipative dynamics (negative values)
+        """
+        d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
 
-        # --- Laplacian dissipative branch ---
-        if hasattr(self, "laplacian_A"):
-            score_bias = self.laplacian_A
-            scores = self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
-            scores = score_bias + scores
-            scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
-            adjacency = F.softplus(scores)
-            adjacency = adjacency - torch.diag_embed(
-                torch.diagonal(adjacency, dim1=-2, dim2=-1)
-            )
-            degree = torch.diag_embed(adjacency.sum(dim=-1))
-            laplacian = degree - adjacency  # PSD
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
-            else:
-                laplacian_dt = (
-                    sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
-                )
-            A = A - laplacian_dt
+        logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
+        dt_diss = self.dt_min_diss + (
+            self.dt_max_diss - self.dt_min_diss
+        ) * torch.sigmoid(logit_diss)
 
-        return A
+        # Negative since dissipation corresponds to negative eigenvalues
+        return -dt_diss * d
 
     def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Return Phi = exp(dt * A), shape [B, n, n].
+        """Compute the transition matrix Phi using Strang splitting: exp(0.5*D) exp(S) exp(0.5*D).
+
+        Where S is the conservative (skew-symmetric) part and D is the dissipative (diagonal) part.
 
         Args:
             x_norm: Normalized input of shape [B, input_dim]
+
+        Returns:
+            Transition matrix of shape [B, n, n]
         """
-        A = self.compute_generator(x_norm)
-        return torch.linalg.matrix_exp(A.float()).to(x_norm.dtype)
+        dtype = x_norm.dtype
+        device = x_norm.device
 
-    # This is a manual graph break so that the inner function is compiled with max-autotune
-    @torch.compiler.disable(recursive=False)
-    def _expm_t18(self, A: torch.Tensor) -> torch.Tensor:
-        """Compute matrix exponential using expm_t18 approximation."""
-        return expm_t18(A)
+        S = self.compute_conservative(x_norm)  # [B, n, n] skew-symmetric
+        D = self.compute_dissipative(x_norm)   # [B, n] diagonal elements (negative)
 
-    def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Alternative transition computation using expm_t18 approximation for efficiency.
+        # Strang splitting: Phi = exp(0.5*D) exp(S) exp(0.5*D)
+        # For diagonal D: exp(0.5*D) is element-wise exponential
+        exp_half_D = torch.exp(0.5 * D)  # [B, n]
 
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-        """
-        A = self.compute_generator(x_norm)
-        return self._expm_t18(A.float()).to(x_norm.dtype)
+        # For skew-symmetric S: use Cayley transform exp(S) = (I - S)^{-1} (I + S)
+        identity = torch.eye(self.n, device=device, dtype=dtype).unsqueeze(0)  # [1, n, n]
+        exp_S = torch.linalg.solve(identity - S, identity + S)  # [B, n, n]
+
+        # Combine: diag(exp_half_D) @ exp_S @ diag(exp_half_D)
+        return exp_half_D[:, :, None] * exp_S * exp_half_D[:, None, :]
 
     def compute_read_write_weights(self, x_norm: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state.
@@ -440,10 +346,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         ### Steam Mixing
         ### Mixing: X_new_mix = Phi @ X  (or protected variant)
-        if self.use_expm_t18:
-            transition_matrix = self.compute_transition_expm_t18(x_norm)  ### [B, n, n]
-        else:
-            transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
+        transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
 
         ### compute projection direction for projected mixing
         projection_dir = self.compute_projection(x_norm)  ### [B, n] or None
