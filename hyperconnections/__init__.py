@@ -1,1 +1,1 @@
-from . import attnhc, cghc, ghc, mhc
+from . import attnhc, cghc, ghc, mhc, cghc_strang
