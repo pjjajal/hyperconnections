@@ -236,8 +236,11 @@ class ContinuousGenHyperConnectionsStrang(nn.Module):
         exp_half_D = torch.exp(0.5 * D)  # [B, n]
 
         # For skew-symmetric S: use Cayley transform exp(S) = (I - S)^{-1} (I + S)
-        identity = torch.eye(self.n, device=device, dtype=dtype).unsqueeze(0)  # [1, n, n]
-        exp_S = torch.linalg.solve(identity - S, identity + S)  # [B, n, n]
+        # Use float32 for numerical stability and solve_ex to avoid CPU sync
+        identity = torch.eye(self.n, device=device, dtype=torch.float32).unsqueeze(0)  # [1, n, n]
+        S_f32 = S.float()
+        exp_S, _ = torch.linalg.solve_ex(identity - S_f32, identity + S_f32)  # [B, n, n]
+        exp_S = exp_S.to(dtype)
 
         # Combine: diag(exp_half_D) @ exp_S @ diag(exp_half_D)
         return exp_half_D[:, :, None] * exp_S * exp_half_D[:, None, :]
