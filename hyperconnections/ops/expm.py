@@ -81,7 +81,7 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
         s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
-        scale = 2.0 ** s
+        scale = (2.0 ** s).clone() 
     A = A / scale
 
     eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
