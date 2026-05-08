@@ -334,7 +334,7 @@ class ContinuousGenHyperConnections(nn.Module):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        return self._expm_t18(A.float()).to(x_norm.dtype)
+        return self._expm_t18(A)
 
     def compute_read_write_weights(self, x_norm: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state.
