@@ -161,8 +161,8 @@ def ref_proj(Phi, x, Y, v):
 
 ### torch.compile baselines — compiled once at import time.
 ### mode="reduce-overhead" enables CUDA graph capture and op fusion.
-_ref_no_proj_compiled = torch.compile(ref_no_proj)
-_ref_proj_compiled = torch.compile(ref_proj)
+_ref_no_proj_compiled = torch.compile(ref_no_proj, mode='max-autotune', fullgraph=True)
+_ref_proj_compiled = torch.compile(ref_proj, mode='max-autotune', fullgraph=True)
 
 
 def ref_proj_backward(Phi, x, Y, v):

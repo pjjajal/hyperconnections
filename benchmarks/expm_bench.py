@@ -41,7 +41,7 @@ import torch
 import triton
 import triton.testing
 
-from hyperconnections.ops import expm_t18, expm_t18_triton
+from hyperconnections.ops import expm_t18 as _expm_t18, expm_t18_triton
 
 ###
 ### Helpers
@@ -98,7 +98,7 @@ def _make_diag_A(B: int, N: int, dtype: torch.dtype, scale: float = 0.5, seed: i
     return torch.diag_embed(d)
 
 
-def _make_large_norm_A(B: int, N: int, dtype: torch.dtype, scale: float = 4.5, seed: int = 4):
+def _make_large_norm_A(B: int, N: int, dtype: torch.dtype, scale: float = 10.0, seed: int = 4):
     """Norm-stress: ||A||_1 lands around 3-5, triggering s=1-2 squarings.
 
     Larger scales (||A||_1 → 10+) drive ||exp(A)|| to thousands and cause
@@ -145,7 +145,7 @@ def ref_torch_matrix_exp_backward(A: torch.Tensor):
 ### Eager (non-compiled) T18 baseline — same algorithm as expm_t18 but
 ### without torch.compile, so inductor never runs.
 # expm_t18 = t18
-
+expm_t18 = torch.compile(_expm_t18, mode="max-autotune", fullgraph=False)
 
 ###
 ### Correctness checks
@@ -315,7 +315,7 @@ def run_perf(
                     t_tri   = triton.testing.do_bench(lambda: expm_t18_triton(A),      warmup=warmup, rep=rep)
                     t_torch = triton.testing.do_bench(lambda: ref_torch_matrix_exp(A), warmup=warmup, rep=rep)
                     t_t18   = triton.testing.do_bench(lambda: expm_t18(A),           warmup=warmup, rep=rep)
-                    print(_perf_row(cfg_str, label, dtype_name, t_tri, t_torch, t_t18))
+                    print(_perf_row(cfg_str, label + " fwd", dtype_name, t_tri, t_torch, t_t18))
 
                 if bwd:
                     A_g = A.detach().clone().requires_grad_(True)
@@ -335,7 +335,7 @@ def run_perf(
                     t_b_tri   = triton.testing.do_bench(_b_tri,   warmup=warmup, rep=rep)
                     t_b_torch = triton.testing.do_bench(_b_torch, warmup=warmup, rep=rep)
                     t_b_t18   = triton.testing.do_bench(_b_t18,   warmup=warmup, rep=rep)
-                    print(_perf_row(cfg_str, label + "+b", dtype_name, t_b_tri, t_b_torch, t_b_t18))
+                    print(_perf_row(cfg_str, label + " bwd", dtype_name, t_b_tri, t_b_torch, t_b_t18))
 
             print()  # blank between (N, B) groups
 
