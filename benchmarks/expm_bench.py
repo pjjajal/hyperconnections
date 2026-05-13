@@ -142,9 +142,7 @@ def ref_torch_matrix_exp_backward(A: torch.Tensor):
     return A_r.grad
 
 
-### Eager (non-compiled) T18 baseline — same algorithm as expm_t18 but
-### without torch.compile, so inductor never runs.
-# expm_t18 = t18
+### Compile eager torch expm_t18
 expm_t18 = torch.compile(_expm_t18, mode="max-autotune", fullgraph=False)
 
 ###

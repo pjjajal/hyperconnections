@@ -277,8 +277,8 @@ class _ExpmT18TritonFn(torch.autograd.Function):
         M[:, N:, N:] = A_T
         M[:, :N, N:] = G
 
-        expM = _expm_t18_no_grad(M, out_dtype=torch.float32)
-        return expM[:, :N, N:].to(A.dtype)
+        dExpM = _expm_t18_no_grad(M, out_dtype=A.dtype)
+        return dExpM[:, :N, N:]
 
 
 ###
