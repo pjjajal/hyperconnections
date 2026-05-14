@@ -131,7 +131,6 @@ _A_LABEL = {
 ### Reference implementations
 ###
 def ref_torch_matrix_exp(A: torch.Tensor) -> torch.Tensor:
-    """Ground-truth: PyTorch's matrix_exp computed in fp32."""
     return torch.linalg.matrix_exp(A.float()).to(A.dtype)
 
 
@@ -324,7 +323,7 @@ def run_perf(
 
                     def _b_torch():
                         A_g.grad = None
-                        torch.linalg.matrix_exp(A_g.float()).to(dtype).sum().backward()
+                        torch.linalg.matrix_exp(A_g).sum().backward()
 
                     def _b_t18():
                         A_g.grad = None

@@ -61,8 +61,7 @@ import triton.language as tl
 
 
 ###
-### T18 polynomial coefficients (Bader, Blanes & Casas 2019, eq. 15, k=5)
-### a01 = b01 = b04 = b14 = 0 (dropped from the polynomial below)
+### T18 Constants
 ###
 _THETA_18 = 3.01      # scaling threshold for u <= 2^-24 (fp32)
 _MAX_S    = 8         # max squarings ⇒ ||A||_1 up to θ₁₈ · 2^8 ≈ 770
@@ -120,15 +119,32 @@ def _matmul_nn(A, B, NP: tl.constexpr, n_idx):
     return R
 
 
+###
+### Helper for block-structured backward (or forward)
+###
+@triton.jit
+def _pair_mul(D1, U1, D2, U2, NP: tl.constexpr, n_idx):
+    ### Structured block product:
+    ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
+    D = _matmul_nn(D1, D2, NP, n_idx)
+    U = _matmul_nn(D1, U2, NP, n_idx) + _matmul_nn(U1, D2, NP, n_idx)
+    return D, U
+
+
+###
+### Alternate forward function for block matrix of form:
+### M = [A G; 0 A];
+###
 @triton.autotune(configs=_FWD_CONFIGS, key=["NP"])
 @triton.jit
-def _expm_t18_fwd(
-    A_ptr, out_ptr,
-    s_ptr, inv_scale_ptr,                # 0-d device scalars (no host sync)
-    stride_a_b, stride_a_n1, stride_a_n2,
+def _expm_t18_structured_fwd(
+    X_ptr, G_ptr, out_ptr,
+    s_ptr, inv_scale_ptr,                # 0-d device scalars for M, not just X
+    stride_x_b, stride_x_n1, stride_x_n2,
+    stride_g_b, stride_g_n1, stride_g_n2,
     stride_o_b, stride_o_n1, stride_o_n2,
-    N:         tl.constexpr,             # logical matrix size
-    NP:        tl.constexpr,             # next_pow2(N) — Triton tile size
+    N:         tl.constexpr,
+    NP:        tl.constexpr,
     MAX_S:     tl.constexpr,
     OUT_DTYPE: tl.constexpr,
 ):
@@ -137,26 +153,14 @@ def _expm_t18_fwd(
     n_mask = n_idx < N
     mask2d = n_mask[:, None] & n_mask[None, :]
 
-    ### Load A[b], upcast, and apply the scaling 1/2^s
-    a_off = (
-        pid_b * stride_a_b
-        + n_idx[:, None] * stride_a_n1
-        + n_idx[None, :] * stride_a_n2
-    )
-    A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
-    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
-    A = A * inv_scale
-
-    ### A^2, A^3, A^6 — see _matmul_nn for why we don't use the naïve
-    ### broadcast+sum contraction.
-    A2 = _matmul_nn(A,  A,  NP, n_idx)
-    A3 = _matmul_nn(A2, A,  NP, n_idx)
-    A6 = _matmul_nn(A3, A3, NP, n_idx)
-
-    ### Identity (NP×NP).  Padded diag ones live only in the [N:,N:] block.
-    eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
-
+    ###
     ### Polynomial blocks (a01 = b01 = b04 = b14 = 0 dropped)
+    ###
+    a11 = -0.10036558103014462
+    a21 = -0.00802924648241157
+    a31 = -0.00089213849804573
+
+    b11 =  0.39784974949645076
     a11 = -0.10036558103014462
     a21 = -0.00802924648241157
     a31 = -0.00089213849804573
@@ -181,6 +185,207 @@ def _expm_t18_fwd(
     b24 = -0.09233646193671186
     b34 = -0.01693649390020817
     b64 = -1.400867981820361e-05
+
+    b21 =  1.36783778460411719
+    b31 =  0.49828962252538268
+    b61 = -0.00063789819459247233
+
+    b02 = -10.96763960529620626
+    b12 =  1.68015813878906197
+    b22 =  0.05717798464788655
+    b32 = -0.00698210122488052
+    b62 =  3.349750170860705e-05
+
+    b03 = -0.09043168323908106
+    b13 = -0.06764045190713819
+    b23 =  0.06759613017740597
+    b33 =  0.02955525704293155
+    b63 = -1.391802575160607e-05
+
+    b24 = -0.09233646193671186
+    b34 = -0.01693649390020817
+    b64 = -1.400867981820361e-05
+
+    ### Load diagonal block X and upper block G.
+    ### For backward, X should be A^T and G should be grad_out.
+    x_off = (
+        pid_b * stride_x_b
+        + n_idx[:, None] * stride_x_n1
+        + n_idx[None, :] * stride_x_n2
+    )
+    g_off = (
+        pid_b * stride_g_b
+        + n_idx[:, None] * stride_g_n1
+        + n_idx[None, :] * stride_g_n2
+    )
+
+    X = tl.load(X_ptr + x_off, mask=mask2d, other=0.0).to(tl.float32)
+    G = tl.load(G_ptr + g_off, mask=mask2d, other=0.0).to(tl.float32)
+
+    ### Important: this scale should correspond to the full block matrix
+    ### M = [[X, G], [0, X]], not only X.
+    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
+
+    D1 = X * inv_scale
+    U1 = G * inv_scale
+
+    ### Structured powers:
+    ### M^1 = (D1, U1)
+    ### M^2 = (D2, U2)
+    ### M^3 = (D3, U3)
+    ### M^6 = (D6, U6)
+    D2, U2 = _pair_mul(D1, U1, D1, U1, NP, n_idx)
+    D3, U3 = _pair_mul(D2, U2, D1, U1, NP, n_idx)
+    D6, U6 = _pair_mul(D3, U3, D3, U3, NP, n_idx)
+
+    ### Identity contributes only to diagonal blocks.
+    eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
+
+    ### B1 = a11 M + a21 M^2 + a31 M^3
+    DB1 = a11 * D1 + a21 * D2 + a31 * D3
+    UB1 = a11 * U1 + a21 * U2 + a31 * U3
+
+    ### B2 = b11 M + b21 M^2 + b31 M^3 + b61 M^6
+    DB2 = b11 * D1 + b21 * D2 + b31 * D3 + b61 * D6
+    UB2 = b11 * U1 + b21 * U2 + b31 * U3 + b61 * U6
+
+    ### B3 = b02 I + b12 M + b22 M^2 + b32 M^3 + b62 M^6
+    DB3 = b02 * eye + b12 * D1 + b22 * D2 + b32 * D3 + b62 * D6
+    UB3 =             b12 * U1 + b22 * U2 + b32 * U3 + b62 * U6
+
+    ### B4 = b03 I + b13 M + b23 M^2 + b33 M^3 + b63 M^6
+    DB4 = b03 * eye + b13 * D1 + b23 * D2 + b33 * D3 + b63 * D6
+    UB4 =             b13 * U1 + b23 * U2 + b33 * U3 + b63 * U6
+
+    ### B5 = b24 M^2 + b34 M^3 + b64 M^6
+    DB5 = b24 * D2 + b34 * D3 + b64 * D6
+    UB5 = b24 * U2 + b34 * U3 + b64 * U6
+
+    ### A9 = B1 @ B5 + B4
+    DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx)
+
+    DA9 = DA9_tmp + DB4
+    UA9 = UA9_tmp + UB4
+
+    ### T18 = B2 + (B3 + A9) @ A9
+    DC = DB3 + DA9
+    UC = UB3 + UA9
+
+    DCA9, UCA9 = _pair_mul(DC, UC, DA9, UA9, NP, n_idx)
+
+    DT18 = DB2 + DCA9
+    UT18 = UB2 + UCA9
+
+    ### Structured repeated squaring:
+    ### (D, U)^2 = (D @ D, D @ U + U @ D)
+    s_val = tl.load(s_ptr).to(tl.int32)
+
+    for i in tl.static_range(MAX_S):
+        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx)
+        DT18 = tl.where(s_val > i, D_sq, DT18)
+        UT18 = tl.where(s_val > i, U_sq, UT18)
+
+    ### Store only the upper-right block, i.e. the Frechet derivative block.
+    o_off = (
+        pid_b * stride_o_b
+        + n_idx[:, None] * stride_o_n1
+        + n_idx[None, :] * stride_o_n2
+    )
+
+    tl.store(out_ptr + o_off, UT18.to(OUT_DTYPE), mask=mask2d)
+
+
+###
+### Standard forward function
+###
+@triton.autotune(configs=_FWD_CONFIGS, key=["NP"])
+@triton.jit
+def _expm_t18_fwd(
+    A_ptr, out_ptr,
+    s_ptr, inv_scale_ptr,                # 0-d device scalars (no host sync)
+    stride_a_b, stride_a_n1, stride_a_n2,
+    stride_o_b, stride_o_n1, stride_o_n2,
+    N:         tl.constexpr,             # logical matrix size
+    NP:        tl.constexpr,             # next_pow2(N) — Triton tile size
+    MAX_S:     tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_b  = tl.program_id(0)
+    n_idx  = tl.arange(0, NP)
+    n_mask = n_idx < N
+    mask2d = n_mask[:, None] & n_mask[None, :]
+
+    ###
+    ### Polynomial blocks (a01 = b01 = b04 = b14 = 0 dropped)
+    ###
+    a11 = -0.10036558103014462
+    a21 = -0.00802924648241157
+    a31 = -0.00089213849804573
+
+    b11 =  0.39784974949645076
+    a11 = -0.10036558103014462
+    a21 = -0.00802924648241157
+    a31 = -0.00089213849804573
+
+    b11 =  0.39784974949645076
+    b21 =  1.36783778460411719
+    b31 =  0.49828962252538268
+    b61 = -0.00063789819459247233
+
+    b02 = -10.96763960529620626
+    b12 =  1.68015813878906197
+    b22 =  0.05717798464788655
+    b32 = -0.00698210122488052
+    b62 =  3.349750170860705e-05
+
+    b03 = -0.09043168323908106
+    b13 = -0.06764045190713819
+    b23 =  0.06759613017740597
+    b33 =  0.02955525704293155
+    b63 = -1.391802575160607e-05
+
+    b24 = -0.09233646193671186
+    b34 = -0.01693649390020817
+    b64 = -1.400867981820361e-05
+
+    b21 =  1.36783778460411719
+    b31 =  0.49828962252538268
+    b61 = -0.00063789819459247233
+
+    b02 = -10.96763960529620626
+    b12 =  1.68015813878906197
+    b22 =  0.05717798464788655
+    b32 = -0.00698210122488052
+    b62 =  3.349750170860705e-05
+
+    b03 = -0.09043168323908106
+    b13 = -0.06764045190713819
+    b23 =  0.06759613017740597
+    b33 =  0.02955525704293155
+    b63 = -1.391802575160607e-05
+
+    b24 = -0.09233646193671186
+    b34 = -0.01693649390020817
+    b64 = -1.400867981820361e-05
+
+    ### Load A[b], upcast, and apply the scaling 1/2^s
+    a_off = (
+        pid_b * stride_a_b
+        + n_idx[:, None] * stride_a_n1
+        + n_idx[None, :] * stride_a_n2
+    )
+    A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
+    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
+    A = A * inv_scale
+
+    ### A^2, A^3, A^6 — see _matmul_nn for why we don't use the naïve
+    ### broadcast+sum contraction.
+    A2 = _matmul_nn(A,  A,  NP, n_idx)
+    A3 = _matmul_nn(A2, A,  NP, n_idx)
+    A6 = _matmul_nn(A3, A3, NP, n_idx)
+
+    ### Identity (NP×NP).  Padded diag ones live only in the [N:,N:] block.
+    eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
 
     B1 = a11 * A           + a21 * A2 + a31 * A3
     B2 = b11 * A           + b21 * A2 + b31 * A3 + b61 * A6
@@ -217,6 +422,9 @@ def _next_pow2(x: int) -> int:
     return 1 if x <= 1 else 1 << (x - 1).bit_length()
 
 
+###
+###
+###
 def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
     Function for both forward and the augmented-matrix backward."""
@@ -250,6 +458,46 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 
 ###
+###
+###
+def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Triton T18 forward.  No autograd wrapping; used by the autograd
+    Function for both forward and the augmented-matrix backward."""
+    if not A_T.is_cuda:
+        raise RuntimeError("expm_t18_structure_no_grad requires CUDA tensors")
+    if A_T.dim() != 3 or A_T.shape[-1] != A_T.shape[-2]:
+        raise ValueError(f"expected [B, N, N], got {tuple(A_T.shape)}")
+    if out_dtype not in _TORCH_TO_TL:
+        raise ValueError(f"unsupported out_dtype {out_dtype}")
+
+    B, N, _ = A_T.shape
+    # X = A_T 
+    X = A_T.to(torch.float32).contiguous()
+
+    ### Global scaling factor
+    X_colsum = X.abs().sum(dim=-2)
+    G_colsum = G.abs().sum(dim=-2)
+
+    M_norm = (X_colsum + G_colsum).amax()
+    M_norm = M_norm.clamp_min(_THETA_18)
+
+    s = torch.ceil(torch.log2(M_norm / _THETA_18)).clamp(min=0)
+    inv_scale = 2.0 ** (-s)
+
+    out = torch.empty_like(G)
+    NP  = _next_pow2(N)
+
+    _expm_t18_structured_fwd[(B,)](
+        X, G, out,
+        s, inv_scale,
+        *X.stride(), *G.stride(), *out.stride(),
+        N=N, NP=NP, MAX_S=_MAX_S,
+        OUT_DTYPE=_TORCH_TO_TL[out_dtype],
+    )
+    return out
+
+
+###
 ### Autograd Function (Higham §10.6 augmented-matrix backward)
 ###
 class _ExpmT18TritonFn(torch.autograd.Function):
@@ -272,13 +520,18 @@ class _ExpmT18TritonFn(torch.autograd.Function):
         A_T = A.float().transpose(-1, -2).contiguous()
         G   = grad_out.float().contiguous()
 
-        M = torch.zeros(B, 2 * N, 2 * N, dtype=torch.float32, device=A.device)
-        M[:, :N, :N] = A_T
-        M[:, N:, N:] = A_T
-        M[:, :N, N:] = G
+        ### STANDARD BWD (Not great for N=4)
+        # M = torch.zeros(B, 2 * N, 2 * N, dtype=torch.float32, device=A.device)
+        # M[:, :N, :N] = A_T
+        # M[:, N:, N:] = A_T
+        # M[:, :N, N:] = G
 
-        dExpM = _expm_t18_no_grad(M, out_dtype=A.dtype)
-        return dExpM[:, :N, N:]
+        # dExpM = _expm_t18_no_grad(M, out_dtype=A.dtype)
+        # return dExpM[:, :N, N:]
+
+        ### BLOCK-STRUTURE BWD
+        dExpM = _expm_t18_structure_no_grad(A_T, G, out_dtype=A.dtype)
+        return dExpM
 
 
 ###
