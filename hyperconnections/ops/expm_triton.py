@@ -54,10 +54,16 @@ identity matrix used in the polynomial is full-NP×NP.
 """
 
 from __future__ import annotations
-
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    HAS_TRITON = False
 
 
 ###
@@ -546,4 +552,9 @@ def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
     Returns:
         exp(A) with the same shape and dtype as A.
     """
+    if not HAS_TRITON:
+        raise RuntimeError("expm_t18_triton requires Triton")
+    if not x.is_cuda:
+        raise RuntimeError("expm_t18_triton requires CUDA tensors")
+
     return _ExpmT18TritonFn.apply(A)

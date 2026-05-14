@@ -102,4 +102,3 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
         T_18 = torch.where(s > i, T_18 @ T_18, T_18)
 
     return T_18.to(original_dtype)
-

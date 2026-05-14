@@ -24,12 +24,22 @@ Threshold:  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 0.75 * L2_BYTES
 
 from __future__ import annotations
 import torch
-from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
-from .stream_mix_big_nb   import stream_mix_add_big_nb   as _big_nb
-from .numbers import (
-    _SM80_A100_L1_PER_SM_BYTES,
-    _SM80_A100_L2_BYTES,
-)
+
+try:
+    from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
+    from .stream_mix_big_nb import stream_mix_add_big_nb as _big_nb
+    from .numbers import (
+        _SM80_A100_L1_PER_SM_BYTES,
+        _SM80_A100_L2_BYTES,
+    )
+    HAS_TRITON = True
+
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _small_nb = None
+    _big_nb = None
+    HAS_TRITON = False
 
 ### Playing around with new version
 # def _use_big_nb(x: torch.Tensor) -> bool:
@@ -65,6 +75,8 @@ def stream_mix_add(
     Returns:
         out: [B, N, D]
     """
+    if not HAS_TRITON:
+        raise RuntimeError("stream_mix_add requires Triton")
     if not x.is_cuda:
         raise RuntimeError("stream_mix_add requires CUDA tensors")
     B, N, D = x.shape

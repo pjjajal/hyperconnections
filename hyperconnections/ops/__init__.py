@@ -1,5 +1,7 @@
-from .stream_mix import stream_mix_add
+from .stream_mix import HAS_TRITON, stream_mix_add
 from .expm import expm_t18
 from .expm_triton import expm_t18_triton
+from .expm_block import expm_t18_augmented_sparse
 
-__all__ = ["stream_mix_add", "expm_t18", "expm_t18_triton"]
+
+__all__ = ["HAS_TRITON", "stream_mix_add", "expm_t18", "expm_t18_triton", "expm_t18_augmented_sparse"]
