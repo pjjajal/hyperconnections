@@ -323,7 +323,7 @@ class ContinuousGenHyperConnections(nn.Module):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        return self._expm_t18(A).to(x_norm.dtype)
+        return self._matrix_exp(A)
 
     # This is a manual graph break so that the inner function is compiled with max-autotune
     @torch.compiler.disable(recursive=False)
