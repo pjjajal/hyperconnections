@@ -49,27 +49,51 @@ import triton.language as tl
 ### Autotune configs
 ### BLOCK_D must be a power-of-2 ≥ 16 for tl.dot on Ampere (sm_80).
 ###
-_BIG_NB_FWD_CONFIGS = [
-    triton.Config({"BLOCK_D": 32},  num_warps=4, num_stages=3),
+_FWD_CONFIGS = [
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
     triton.Config({"BLOCK_D": 64},  num_warps=8, num_stages=4),
+    ###
+    triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
 
-_BIG_NB_DPHI_CONFIGS = [
-    triton.Config({"BLOCK_D": 32},  num_warps=4, num_stages=3),
+_DPHI_CONFIGS = [
+    triton.Config({"BLOCK_D": 64},  num_warps=1, num_stages=2),
+    triton.Config({"BLOCK_D": 64},  num_warps=2, num_stages=4),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=2),
     triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 64},  num_warps=4, num_stages=4),
+    ###
+    triton.Config({"BLOCK_D": 128}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
+    ###
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=2, num_stages=3),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=4),
 ]
 
 
 ###
 ### Forward kernel
 ###
-@triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_fwd_big_nb(
     Phi_ptr, x_ptr, Y_ptr, out_ptr, v_ptr,
@@ -108,23 +132,23 @@ def _stream_mix_fwd_big_nb(
         + n_idx[:, None] * stride_x_n
         + d_idx[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+    x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32) ### [N, BLOCK_D]
 
     ### acc = Phi @ x_tile [N, BLOCK_D] via tensor cores
-    acc = tl.dot(Phi_tile, x_tile, allow_tf32=False)  # [N, BLOCK_D], fp32
+    acc = tl.dot(Phi_tile, x_tile, allow_tf32=False) # [N, BLOCK_D], fp32
 
     ### Optional projection correction
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
-        v_tile = tl.load(v_ptrs).to(tl.float32)                       # [N]
+        v_tile = tl.load(v_ptrs).to(tl.float32)
 
-        # alpha[d] = v^T x_tile[:, d]  (partial sum over N; shape [BLOCK_D])
-        alpha = tl.sum(v_tile[:, None] * x_tile, axis=0)              # [BLOCK_D]
+        ### alpha[d] = v^T x_tile[:, d]  (partial sum over N; shape [BLOCK_D])
+        alpha = tl.sum(v_tile[:, None] * x_tile, axis=0) # [BLOCK_D]
 
-        # phi_v[n1] = Phi[n1, :] . v  (element-wise row dot; shape [N])
-        phi_v = tl.sum(Phi_tile * v_tile[None, :], axis=1)            # [N]
+        ### phi_v[n1] = Phi[n1, :] . v  (element-wise row dot; shape [N])
+        phi_v = tl.sum(Phi_tile * v_tile[None, :], axis=1) # [N]
 
-        # correction = (v - phi_v) * alpha  [N, BLOCK_D]
+        ### correction = (v - phi_v) * alpha  [N, BLOCK_D]
         acc = acc + (v_tile - phi_v)[:, None] * alpha[None, :]
 
     ### Add Y[b, :, d_tile]
@@ -154,7 +178,7 @@ def _stream_mix_fwd_big_nb(
 ###
 ### beta precomputed in Python — single load per d_tile, no nested N loop.
 ###
-@triton.autotune(configs=_BIG_NB_FWD_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_FWD_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dx_big_nb(
     G_ptr, Phi_ptr, v_ptr, beta_ptr, grad_x_ptr,
@@ -230,7 +254,7 @@ def _stream_mix_bwd_dx_big_nb(
 ### v is [N], loop-invariant → loaded once before the D loop.
 ### alpha is [B, D]          → loaded per d_tile inside the loop.
 ###
-@triton.autotune(configs=_BIG_NB_DPHI_CONFIGS, key=["D", "N_STREAMS"])
+@triton.autotune(configs=_DPHI_CONFIGS, key=["D", "N_STREAMS"], cache_results=True)
 @triton.jit
 def _stream_mix_bwd_dPhi_big_nb(
     G_ptr, x_ptr, v_ptr, alpha_ptr, grad_Phi_ptr,
@@ -247,12 +271,12 @@ def _stream_mix_bwd_dPhi_big_nb(
     pid_b = tl.program_id(0)
     n_idx = tl.arange(0, N_STREAMS)
 
-    # Load v once — it is [N] and loop-invariant over d_tiles
+    ### Load v once — it is [N] and loop-invariant over d_tiles
     if USE_PROJ:
         v_ptrs = v_ptr + pid_b * stride_v_b + n_idx * stride_v_n
         v_tile = tl.load(v_ptrs).to(tl.float32)   # [N]
 
-    # Accumulate grad_Phi[b] = Σ_tiles  G_tile @ x_eff_tile^T
+    ### Accumulate grad_Phi[b] = Σ_tiles  G_tile @ x_eff_tile^T
     acc = tl.zeros([N_STREAMS, N_STREAMS], dtype=tl.float32)
 
     n_blocks = tl.cdiv(D, BLOCK_D)
@@ -267,7 +291,7 @@ def _stream_mix_bwd_dPhi_big_nb(
             + n_idx[:, None] * stride_g_n
             + d_idx[None, :] * stride_g_d
         )
-        G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+        G_tile = tl.load(G_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)     # [N, BLOCK_D]
 
         x_ptrs = (
             x_ptr
@@ -275,7 +299,7 @@ def _stream_mix_bwd_dPhi_big_nb(
             + n_idx[:, None] * stride_x_n
             + d_idx[None, :] * stride_x_d
         )
-        x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)  # [N, BLOCK_D]
+        x_tile = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)     # [N, BLOCK_D]
 
         if USE_PROJ:
             alpha_ptrs = alpha_ptr + pid_b * stride_alpha_b + d_idx * stride_alpha_d
@@ -284,7 +308,7 @@ def _stream_mix_bwd_dPhi_big_nb(
         else:
             x_eff = x_tile
 
-        # [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
+        ### [N, BLOCK_D] @ [BLOCK_D, N] → [N, N], fused into accumulator
         acc = tl.dot(G_tile, tl.trans(x_eff), acc=acc, allow_tf32=False)
 
     ### Store grad_Phi[b]
@@ -303,13 +327,13 @@ def _stream_mix_bwd_dPhi_big_nb(
 def _make_v_arg(v: torch.Tensor | None, B: int, N: int, device, dtype):
     if v is not None:
         return v.contiguous()
-    return torch.zeros(B, N, dtype=dtype, device=device)
+    return torch.empty(B, N, dtype=dtype, device=device)
 
 
 def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
     if t is not None:
         return t.contiguous()
-    return torch.zeros(B, D, dtype=torch.float32, device=device)
+    return torch.empty(B, D, dtype=torch.float32, device=device)
 
 
 ###

@@ -31,12 +31,14 @@ Thumbs.db
 *.txt
 *.log
 *.lock
+*.PNG
+*.CSV
+*.pdf
+*.ncu-rep
 
 # Project-specific
 .claude/
-*.pdf
 snr_analysis.py
-cutile-python/
 ptx_ir_dump/
 
 # Exceptions

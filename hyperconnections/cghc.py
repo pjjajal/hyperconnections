@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
-from hyperconnections.ops import HAS_TRITON, expm_t18, stream_mix_add
+from hyperconnections.ops import HAS_TRITON, expm_t18, expm_t18_triton, stream_mix_add
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -122,6 +122,11 @@ class ContinuousGenHyperConnections(nn.Module):
             self._stream_mix_triton
             if use_triton and HAS_TRITON
             else self._stream_mix_eager
+        )
+        self._matrix_exp = (
+            _expm_t18_triton 
+            if use_triton and HAS_TRITON
+            else self._matrix_exp_eager
         )
         self.init_weights()
 
@@ -320,7 +325,7 @@ class ContinuousGenHyperConnections(nn.Module):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        return torch.linalg.matrix_exp(A.float()).to(x_norm.dtype)
+        return self._matrix_exp(A).to(x_norm.dtype)
 
     # This is a manual graph break so that the inner function is compiled with max-autotune
     @torch.compiler.disable(recursive=False)
@@ -370,6 +375,12 @@ class ContinuousGenHyperConnections(nn.Module):
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None
+
+    def _matrix_exp_eager(
+        self,
+        transition_matrix: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.linalg.matrix_exp(transition_matrix.float())
 
     def _stream_mix_triton(
         self,

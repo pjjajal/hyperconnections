@@ -23,14 +23,17 @@ Threshold:  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 0.75 * L2_BYTES
 """
 
 from __future__ import annotations
-
 import torch
 
 try:
     from .stream_mix_small_nb import stream_mix_add_small_nb as _small_nb
     from .stream_mix_big_nb import stream_mix_add_big_nb as _big_nb
-
+    from .numbers import (
+        _SM80_A100_L1_PER_SM_BYTES,
+        _SM80_A100_L2_BYTES,
+    )
     HAS_TRITON = True
+
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
@@ -38,8 +41,13 @@ except ModuleNotFoundError as exc:
     _big_nb = None
     HAS_TRITON = False
 
-# A100 L2 capacity in bytes.  Adjust if targeting a different GPU.
-_SM80_L2_BYTES = 40 * 1024 * 1024
+### Playing around with new version
+# def _use_big_nb(x: torch.Tensor) -> bool:
+#     B, N, D = x.shape
+#     ### "Safety" buffer: switch kernels when x occupies > 75% of L2
+#     c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
+#     # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
+#     return c
 
 
 def _use_big_nb(x: torch.Tensor) -> bool:
@@ -47,7 +55,7 @@ def _use_big_nb(x: torch.Tensor) -> bool:
     if N < 16 or N % 16 != 0:
         return False
     # "Safety" buffer: switch kernels when x occupies > 75% of L2
-    return B * N * D * x.element_size() > _SM80_L2_BYTES * 0.75
+    return B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 0.75
 
 
 def stream_mix_add(

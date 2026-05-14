@@ -62,10 +62,6 @@ _b64 = -0.00001400867981820361
 _THETA_18_F32 = 3.01
 
 
-@torch.compile(
-    fullgraph=True,
-    mode="max-autotune",
-)
 def expm_t18(A: torch.Tensor) -> torch.Tensor:
     """Compute the matrix exponential of A using the T_18 Taylor approximation.
 
@@ -75,16 +71,18 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     Returns:
         exp(A) with the same shape and dtype as A.
     """
+    original_dtype = A.dtype
+    A = A.to(torch.float32)
 
-    # Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
-    # Kept as float32 so the comparison (s > i) and division stay on-device.
+    ### Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
+    ### Kept as float32 so the comparison (s > i) and division stay on-device.
     with torch.no_grad():
         A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
         s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
         scale = 2.0 ** s
     A = A / scale
 
-    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
+    eye = torch.eye(A.shape[-1], dtype=torch.float32, device=A.device)
     A_2 = A @ A
     A_3 = A_2 @ A
     A_6 = A_3 @ A_3
@@ -98,9 +96,9 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     A_9 = B_1 @ B_5 + B_4
     T_18 = B_2 + (B_3 + A_9) @ A_9
 
-    # Unrolled repeated squaring (max 8 doublings covers ||A||_1 up to ~386).
-    # Gated by torch.where to keep a static graph for torch.compile.
+    ### Unrolled repeated squaring (max 8 doublings covers ||A||_1 up to ~386).
+    ### Gated by torch.where to keep a static graph for torch.compile.
     for i in range(8):
         T_18 = torch.where(s > i, T_18 @ T_18, T_18)
 
-    return T_18
+    return T_18.to(original_dtype)
