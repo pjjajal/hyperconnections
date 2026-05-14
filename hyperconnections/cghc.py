@@ -124,9 +124,7 @@ class ContinuousGenHyperConnections(nn.Module):
             else self._stream_mix_eager
         )
         self._matrix_exp = (
-            _expm_t18_triton 
-            if use_triton and HAS_TRITON
-            else self._matrix_exp_eager
+            expm_t18_triton if use_triton and HAS_TRITON else self._matrix_exp_eager
         )
         self.init_weights()
 
@@ -325,7 +323,7 @@ class ContinuousGenHyperConnections(nn.Module):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        return self._matrix_exp(A).to(x_norm.dtype)
+        return self._expm_t18(A).to(x_norm.dtype)
 
     # This is a manual graph break so that the inner function is compiled with max-autotune
     @torch.compiler.disable(recursive=False)
@@ -333,14 +331,8 @@ class ContinuousGenHyperConnections(nn.Module):
         """Compute matrix exponential using expm_t18 approximation."""
         return expm_t18(A)
 
-    def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Alternative transition computation using expm_t18 approximation for efficiency.
-
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-        """
-        A = self.compute_generator(x_norm)
-        return self._expm_t18(A.float()).to(x_norm.dtype)
+    def _matrix_exp_eager(self, A: torch.Tensor) -> torch.Tensor:
+        return self._expm_t18(A.float()).to(A.dtype)
 
     def compute_read_write_weights(self, x_norm: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state.
@@ -375,12 +367,6 @@ class ContinuousGenHyperConnections(nn.Module):
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None
-
-    def _matrix_exp_eager(
-        self,
-        transition_matrix: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.linalg.matrix_exp(transition_matrix.float())
 
     def _stream_mix_triton(
         self,
@@ -452,10 +438,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         ### Steam Mixing
         ### Mixing: X_new_mix = Phi @ X  (or protected variant)
-        if self.use_expm_t18:
-            transition_matrix = self.compute_transition_expm_t18(x_norm)  ### [B, n, n]
-        else:
-            transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
+        transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
 
         ### compute projection direction for projected mixing
         projection_dir = self.compute_projection(x_norm)  ### [B, n] or None

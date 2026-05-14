@@ -554,7 +554,7 @@ def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
     """
     if not HAS_TRITON:
         raise RuntimeError("expm_t18_triton requires Triton")
-    if not x.is_cuda:
+    if not A.is_cuda:
         raise RuntimeError("expm_t18_triton requires CUDA tensors")
 
     return _ExpmT18TritonFn.apply(A)
