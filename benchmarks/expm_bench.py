@@ -160,7 +160,8 @@ def ref_torch_matrix_exp_backward(A: torch.Tensor):
 
 ### Compile eager torch expm_t18
 torch._dynamo.config.cache_size_limit = 12
-expm_t18 = torch.compile(_expm_t18, mode="max-autotune", fullgraph=False, dynamic=False)
+EXPMT18_COMPILE_MODE = os.environ.get("EXPMT18_COMPILE_MODE", "max-autotune")
+expm_t18 = torch.compile(_expm_t18, mode=EXPMT18_COMPILE_MODE, fullgraph=False, dynamic=False)
 
 ###
 ### Correctness checks
@@ -433,13 +434,16 @@ def main():
     print(f"bench fwd : {run_fwd}")
     print(f"bench bwd : {run_bwd}")
 
-    today = date.today().strftime("%Y_%m_%d_%mm")
+    today = date.today().strftime("%Y_%m_%d")
     if run_fwd and run_bwd:
         dir_tag = "fwdbwd"
     elif run_bwd:
         dir_tag = "bwd"
     else:
         dir_tag = "fwd"
+    if len(list(args.n)) == 1:
+        dir_tag += f"_n{list(args.n)[0]}"
+
     report_dir = os.path.normpath(_REPORT_DIR)
 
     passed = True
@@ -457,11 +461,6 @@ def main():
                                  f"benchmark_expm_perf_{dir_tag}_{today}.CSV")
         _write_csv(perf_rows, perf_path)
 
-    if args.mode == "all":
-        all_rows = corr_rows + perf_rows
-        all_path = os.path.join(report_dir,
-                                f"benchmark_expm_all_{dir_tag}_{today}.CSV")
-        _write_csv(all_rows, all_path)
 
     if args.mode in ("correctness", "all") and not passed:
         sys.exit(1)
