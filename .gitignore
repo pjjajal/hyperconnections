@@ -31,6 +31,7 @@ Thumbs.db
 *.txt
 *.log
 *.lock
+*.PNG
 
 # Project-specific
 .claude/

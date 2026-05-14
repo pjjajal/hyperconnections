@@ -159,7 +159,8 @@ def ref_torch_matrix_exp_backward(A: torch.Tensor):
 
 
 ### Compile eager torch expm_t18
-expm_t18 = torch.compile(_expm_t18, mode="max-autotune", fullgraph=False)
+torch._dynamo.config.cache_size_limit = 12
+expm_t18 = torch.compile(_expm_t18, mode="max-autotune", fullgraph=False, dynamic=False)
 
 ###
 ### Correctness checks
@@ -432,7 +433,7 @@ def main():
     print(f"bench fwd : {run_fwd}")
     print(f"bench bwd : {run_bwd}")
 
-    today = date.today().strftime("%Y%m%d")
+    today = date.today().strftime("%Y_%m_%d_%mm")
     if run_fwd and run_bwd:
         dir_tag = "fwdbwd"
     elif run_bwd:
