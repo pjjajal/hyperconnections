@@ -162,8 +162,10 @@ def ref_proj(Phi, x, Y, v):
 
 
 ### torch.compile baselines
-_ref_no_proj_compiled = torch.compile(ref_no_proj, mode='max-autotune', fullgraph=False, dynamic=False)
-_ref_proj_compiled = torch.compile(ref_proj, mode='max-autotune', fullgraph=False, dynamic=False)
+torch._dynamo.config.cache_size_limit = 12
+STREAMMIX_COMPILE_MODE = os.environ.get("STREAMMIX_COMPILE_MODE", "max-autotune")
+_ref_no_proj_compiled = torch.compile(ref_no_proj, mode=STREAMMIX_COMPILE_MODE, fullgraph=False, dynamic=False)
+_ref_proj_compiled = torch.compile(ref_proj, mode=STREAMMIX_COMPILE_MODE, fullgraph=False, dynamic=False)
 
 
 def ref_proj_backward(Phi, x, Y, v):
