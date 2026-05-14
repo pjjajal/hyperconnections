@@ -1,3 +1,5 @@
+# This is the constant forcing variant of CGHC.
+
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -8,10 +10,10 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.models.layers import trunc_normal_
 
-from hyperconnections.ops import HAS_TRITON, expm_t18, stream_mix_add
+from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, stream_mix_add
 
 
-class ContinuousGenHyperConnections(nn.Module):
+class ContinuousGenHyperConnectionsForced(nn.Module):
     def __init__(
         self,
         n: int,
@@ -324,9 +326,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
     # This is a manual graph break so that the inner function is compiled with max-autotune
     @torch.compiler.disable(recursive=False)
-    def _expm_t18(self, A: torch.Tensor) -> torch.Tensor:
+    def _expm_t18(self, A: torch.Tensor):
         """Compute matrix exponential using expm_t18 approximation."""
-        return expm_t18(A)
+        return expm_t18_augmented_sparse(A)
 
     def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> torch.Tensor:
         """Alternative transition computation using expm_t18 approximation for efficiency.
@@ -335,7 +337,8 @@ class ContinuousGenHyperConnections(nn.Module):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        return self._expm_t18(A.float()).to(x_norm.dtype)
+        transition_matrix, psi = self._expm_t18(A.float())
+        return transition_matrix.to(x_norm.dtype), psi.to(x_norm.dtype)
 
     def compute_read_write_weights(self, x_norm: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state.
@@ -439,14 +442,15 @@ class ContinuousGenHyperConnections(nn.Module):
         out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
 
-        ### Steam Mixing
-        ### Mixing: X_new_mix = Phi @ X  (or protected variant)
-        if self.use_expm_t18:
-            transition_matrix = self.compute_transition_expm_t18(x_norm)  ### [B, n, n]
-        else:
-            transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
+        ### Stream Mixing
+        # Exact integration of dx/dt = Ax + f over one step gives:
+        #   x(1) = exp(A) x(0) + phi_1(A) f
+        # where phi_1(A) = integral_0^1 exp(theta A) d theta.
+        # transition_matrix = exp(A), psi = phi_1(A), both computed together
+        # without materializing the 2n x 2n augmented matrix.
+        transition_matrix, psi = self.compute_transition_expm_t18(x_norm)
+        Y = einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")
 
-        ### compute projection direction for projected mixing
         projection_dir = self.compute_projection(x_norm)  ### [B, n] or None
 
         return (
