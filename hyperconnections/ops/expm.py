@@ -62,6 +62,10 @@ _b64 = -0.00001400867981820361
 _THETA_18_F32 = 3.01
 
 
+@torch.compile(
+    fullgraph=True,
+    mode="max-autotune",
+)
 def expm_t18(A: torch.Tensor) -> torch.Tensor:
     """Compute the matrix exponential of A using the T_18 Taylor approximation.
 
@@ -79,7 +83,7 @@ def expm_t18(A: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
         s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
-        scale = 2.0 ** s
+        scale = 2.0**s
     A = A / scale
 
     eye = torch.eye(A.shape[-1], dtype=torch.float32, device=A.device)
