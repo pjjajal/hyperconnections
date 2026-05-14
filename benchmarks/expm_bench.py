@@ -33,7 +33,10 @@ Requirements: CUDA GPU, triton, torch.
 from __future__ import annotations
 
 import argparse
+import csv
+import os
 import sys
+from datetime import date
 from itertools import product
 from typing import Sequence
 
@@ -66,6 +69,20 @@ def bold(s):
     return _col(s, _BOLD)
 def _dtype(name: str) -> torch.dtype:
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
+
+
+###
+### CSV export
+###
+_REPORT_DIR = os.path.join(os.path.dirname(__file__), "..", "benchmark_reports")
+
+def _write_csv(rows: list[dict], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  -> saved {path}")
 
 
 ###
@@ -172,7 +189,8 @@ def _corr_row(config, variant, check, max_err, atol, passed):
 
 
 def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
-                atol_f: float, atol_b: float, all_passed: bool) -> bool:
+                atol_f: float, atol_b: float, all_passed: bool,
+                csv_rows: list[dict]) -> bool:
     """Run fwd+bwd correctness on one A; return updated all_passed."""
 
     ### forward — Triton vs ground-truth (torch.linalg.matrix_exp)
@@ -181,12 +199,16 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     passed, err = _check(got, ref, atol_f)
     all_passed &= passed
     print(_corr_row(cfg_str, "triton", "fwd", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "fwd",
+                     "max_err": err, "atol": atol_f, "passed": passed})
 
     ### forward — Triton vs compiled T18 (same algorithm, smaller tolerance)
     ref_t18 = expm_t18(A)
     passed, err = _check(got, ref_t18, atol_f)
     all_passed &= passed
     print(_corr_row(cfg_str, "vs T18", "fwd", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "vs T18", "check": "fwd",
+                     "max_err": err, "atol": atol_f, "passed": passed})
 
     ### backward — grad_A from Triton vs from torch.linalg.matrix_exp
     A_t = A.detach().clone().requires_grad_(True)
@@ -196,6 +218,8 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     passed, err = _check(A_t.grad, grad_ref, atol_b)
     all_passed &= passed
     print(_corr_row(cfg_str, "triton", "grad_A", err, atol_b, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad_A",
+                     "max_err": err, "atol": atol_b, "passed": passed})
 
     return all_passed
 
@@ -204,7 +228,7 @@ def run_correctness(
     ns: Sequence[int],
     bs: Sequence[int],
     dtypes: Sequence[str],
-):
+) -> tuple[bool, list[dict]]:
     print()
     print(bold("=" * 92))
     print(bold("  CORRECTNESS — random A (small norm, no/few squarings)"))
@@ -213,6 +237,7 @@ def run_correctness(
     print(_CORR_SEP)
 
     all_passed = True
+    csv_rows: list[dict] = []
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
@@ -225,7 +250,7 @@ def run_correctness(
         for B, N in product(bs, ns):
             A = _A_FACTORIES["random"](B, N, dtype)
             cfg_str = f"B={B} N={N} {dtype_name}"
-            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed)
+            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
         print(_CORR_SEP)
 
@@ -245,7 +270,7 @@ def run_correctness(
         for kind, B, N in product(["skew", "neg_psd", "diagonal", "large"], bs, ns):
             A = _A_FACTORIES[kind](B, N, dtype)
             cfg_str = f"[{_A_LABEL[kind]}] B={B} N={N} {dtype_name}"
-            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed)
+            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
         print(_CORR_SEP)
 
@@ -255,7 +280,7 @@ def run_correctness(
     else:
         print(fail("One or more correctness checks FAILED."))
     print()
-    return all_passed
+    return all_passed, csv_rows
 
 
 ###
@@ -289,7 +314,7 @@ def run_perf(
     rep: int = 200,
     fwd: bool = True,
     bwd: bool = False,
-):
+) -> list[dict]:
     print()
     print(bold("=" * 110))
     print(bold("  PERFORMANCE — random / skew / neg_psd / diagonal / large-norm"))
@@ -298,6 +323,7 @@ def run_perf(
     print(_PERF_SEP)
 
     kinds = ["random", "skew", "neg_psd", "diagonal", "large"]
+    csv_rows: list[dict] = []
 
     for dtype_name in dtypes:
         dtype = _dtype(dtype_name)
@@ -313,6 +339,11 @@ def run_perf(
                     t_torch = triton.testing.do_bench(lambda: ref_torch_matrix_exp(A), warmup=warmup, rep=rep)
                     t_t18   = triton.testing.do_bench(lambda: expm_t18(A),           warmup=warmup, rep=rep)
                     print(_perf_row(cfg_str, label + " fwd", dtype_name, t_tri, t_torch, t_t18))
+                    csv_rows.append({
+                        "config": cfg_str, "atype": label + " fwd", "dtype": dtype_name,
+                        "triton_ms": t_tri, "matrix_exp_ms": t_torch, "t18_ms": t_t18,
+                        "speedup_vs_torch": t_torch / t_tri, "speedup_vs_t18": t_t18 / t_tri,
+                    })
 
                 if bwd:
                     A_g = A.detach().clone().requires_grad_(True)
@@ -333,11 +364,17 @@ def run_perf(
                     t_b_torch = triton.testing.do_bench(_b_torch, warmup=warmup, rep=rep)
                     t_b_t18   = triton.testing.do_bench(_b_t18,   warmup=warmup, rep=rep)
                     print(_perf_row(cfg_str, label + " bwd", dtype_name, t_b_tri, t_b_torch, t_b_t18))
+                    csv_rows.append({
+                        "config": cfg_str, "atype": label + " bwd", "dtype": dtype_name,
+                        "triton_ms": t_b_tri, "matrix_exp_ms": t_b_torch, "t18_ms": t_b_t18,
+                        "speedup_vs_torch": t_b_torch / t_b_tri, "speedup_vs_t18": t_b_t18 / t_b_tri,
+                    })
 
             print()  # blank between (N, B) groups
 
         print(_PERF_SEP)
     print()
+    return csv_rows
 
 
 ###
@@ -395,14 +432,35 @@ def main():
     print(f"bench fwd : {run_fwd}")
     print(f"bench bwd : {run_bwd}")
 
+    today = date.today().strftime("%Y%m%d")
+    if run_fwd and run_bwd:
+        dir_tag = "fwdbwd"
+    elif run_bwd:
+        dir_tag = "bwd"
+    else:
+        dir_tag = "fwd"
+    report_dir = os.path.normpath(_REPORT_DIR)
+
     passed = True
     if args.mode in ("correctness", "all"):
         ### Correctness uses smaller B to keep the table compact
-        passed = run_correctness(args.n, [min(args.b)], args.dtype)
+        passed, corr_rows = run_correctness(args.n, [min(args.b)], args.dtype)
+        corr_path = os.path.join(report_dir,
+                                 f"benchmark_expm_correctness_fwdbwd_{today}.CSV")
+        _write_csv(corr_rows, corr_path)
 
     if args.mode in ("perf", "all"):
-        run_perf(args.n, args.b, args.dtype,
-                 warmup=args.warmup, rep=args.rep, fwd=run_fwd, bwd=run_bwd)
+        perf_rows = run_perf(args.n, args.b, args.dtype,
+                             warmup=args.warmup, rep=args.rep, fwd=run_fwd, bwd=run_bwd)
+        perf_path = os.path.join(report_dir,
+                                 f"benchmark_expm_perf_{dir_tag}_{today}.CSV")
+        _write_csv(perf_rows, perf_path)
+
+    if args.mode == "all":
+        all_rows = corr_rows + perf_rows
+        all_path = os.path.join(report_dir,
+                                f"benchmark_expm_all_{dir_tag}_{today}.CSV")
+        _write_csv(all_rows, all_path)
 
     if args.mode in ("correctness", "all") and not passed:
         sys.exit(1)

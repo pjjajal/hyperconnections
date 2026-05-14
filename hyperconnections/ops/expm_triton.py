@@ -458,7 +458,7 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 
 ###
-###
+### 
 ###
 def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
