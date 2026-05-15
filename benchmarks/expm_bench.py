@@ -46,29 +46,7 @@ import triton.testing
 
 from hyperconnections.ops import expm_t18 as _expm_t18, expm_t18_triton
 
-###
-### Helpers
-###
-DEVICE = "cuda:0"
-
-_RESET  = "\033[0m"
-_GREEN  = "\033[92m"
-_RED    = "\033[91m"
-_YELLOW = "\033[93m"
-_BOLD   = "\033[1m"
-
-def _col(text: str, code: str) -> str:
-    return f"{code}{text}{_RESET}" if sys.stdout.isatty() else text
-def ok(s="PASS"):
-    return _col(s, _GREEN)
-def fail(s):
-    return _col(s, _RED)
-def warn(s):
-    return _col(s, _YELLOW)
-def bold(s):
-    return _col(s, _BOLD)
-def _dtype(name: str) -> torch.dtype:
-    return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
+from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row
 
 
 ###
@@ -183,11 +161,6 @@ def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, flo
 
 _CORR_HDR = f"{'Config':>34}  {'Variant':>10}  {'Check':>10}  {'MaxErr':>10}  {'atol':>8}  Result"
 _CORR_SEP = "-" * 92
-
-
-def _corr_row(config, variant, check, max_err, atol, passed):
-    result = ok("PASS") if passed else fail("FAIL")
-    return f"{config:>34}  {variant:>10}  {check:>10}  {max_err:>10.2e}  {atol:>8.0e}  {result}"
 
 
 def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,

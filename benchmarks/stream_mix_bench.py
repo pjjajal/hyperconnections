@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from itertools import product
 from pathlib import Path
@@ -46,29 +47,12 @@ from einops import einsum
 
 from hyperconnections.ops import stream_mix_add
 
-###
-### Helpers
-###
-DEVICE = "cuda:0"
+from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base
 
-_RESET  = "\033[0m"
-_GREEN  = "\033[92m"
-_RED    = "\033[91m"
-_YELLOW = "\033[93m"
-_BOLD   = "\033[1m"
 
-def _col(text: str, code: str) -> str:
-    return f"{code}{text}{_RESET}" if sys.stdout.isatty() else text
-def ok(s="PASS"):
-    return _col(s, _GREEN)
-def fail(s):
-    return _col(s, _RED)
-def warn(s):
-    return _col(s, _YELLOW)
-def bold(s):
-    return _col(s, _BOLD)
-def _dtype(name: str) -> torch.dtype:
-    return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
+def _corr_row(config, variant, check, max_err, atol, passed):
+    return _corr_row_base(config, variant, check, max_err, atol, passed,
+                          config_width=30, variant_width=12)
 
 
 def _make(B, N, D, dtype, seed=0):
@@ -200,11 +184,6 @@ def _check(label: str, got: torch.Tensor, ref: torch.Tensor, atol: float) -> tup
 # Column widths for the correctness table
 _CORR_HDR = f"{'Config':>30}  {'Variant':>12}  {'Check':>10}  {'MaxErr':>10}  {'atol':>8}  Result"
 _CORR_SEP = "-" * 90
-
-
-def _corr_row(config, variant, check, max_err, atol, passed):
-    result = ok("PASS") if passed else fail("FAIL")
-    return f"{config:>30}  {variant:>12}  {check:>10}  {max_err:>10.2e}  {atol:>8.0e}  {result}"
 
 
 def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
