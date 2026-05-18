@@ -59,12 +59,22 @@ import torch
 import triton
 import triton.language as tl
 
+from .numbers import (
+    _a11, _a21, _a31,
+    _b11, _b21, _b31, _b61,
+    _b02, _b12, _b22, _b32, _b62,
+    _b03, _b13, _b23, _b33, _b63,
+    _b24, _b34, _b64,
+    _THETA_18_F32 as _THETA_18,
+)
 
-###
-### T18 Constants
-###
-_THETA_18 = 3.01      # scaling threshold for u <= 2^-24 (fp32)
-_MAX_S    = 8         # max squarings ⇒ ||A||_1 up to θ₁₈ · 2^8 ≈ 770
+### Convert to tl.constexpr(...)
+_a11 = tl.constexpr(_a11); _a21 = tl.constexpr(_a21); _a31 = tl.constexpr(_a31)
+_b11 = tl.constexpr(_b11); _b21 = tl.constexpr(_b21); _b31 = tl.constexpr(_b31); _b61 = tl.constexpr(_b61)
+_b02 = tl.constexpr(_b02); _b12 = tl.constexpr(_b12); _b22 = tl.constexpr(_b22); _b32 = tl.constexpr(_b32); _b62 = tl.constexpr(_b62)
+_b03 = tl.constexpr(_b03); _b13 = tl.constexpr(_b13); _b23 = tl.constexpr(_b23); _b33 = tl.constexpr(_b33); _b63 = tl.constexpr(_b63)
+_b24 = tl.constexpr(_b24); _b34 = tl.constexpr(_b34); _b64 = tl.constexpr(_b64)
+_MAX_S = 8
 
 _TORCH_TO_TL = {
     torch.float16:  tl.float16,
@@ -153,59 +163,6 @@ def _expm_t18_structured_fwd(
     n_mask = n_idx < N
     mask2d = n_mask[:, None] & n_mask[None, :]
 
-    ###
-    ### Polynomial blocks (a01 = b01 = b04 = b14 = 0 dropped)
-    ###
-    a11 = -0.10036558103014462
-    a21 = -0.00802924648241157
-    a31 = -0.00089213849804573
-
-    b11 =  0.39784974949645076
-    a11 = -0.10036558103014462
-    a21 = -0.00802924648241157
-    a31 = -0.00089213849804573
-
-    b11 =  0.39784974949645076
-    b21 =  1.36783778460411719
-    b31 =  0.49828962252538268
-    b61 = -0.00063789819459247233
-
-    b02 = -10.96763960529620626
-    b12 =  1.68015813878906197
-    b22 =  0.05717798464788655
-    b32 = -0.00698210122488052
-    b62 =  3.349750170860705e-05
-
-    b03 = -0.09043168323908106
-    b13 = -0.06764045190713819
-    b23 =  0.06759613017740597
-    b33 =  0.02955525704293155
-    b63 = -1.391802575160607e-05
-
-    b24 = -0.09233646193671186
-    b34 = -0.01693649390020817
-    b64 = -1.400867981820361e-05
-
-    b21 =  1.36783778460411719
-    b31 =  0.49828962252538268
-    b61 = -0.00063789819459247233
-
-    b02 = -10.96763960529620626
-    b12 =  1.68015813878906197
-    b22 =  0.05717798464788655
-    b32 = -0.00698210122488052
-    b62 =  3.349750170860705e-05
-
-    b03 = -0.09043168323908106
-    b13 = -0.06764045190713819
-    b23 =  0.06759613017740597
-    b33 =  0.02955525704293155
-    b63 = -1.391802575160607e-05
-
-    b24 = -0.09233646193671186
-    b34 = -0.01693649390020817
-    b64 = -1.400867981820361e-05
-
     ### Load diagonal block X and upper block G.
     ### For backward, X should be A^T and G should be grad_out.
     x_off = (
@@ -242,24 +199,24 @@ def _expm_t18_structured_fwd(
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
 
     ### B1 = a11 M + a21 M^2 + a31 M^3
-    DB1 = a11 * D1 + a21 * D2 + a31 * D3
-    UB1 = a11 * U1 + a21 * U2 + a31 * U3
+    DB1 = _a11 * D1 + _a21 * D2 + _a31 * D3
+    UB1 = _a11 * U1 + _a21 * U2 + _a31 * U3
 
     ### B2 = b11 M + b21 M^2 + b31 M^3 + b61 M^6
-    DB2 = b11 * D1 + b21 * D2 + b31 * D3 + b61 * D6
-    UB2 = b11 * U1 + b21 * U2 + b31 * U3 + b61 * U6
+    DB2 = _b11 * D1 + _b21 * D2 + _b31 * D3 + _b61 * D6
+    UB2 = _b11 * U1 + _b21 * U2 + _b31 * U3 + _b61 * U6
 
     ### B3 = b02 I + b12 M + b22 M^2 + b32 M^3 + b62 M^6
-    DB3 = b02 * eye + b12 * D1 + b22 * D2 + b32 * D3 + b62 * D6
-    UB3 =             b12 * U1 + b22 * U2 + b32 * U3 + b62 * U6
+    DB3 = _b02 * eye + _b12 * D1 + _b22 * D2 + _b32 * D3 + _b62 * D6
+    UB3 =              _b12 * U1 + _b22 * U2 + _b32 * U3 + _b62 * U6
 
     ### B4 = b03 I + b13 M + b23 M^2 + b33 M^3 + b63 M^6
-    DB4 = b03 * eye + b13 * D1 + b23 * D2 + b33 * D3 + b63 * D6
-    UB4 =             b13 * U1 + b23 * U2 + b33 * U3 + b63 * U6
+    DB4 = _b03 * eye + _b13 * D1 + _b23 * D2 + _b33 * D3 + _b63 * D6
+    UB4 =              _b13 * U1 + _b23 * U2 + _b33 * U3 + _b63 * U6
 
     ### B5 = b24 M^2 + b34 M^3 + b64 M^6
-    DB5 = b24 * D2 + b34 * D3 + b64 * D6
-    UB5 = b24 * U2 + b34 * U3 + b64 * U6
+    DB5 = _b24 * D2 + _b34 * D3 + _b64 * D6
+    UB5 = _b24 * U2 + _b34 * U3 + _b64 * U6
 
     ### A9 = B1 @ B5 + B4
     DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx)
@@ -315,59 +272,6 @@ def _expm_t18_fwd(
     n_mask = n_idx < N
     mask2d = n_mask[:, None] & n_mask[None, :]
 
-    ###
-    ### Polynomial blocks (a01 = b01 = b04 = b14 = 0 dropped)
-    ###
-    a11 = -0.10036558103014462
-    a21 = -0.00802924648241157
-    a31 = -0.00089213849804573
-
-    b11 =  0.39784974949645076
-    a11 = -0.10036558103014462
-    a21 = -0.00802924648241157
-    a31 = -0.00089213849804573
-
-    b11 =  0.39784974949645076
-    b21 =  1.36783778460411719
-    b31 =  0.49828962252538268
-    b61 = -0.00063789819459247233
-
-    b02 = -10.96763960529620626
-    b12 =  1.68015813878906197
-    b22 =  0.05717798464788655
-    b32 = -0.00698210122488052
-    b62 =  3.349750170860705e-05
-
-    b03 = -0.09043168323908106
-    b13 = -0.06764045190713819
-    b23 =  0.06759613017740597
-    b33 =  0.02955525704293155
-    b63 = -1.391802575160607e-05
-
-    b24 = -0.09233646193671186
-    b34 = -0.01693649390020817
-    b64 = -1.400867981820361e-05
-
-    b21 =  1.36783778460411719
-    b31 =  0.49828962252538268
-    b61 = -0.00063789819459247233
-
-    b02 = -10.96763960529620626
-    b12 =  1.68015813878906197
-    b22 =  0.05717798464788655
-    b32 = -0.00698210122488052
-    b62 =  3.349750170860705e-05
-
-    b03 = -0.09043168323908106
-    b13 = -0.06764045190713819
-    b23 =  0.06759613017740597
-    b33 =  0.02955525704293155
-    b63 = -1.391802575160607e-05
-
-    b24 = -0.09233646193671186
-    b34 = -0.01693649390020817
-    b64 = -1.400867981820361e-05
-
     ### Load A[b], upcast, and apply the scaling 1/2^s
     a_off = (
         pid_b * stride_a_b
@@ -387,11 +291,11 @@ def _expm_t18_fwd(
     ### Identity (NP×NP).  Padded diag ones live only in the [N:,N:] block.
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
 
-    B1 = a11 * A           + a21 * A2 + a31 * A3
-    B2 = b11 * A           + b21 * A2 + b31 * A3 + b61 * A6
-    B3 = b02 * eye + b12 * A + b22 * A2 + b32 * A3 + b62 * A6
-    B4 = b03 * eye + b13 * A + b23 * A2 + b33 * A3 + b63 * A6
-    B5 = b24 * A2 + b34 * A3 + b64 * A6
+    B1 = _a11 * A            + _a21 * A2 + _a31 * A3
+    B2 = _b11 * A            + _b21 * A2 + _b31 * A3 + _b61 * A6
+    B3 = _b02 * eye + _b12 * A + _b22 * A2 + _b32 * A3 + _b62 * A6
+    B4 = _b03 * eye + _b13 * A + _b23 * A2 + _b33 * A3 + _b63 * A6
+    B5 = _b24 * A2 + _b34 * A3 + _b64 * A6
 
     ### A9 = B1 @ B5 + B4
     A9 = _matmul_nn(B1, B5, NP, n_idx) + B4
@@ -520,7 +424,7 @@ class _ExpmT18TritonFn(torch.autograd.Function):
         A_T = A.float().transpose(-1, -2).contiguous()
         G   = grad_out.float().contiguous()
 
-        ### STANDARD BWD (Not great for N=4)
+        ### STANDARD BWD
         # M = torch.zeros(B, 2 * N, 2 * N, dtype=torch.float32, device=A.device)
         # M[:, :N, :N] = A_T
         # M[:, N:, N:] = A_T
