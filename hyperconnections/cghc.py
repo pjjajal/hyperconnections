@@ -129,15 +129,34 @@ class ContinuousGenHyperConnections(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # read_in: σ(bias) = 1/n  →  bias = log(1/(n-1))
-        logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
-        nn.init.constant_(self.read_in, logit_1_over_n)
+        # read_in (semantic [m, n], stored as [n, m]):
+        #   m == 1 (mHC case): preserve mean-read convention — σ(log(1/(n-1))) = 1/n
+        #     so each of n streams contributes 1/n to the single chunk's read.
+        #   m > 1 (GHC case): top-left m×m identity. Chunk j reads predominantly from
+        #     stream j; streams [m, n) start dormant. σ(+5) ≈ 0.993 / σ(-5) ≈ 0.007
+        #     saturates GHC's 1/0 values.
+        if self.m == 1:
+            logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
+            nn.init.constant_(self.read_in, logit_1_over_n)
+        else:
+            read_in_init = torch.full((self.m, self.n), -5.0)
+            for j in range(self.m):
+                read_in_init[j, j] = 5.0
+            self.read_in.data.copy_(read_in_init.T)
+
+        # write_out (semantic [n, m]): round-robin, matching GHC. Stream i writes
+        # predominantly from chunk (i % m). 2·σ(0) = 1 exactly; 2·σ(-5) ≈ 0.013
+        # for off-positions. For m == 1 every entry collapses to 0, recovering
+        # the original 2·σ(0) = 1 mHC convention.
+        write_out_init = torch.full((self.n, self.m), -5.0)
+        for i in range(self.n):
+            write_out_init[i, i % self.m] = 0.0
+        self.write_out.data.copy_(write_out_init)
+
         with torch.no_grad():
-            self.read_in.add_(
-                torch.randn_like(self.read_in) * 0.01
-            )  # small noise for asymmetry breaking
-        # write_out: 2·σ(0) = 1
-        trunc_normal_(self.write_out, std=0.01)
+            # small noise for asymmetry breaking
+            self.read_in.add_(torch.randn_like(self.read_in) * 0.01)
+            self.write_out.add_(torch.randn_like(self.write_out) * 0.01)
         # Alpha gating: 0.01 so dynamic component starts negligible
         nn.init.constant_(self.alpha_read_in, 0.01)
         nn.init.constant_(self.alpha_write_out, 0.01)
