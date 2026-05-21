@@ -38,7 +38,7 @@ import torch
 import triton
 import triton.testing
 
-from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton
+from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton as _expm_t18_block_triton
 
 from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row
 
@@ -122,6 +122,9 @@ _A_LABEL = {
 def ref_torch_matrix_exp(A: torch.Tensor) -> torch.Tensor:
     return torch.linalg.matrix_exp(A.float()).to(A.dtype)
 
+expm_t18_block_triton = torch.compile(_expm_t18_block_triton,fullgraph=False,mode="max-autotune")
+torch._dynamo.config.cache_size_limit = 12
+EXPMT18_COMPILE_MODE = os.environ.get("EXPMT18_COMPILE_MODE", "max-autotune")
 
 ###
 ### Correctness checks
@@ -343,7 +346,7 @@ def main():
 
     passed = True
     if args.mode in ("correctness", "all"):
-        passed, corr_rows = run_correctness(args.n, [min(args.b)], args.dtype)
+        passed, corr_rows = run_correctness(args.n, args.b, args.dtype)
         corr_path = os.path.join(report_dir,
                                  f"benchmark_expm_force_correctness_{today}.CSV")
         _write_csv(corr_rows, corr_path)

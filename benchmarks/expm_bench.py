@@ -422,7 +422,7 @@ def main():
     passed = True
     if args.mode in ("correctness", "all"):
         ### Correctness uses smaller B to keep the table compact
-        passed, corr_rows = run_correctness(args.n, [min(args.b)], args.dtype)
+        passed, corr_rows = run_correctness(args.n, args.b, args.dtype)
         corr_path = os.path.join(report_dir,
                                  f"benchmark_expm_correctness_fwdbwd_{today}.CSV")
         _write_csv(corr_rows, corr_path)

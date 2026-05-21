@@ -129,11 +129,42 @@ def _matmul_nn(A, B, NP: tl.constexpr, n_idx):
     return R
 
 
+@triton.jit
+def _matmul_nn_alt(A, B, NP: tl.constexpr, n_idx):
+    """A @ B for square [NP, NP] register tiles, fp32, scalar-FFMA only.
+
+    Implemented as Σ_k outer(col_k(A), row_k(B)) via a static_range loop.
+    The naïve broadcast contraction tl.sum(A[:,:,None] * B[None,:,:], axis=1)
+    is mathematically identical but the Triton backend lowers it to a TF32
+    MMA at NP≥16 (verified empirically on sm_80, Triton 3.6) — which loses
+    13 mantissa bits and produces ~1e-3 errors in the BBC polynomial.
+
+    n_idx is passed in from the caller (it's the same tl.arange(0, NP) the
+    caller already built for load/store offsets) so we don't rebuild it
+    NP times across the per-k loop.
+    """
+    R = tl.zeros([NP, NP], dtype=tl.float32)
+    for k in tl.static_range(NP):
+        e_k   = (n_idx == k).to(tl.float32)            # [NP]
+        col_k = tl.sum(A * e_k[None, :], axis=1)       # [NP]  = A[:, k]
+        row_k = tl.sum(B * e_k[:, None], axis=0)       # [NP]  = B[k, :]
+        R = R + col_k[:, None] * row_k[None, :]
+    return R
+
+
 ###
 ### Helper for block-structured backward (or forward)
 ###
 @triton.jit
 def _pair_mul(D1, U1, D2, U2, NP: tl.constexpr, n_idx):
+    ### Structured block product:
+    ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
+    D = _matmul_nn(D1, D2, NP, n_idx)
+    U = _matmul_nn(D1, U2, NP, n_idx) + _matmul_nn(U1, D2, NP, n_idx)
+    return D, U
+
+
+def _pair_mul_alt(D1, U1, D2, U2, R, NP: tl.constexpr, n_idx):
     ### Structured block product:
     ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
     D = _matmul_nn(D1, D2, NP, n_idx)
