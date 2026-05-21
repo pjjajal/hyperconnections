@@ -9,14 +9,15 @@ from .expm_block import expm_t18_augmented_sparse
 ### there is no other public HAS_TRITON in the package.
 try:
     from .stream_mix import stream_mix_add
-    from .expm_triton import expm_t18_triton
+    from .expm_triton import expm_t18_triton, expm_t18_block_triton
     HAS_TRITON = True
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
     HAS_TRITON = False
-    stream_mix_add  = None  # type: ignore[assignment]
-    expm_t18_triton = None  # type: ignore[assignment]
+    stream_mix_add        = None  # type: ignore[assignment]
+    expm_t18_triton       = None  # type: ignore[assignment]
+    expm_t18_block_triton = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "stream_mix_add",
     "expm_t18",
     "expm_t18_triton",
+    "expm_t18_block_triton",
     "expm_t18_augmented_sparse",
 ]

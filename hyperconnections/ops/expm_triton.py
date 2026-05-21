@@ -253,7 +253,7 @@ def _expm_t18_structured_fwd(
 
 
 ###
-### Standard forward function
+### Inner Triton Forward
 ###
 @triton.autotune(configs=_FWD_CONFIGS, key=["NP"])
 @triton.jit
@@ -327,7 +327,7 @@ def _next_pow2(x: int) -> int:
 
 
 ###
-###
+### Forward
 ###
 def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
@@ -362,7 +362,7 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 
 ###
-### 
+### Forward
 ###
 def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
@@ -454,3 +454,188 @@ def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("expm_t18_triton requires CUDA tensors")
 
     return _ExpmT18TritonFn.apply(A)
+
+
+###
+### Triton kernel for exp([[A, I]; [0, 0]])
+###
+### Represents the augmented matrix as the block pair (D, U) where:
+###   D tracks the diagonal block (converges to exp(A))
+###   U tracks the upper-right block (converges to phi_1(A))
+###
+### The lower-right scalar c = 0 throughout, so _blk_mul simplifies to:
+###   (D1@D2, D1@U2 + U1@D2, 0) — exactly _pair_mul with no scalar correction.
+###
+@triton.autotune(configs=_FWD_CONFIGS, key=["NP"])
+@triton.jit
+def _expm_t18_augmented_fwd(
+    A_ptr, E_ptr, psi_ptr,
+    s_ptr, inv_scale_ptr,
+    stride_a_b, stride_a_n1, stride_a_n2,
+    stride_e_b, stride_e_n1, stride_e_n2,
+    stride_p_b, stride_p_n1, stride_p_n2,
+    N:         tl.constexpr,
+    NP:        tl.constexpr,
+    MAX_S:     tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    """Structured T18 forward for Z = [[A, I], [0, 0]].
+
+    Initial block pair: D1 = A * inv_scale, U1 = I * inv_scale.
+    The lower-right scalar c=0 throughout, so _pair_mul is exact.
+    Stores E = DT18 (approx exp(A)) and psi = UT18 (approx phi_1(A)).
+    """
+    pid_b  = tl.program_id(0)
+    n_idx  = tl.arange(0, NP)
+    n_mask = n_idx < N
+    mask2d = n_mask[:, None] & n_mask[None, :]
+
+    a_off = (
+        pid_b * stride_a_b
+        + n_idx[:, None] * stride_a_n1
+        + n_idx[None, :] * stride_a_n2
+    )
+    A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
+    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
+
+    eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
+
+    D1 = A * inv_scale
+    U1 = eye * inv_scale    # upper-right block of scaled Z: I / scale
+
+    ### Structured powers of Z = (D1, U1):
+    D2, U2 = _pair_mul(D1, U1, D1, U1, NP, n_idx)
+    D3, U3 = _pair_mul(D2, U2, D1, U1, NP, n_idx)
+    D6, U6 = _pair_mul(D3, U3, D3, U3, NP, n_idx)
+
+    ### B1 = a11 M + a21 M^2 + a31 M^3  (a01=0, no identity term)
+    DB1 = _a11 * D1 + _a21 * D2 + _a31 * D3
+    UB1 = _a11 * U1 + _a21 * U2 + _a31 * U3
+
+    ### B2 = b11 M + b21 M^2 + b31 M^3 + b61 M^6  (b01=0)
+    DB2 = _b11 * D1 + _b21 * D2 + _b31 * D3 + _b61 * D6
+    UB2 = _b11 * U1 + _b21 * U2 + _b31 * U3 + _b61 * U6
+
+    ### B3 = b02 I + b12 M + b22 M^2 + b32 M^3 + b62 M^6
+    DB3 = _b02 * eye + _b12 * D1 + _b22 * D2 + _b32 * D3 + _b62 * D6
+    UB3 =              _b12 * U1 + _b22 * U2 + _b32 * U3 + _b62 * U6
+
+    ### B4 = b03 I + b13 M + b23 M^2 + b33 M^3 + b63 M^6
+    DB4 = _b03 * eye + _b13 * D1 + _b23 * D2 + _b33 * D3 + _b63 * D6
+    UB4 =              _b13 * U1 + _b23 * U2 + _b33 * U3 + _b63 * U6
+
+    ### B5 = b24 M^2 + b34 M^3 + b64 M^6  (b04=0, b14=0)
+    DB5 = _b24 * D2 + _b34 * D3 + _b64 * D6
+    UB5 = _b24 * U2 + _b34 * U3 + _b64 * U6
+
+    ### A9 = B1 @ B5 + B4
+    DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx)
+    DA9 = DA9_tmp + DB4
+    UA9 = UA9_tmp + UB4
+
+    ### T18 = B2 + (B3 + A9) @ A9
+    DC = DB3 + DA9
+    UC = UB3 + UA9
+    DCA9, UCA9 = _pair_mul(DC, UC, DA9, UA9, NP, n_idx)
+    DT18 = DB2 + DCA9
+    UT18 = UB2 + UCA9
+
+    ### Repeated squaring
+    s_val = tl.load(s_ptr).to(tl.int32)
+    for i in tl.static_range(MAX_S):
+        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx)
+        DT18 = tl.where(s_val > i, D_sq, DT18)
+        UT18 = tl.where(s_val > i, U_sq, UT18)
+
+    ### Store exp(A) and phi_1(A)
+    e_off = (
+        pid_b * stride_e_b
+        + n_idx[:, None] * stride_e_n1
+        + n_idx[None, :] * stride_e_n2
+    )
+    p_off = (
+        pid_b * stride_p_b
+        + n_idx[:, None] * stride_p_n1
+        + n_idx[None, :] * stride_p_n2
+    )
+    tl.store(E_ptr   + e_off, DT18.to(OUT_DTYPE), mask=mask2d)
+    tl.store(psi_ptr + p_off, UT18.to(OUT_DTYPE), mask=mask2d)
+
+
+###
+### Python launcher (no autograd)
+###
+def _expm_t18_augmented_no_grad(
+    A: torch.Tensor, out_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton T18 augmented forward. Returns (exp(A), phi_1(A)). No autograd."""
+    if not A.is_cuda:
+        raise RuntimeError("_expm_t18_augmented_no_grad requires CUDA tensors")
+    if A.dim() != 3 or A.shape[-1] != A.shape[-2]:
+        raise ValueError(f"expected [B, N, N], got {tuple(A.shape)}")
+    if out_dtype not in _TORCH_TO_TL:
+        raise ValueError(f"unsupported out_dtype {out_dtype}")
+
+    B, N, _ = A.shape
+    A_fp32 = A.to(torch.float32).contiguous()
+
+    ### ||Z||_1 = max(||A||_1, 1).  Since theta_18 = 3.01 > 1, scaling on
+    ### ||A||_1 alone is sufficient (same as _expm_t18_no_grad).
+    A_norm    = torch.linalg.matrix_norm(A_fp32, ord=1).max().clamp_min(_THETA_18)
+    s         = torch.ceil(torch.log2(A_norm / _THETA_18)).clamp(min=0).to(torch.int32)
+    inv_scale = torch.exp2(-s.float())
+
+    E   = torch.empty(B, N, N, dtype=out_dtype, device=A.device)
+    psi = torch.empty(B, N, N, dtype=out_dtype, device=A.device)
+    NP  = _next_pow2(N)
+
+    _expm_t18_augmented_fwd[(B,)](
+        A_fp32, E, psi,
+        s, inv_scale,
+        *A_fp32.stride(), *E.stride(), *psi.stride(),
+        N=N, NP=NP, MAX_S=_MAX_S,
+        OUT_DTYPE=_TORCH_TO_TL[out_dtype],
+    )
+    return E, psi
+
+
+###
+### Autograd Function (forward-only)
+###
+class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A: torch.Tensor):
+        E, psi = _expm_t18_augmented_no_grad(A, out_dtype=A.dtype)
+        ctx.save_for_backward(A)
+        return E, psi
+
+    @staticmethod
+    def backward(ctx, grad_E: torch.Tensor, grad_psi: torch.Tensor):
+        raise NotImplementedError(
+            "expm_t18_block_triton backward not yet implemented"
+        )
+
+
+###
+### Public API
+###
+def expm_t18_block_triton(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton T18 augmented matrix exponential.
+
+    Computes exp([[A, I]; [0, 0]]) via the block-structured T18 polynomial,
+    returning (exp(A), phi_1(A)) without materialising the 2N x 2N matrix.
+
+    phi_1(A) = integral_0^1 exp(theta A) d theta is the matrix phi function
+    needed for exact integration of dx/dt = Ax + f over one step:
+        x(1) = exp(A) x(0) + phi_1(A) f.
+
+    Args:
+        A: [B, N, N] fp32 / bf16 / fp16 tensor on CUDA.
+
+    Returns:
+        E:   [B, N, N], approximation to exp(A).
+        psi: [B, N, N], approximation to phi_1(A).
+    """
+    if not A.is_cuda:
+        raise RuntimeError("expm_t18_block_triton requires CUDA tensors")
+    return _ExpmT18AugmentedTritonFn.apply(A)
