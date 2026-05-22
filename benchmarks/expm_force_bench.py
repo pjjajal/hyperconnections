@@ -146,9 +146,11 @@ def ref_phi1_quadrature(A: torch.Tensor, n_nodes: int = 64) -> torch.Tensor:
         psi += (0.5 * w) * torch.linalg.matrix_exp(theta * A64)
     return psi.to(A.dtype)
 
-expm_t18_augmented_sparse = torch.compile(_expm_t18_augmented_sparse,fullgraph=False,mode="max-autotune")
+
 torch._dynamo.config.cache_size_limit = 12
 EXPMT18_COMPILE_MODE = os.environ.get("EXPMT18_COMPILE_MODE", "max-autotune")
+expm_t18_augmented_sparse = torch.compile(_expm_t18_augmented_sparse,fullgraph=False,mode=EXPMT18_COMPILE_MODE)
+
 
 ###
 ### Correctness checks

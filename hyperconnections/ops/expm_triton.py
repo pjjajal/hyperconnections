@@ -164,6 +164,7 @@ def _pair_mul(D1, U1, D2, U2, NP: tl.constexpr, n_idx):
     return D, U
 
 
+@triton.jit
 def _pair_mul_alt(D1, U1, D2, U2, R, NP: tl.constexpr, n_idx):
     ### Structured block product:
     ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
@@ -488,14 +489,38 @@ def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
 
 
 ###
+### Helper for the augmented forcing matrix exp([[A, I]; [0, 0]])
+###
+@triton.jit
+def _blk_mul_c(D1, U1, c1, D2, U2, c2, NP: tl.constexpr, n_idx):
+    """Structured block product for the augmented forcing matrix.
+
+    A block triple (D, U, c) represents [[D, U], [0, c*I]].  The product
+
+      [[D1,U1],[0,c1 I]] @ [[D2,U2],[0,c2 I]]
+        = [[D1@D2,  D1@U2 + c2*U1],  [0,  c1*c2 I]]
+
+    The cross-term is the scalar scaling c2*U1 — NOT the matrix product
+    U1@D2 used by _pair_mul.  _pair_mul is correct only for the Frechet
+    structure [[D,U],[0,D]] (lower-right block = D); here the lower-right
+    block is c*I, so the scalar c must be tracked and propagated.
+    """
+    D = _matmul_nn(D1, D2, NP, n_idx)
+    U = _matmul_nn(D1, U2, NP, n_idx) + c2 * U1
+    c = c1 * c2
+    return D, U, c
+
+
+###
 ### Triton kernel for exp([[A, I]; [0, 0]])
 ###
-### Represents the augmented matrix as the block pair (D, U) where:
-###   D tracks the diagonal block (converges to exp(A))
-###   U tracks the upper-right block (converges to phi_1(A))
+### Tracks each block as a triple (D, U, c) representing [[D, U], [0, c*I]]:
+###   D -> exp(A),  U -> phi_1(A).
 ###
-### The lower-right scalar c = 0 throughout, so _blk_mul simplifies to:
-###   (D1@D2, D1@U2 + U1@D2, 0) — exactly _pair_mul with no scalar correction.
+### Z = [[A, I], [0, 0]] has c = 0, but the identity injected by the
+### polynomial has c = 1, so the intermediate blocks B3, B4, A9, T18 carry
+### a nonzero scalar.  The block product therefore goes through _blk_mul_c
+### (cross-term c2*U1), not _pair_mul (cross-term U1@D2).
 ###
 @triton.autotune(configs=_FWD_CONFIGS, key=["NP"])
 @triton.jit
@@ -512,8 +537,9 @@ def _expm_t18_augmented_fwd(
 ):
     """Structured T18 forward for Z = [[A, I], [0, 0]].
 
-    Initial block pair: D1 = A * inv_scale, U1 = I * inv_scale.
-    The lower-right scalar c=0 throughout, so _pair_mul is exact.
+    Block triples (D, U, c) represent [[D, U], [0, c*I]].  Z itself is
+    (A*inv_scale, I*inv_scale, 0); the identity is (I, 0, 1).  Products go
+    through _blk_mul_c so the scalar c is propagated correctly.
     Stores E = DT18 (approx exp(A)) and psi = UT18 (approx phi_1(A)).
     """
     pid_b  = tl.program_id(0)
@@ -531,52 +557,67 @@ def _expm_t18_augmented_fwd(
 
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
 
+    ### Z = (D1, U1, 0):  scaled augmented matrix [[A, I], [0, 0]] / scale.
     D1 = A * inv_scale
-    U1 = eye * inv_scale    # upper-right block of scaled Z: I / scale
+    U1 = eye * inv_scale
+    c1 = 0.0
 
-    ### Structured powers of Z = (D1, U1):
-    D2, U2 = _pair_mul(D1, U1, D1, U1, NP, n_idx)
-    D3, U3 = _pair_mul(D2, U2, D1, U1, NP, n_idx)
-    D6, U6 = _pair_mul(D3, U3, D3, U3, NP, n_idx)
+    ### Structured powers of Z.  Each has c = 0 (0^k = 0 for k >= 1), so the
+    ### c2*U1 cross-term vanishes for every Z-power product.
+    D2, U2, c2 = _blk_mul_c(D1, U1, c1, D1, U1, c1, NP, n_idx)
+    D3, U3, c3 = _blk_mul_c(D2, U2, c2, D1, U1, c1, NP, n_idx)
+    D6, U6, c6 = _blk_mul_c(D3, U3, c3, D3, U3, c3, NP, n_idx)
 
-    ### B1 = a11 M + a21 M^2 + a31 M^3  (a01=0, no identity term)
+    ### Polynomial blocks.  The identity carries c = 1, so each block's
+    ### scalar is its identity coefficient (a01=b01=b04=b14=0, hence
+    ### cB1 = cB2 = cB5 = 0; cB3 = b02; cB4 = b03).
+    ### B1 = a11 Z + a21 Z^2 + a31 Z^3
     DB1 = _a11 * D1 + _a21 * D2 + _a31 * D3
     UB1 = _a11 * U1 + _a21 * U2 + _a31 * U3
+    cB1 = 0.0
 
-    ### B2 = b11 M + b21 M^2 + b31 M^3 + b61 M^6  (b01=0)
+    ### B2 = b11 Z + b21 Z^2 + b31 Z^3 + b61 Z^6
     DB2 = _b11 * D1 + _b21 * D2 + _b31 * D3 + _b61 * D6
     UB2 = _b11 * U1 + _b21 * U2 + _b31 * U3 + _b61 * U6
+    cB2 = 0.0
 
-    ### B3 = b02 I + b12 M + b22 M^2 + b32 M^3 + b62 M^6
+    ### B3 = b02 I + b12 Z + b22 Z^2 + b32 Z^3 + b62 Z^6
     DB3 = _b02 * eye + _b12 * D1 + _b22 * D2 + _b32 * D3 + _b62 * D6
     UB3 =              _b12 * U1 + _b22 * U2 + _b32 * U3 + _b62 * U6
+    cB3 = _b02
 
-    ### B4 = b03 I + b13 M + b23 M^2 + b33 M^3 + b63 M^6
+    ### B4 = b03 I + b13 Z + b23 Z^2 + b33 Z^3 + b63 Z^6
     DB4 = _b03 * eye + _b13 * D1 + _b23 * D2 + _b33 * D3 + _b63 * D6
     UB4 =              _b13 * U1 + _b23 * U2 + _b33 * U3 + _b63 * U6
+    cB4 = _b03
 
-    ### B5 = b24 M^2 + b34 M^3 + b64 M^6  (b04=0, b14=0)
+    ### B5 = b24 Z^2 + b34 Z^3 + b64 Z^6
     DB5 = _b24 * D2 + _b34 * D3 + _b64 * D6
     UB5 = _b24 * U2 + _b34 * U3 + _b64 * U6
+    cB5 = 0.0
 
     ### A9 = B1 @ B5 + B4
-    DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx)
+    DA9_tmp, UA9_tmp, cA9_tmp = _blk_mul_c(DB1, UB1, cB1, DB5, UB5, cB5, NP, n_idx)
     DA9 = DA9_tmp + DB4
     UA9 = UA9_tmp + UB4
+    cA9 = cA9_tmp + cB4
 
     ### T18 = B2 + (B3 + A9) @ A9
     DC = DB3 + DA9
     UC = UB3 + UA9
-    DCA9, UCA9 = _pair_mul(DC, UC, DA9, UA9, NP, n_idx)
+    cC = cB3 + cA9
+    DCA9, UCA9, cCA9 = _blk_mul_c(DC, UC, cC, DA9, UA9, cA9, NP, n_idx)
     DT18 = DB2 + DCA9
     UT18 = UB2 + UCA9
+    cT18 = cB2 + cCA9
 
-    ### Repeated squaring
+    ### Repeated squaring: (D, U, c)^2 = (D@D, D@U + c*U, c^2).
     s_val = tl.load(s_ptr).to(tl.int32)
     for i in tl.static_range(MAX_S):
-        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx)
+        D_sq, U_sq, c_sq = _blk_mul_c(DT18, UT18, cT18, DT18, UT18, cT18, NP, n_idx)
         DT18 = tl.where(s_val > i, D_sq, DT18)
         UT18 = tl.where(s_val > i, U_sq, UT18)
+        cT18 = tl.where(s_val > i, c_sq, cT18)
 
     ### Store exp(A) and phi_1(A)
     e_off = (
