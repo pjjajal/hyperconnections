@@ -75,8 +75,8 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
                 output_snr = output_signal_norm / (output_error_norm + 1e-8)
 
                 # Queried Signal Norm:
-                vs = einsum("bnd,bkn->bkd", inputs, signal_basis)
-                outputs_vs = einsum("bnd,bkn->bkd", outputs, signal_basis)
+                vs = einsum(inputs, signal_basis, "bnd,bkn->bkd")
+                outputs_vs = einsum(outputs, signal_basis, "bnd,bkn->bkd")
 
                 vs_energy = vs.norm(dim=-1).pow(2).mean().item()
                 outputs_vs_energy = outputs_vs.norm(dim=-1).pow(2).mean().item()
