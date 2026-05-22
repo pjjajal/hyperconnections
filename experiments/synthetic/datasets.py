@@ -196,7 +196,9 @@ class SignalFilteringDataset(Dataset):
 
         # Generate noise per layer
         # noise[layer] = sum_j noise_keys[layer, j] @ noise_values[layer, j]^T
+        # Scale by 1/sqrt(n_layers) so total noise energy is independent of depth
         noise = torch.zeros(n_samples, n_layers, n_streams, d)
+        layer_noise_scale = noise_scale / (n_layers ** 0.5)
 
         for layer in range(n_layers):
             # Sample noise keys from noise basis (different per layer)
@@ -210,7 +212,7 @@ class SignalFilteringDataset(Dataset):
             noise_values = torch.randn(n_samples, n_noise_memories, d)
 
             # Construct noise for this layer
-            noise[:, layer] = torch.einsum('bkn,bkd->bnd', noise_keys, noise_values) * noise_scale
+            noise[:, layer] = torch.einsum('bkn,bkd->bnd', noise_keys, noise_values) * layer_noise_scale
 
         self.noise = noise
         self.H_target = H_0.clone()

@@ -54,81 +54,31 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
 
             # Log energy statistics for filtering task
             if noise is not None:
-                # Signal energy (input)
-                signal_energy = torch.norm(inputs).item()
+                B = inputs.shape[0]
 
-                # Noise energy: average per layer and total
+                # Input SNR: ||signal|| / ||total_noise||
+                signal_norm = torch.norm(inputs.reshape(B, -1), dim=1).mean().item()
+
+                # Sum noise across all layers then compute norm
                 # noise shape: [B, n_layers, n_streams, d]
-                noise_per_layer = torch.stack([
-                    torch.norm(noise[:, i]) for i in range(noise.shape[1])
-                ])
-                avg_noise_per_layer = noise_per_layer.mean().item()
-                total_noise_added = noise_per_layer.sum().item()
+                total_noise = noise.sum(dim=1)  # [B, n_streams, d]
+                total_noise_norm = torch.norm(total_noise.reshape(B, -1), dim=1).mean().item()
 
-                # Input SNR
-                input_snr = signal_energy / (total_noise_added + 1e-8)
+                input_snr = signal_norm / (total_noise_norm + 1e-8)
 
-                # Output energy and error
-                output_energy = torch.norm(outputs).item()
-                error_energy = torch.norm(outputs - targets).item()
-
-                # Option 3: Relative signal strength metrics
-                signal_preservation = signal_energy / (output_energy + 1e-8)
-                relative_error = error_energy / (signal_energy + 1e-8)
-                output_snr_v3 = signal_preservation / (relative_error + 1e-8)
+                # Output SNR: ||targets|| / ||outputs - targets||
+                output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).mean().item()
+                output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).mean().item()
+                output_snr = output_signal_norm / (output_error_norm + 1e-8)
 
                 metrics.update({
-                    "signal_energy": signal_energy,
-                    "avg_noise_per_layer": avg_noise_per_layer,
-                    "total_noise_added": total_noise_added,
-                    "output_energy": output_energy,
-                    "error_energy": error_energy,
+                    "signal_norm": signal_norm,
+                    "total_noise_norm": total_noise_norm,
                     "input_snr": input_snr,
-                    "signal_preservation": signal_preservation,
-                    "relative_error": relative_error,
-                    "output_snr_v3": output_snr_v3,
+                    "output_signal_norm": output_signal_norm,
+                    "output_error_norm": output_error_norm,
+                    "output_snr": output_snr,
                 })
-
-                # Option 2: Subspace projection (if bases available)
-                if "signal_basis" in batch and "noise_basis" in batch:
-                    signal_basis = batch["signal_basis"].to(device)  # [B, n_signal_basis, n_streams]
-                    noise_basis = batch["noise_basis"].to(device)    # [B, n_noise_basis, n_streams]
-
-                    # Project output onto signal subspace
-                    # outputs: [B, n_streams, d], signal_basis: [B, n_basis, n_streams]
-                    # Project: for each sample and each d dimension
-                    B = outputs.shape[0]
-                    signal_components = []
-                    noise_components = []
-
-                    for b in range(B):
-                        # outputs[b]: [n_streams, d], basis: [n_basis, n_streams]
-                        # Project each column of outputs[b] onto the basis
-                        out_b = outputs[b]  # [n_streams, d]
-
-                        # Project onto signal basis
-                        sig_basis = signal_basis[b]  # [n_signal_basis, n_streams]
-                        # Projection: basis^T @ (basis @ basis^T)^{-1} @ basis @ out
-                        # Simpler: basis^T @ out gives coefficients if basis is orthonormal
-                        sig_coeffs = torch.matmul(sig_basis, out_b)  # [n_signal_basis, d]
-                        sig_proj = torch.matmul(sig_basis.T, sig_coeffs)  # [n_streams, d]
-                        signal_components.append(torch.norm(sig_proj).item())
-
-                        # Project onto noise basis
-                        noise_b_basis = noise_basis[b]  # [n_noise_basis, n_streams]
-                        noise_coeffs = torch.matmul(noise_b_basis, out_b)  # [n_noise_basis, d]
-                        noise_proj = torch.matmul(noise_b_basis.T, noise_coeffs)  # [n_streams, d]
-                        noise_components.append(torch.norm(noise_proj).item())
-
-                    signal_subspace_energy = sum(signal_components) / B
-                    noise_subspace_energy = sum(noise_components) / B
-                    output_snr_v2 = signal_subspace_energy / (noise_subspace_energy + 1e-8)
-
-                    metrics.update({
-                        "signal_subspace_energy": signal_subspace_energy,
-                        "noise_subspace_energy": noise_subspace_energy,
-                        "output_snr_v2": output_snr_v2,
-                    })
 
             logger.log_metrics(epoch, step, metrics)
         step += 1
