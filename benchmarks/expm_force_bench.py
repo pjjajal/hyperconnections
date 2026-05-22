@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.testing
 
-from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton as _expm_t18_block_triton
+from hyperconnections.ops import expm_t18_augmented_sparse as _expm_t18_augmented_sparse, expm_t18_block_triton
 
 from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base
 
@@ -146,7 +146,7 @@ def ref_phi1_quadrature(A: torch.Tensor, n_nodes: int = 64) -> torch.Tensor:
         psi += (0.5 * w) * torch.linalg.matrix_exp(theta * A64)
     return psi.to(A.dtype)
 
-expm_t18_block_triton = torch.compile(_expm_t18_block_triton,fullgraph=False,mode="max-autotune")
+expm_t18_augmented_sparse = torch.compile(_expm_t18_augmented_sparse,fullgraph=False,mode="max-autotune")
 torch._dynamo.config.cache_size_limit = 12
 EXPMT18_COMPILE_MODE = os.environ.get("EXPMT18_COMPILE_MODE", "max-autotune")
 
