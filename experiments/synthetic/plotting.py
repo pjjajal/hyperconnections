@@ -76,15 +76,24 @@ def load_run(run_dir: Path):
     return config, metrics
 
 
-def global_steps_and_loss(metrics):
+def global_steps(metrics):
     if not metrics:
-        return np.array([]), np.array([])
+        return np.array([], dtype=np.int64)
     max_step_per_epoch = max(e["step"] for e in metrics) + 1
-    steps = np.array(
+    return np.array(
         [e["epoch"] * max_step_per_epoch + e["step"] for e in metrics], dtype=np.int64
     )
-    loss = np.array([e["loss"] for e in metrics], dtype=np.float64)
-    return steps, loss
+
+
+def metric_series(metrics, key):
+    vals = [e[key] for e in metrics if key in e]
+    if len(vals) != len(metrics):
+        return None
+    return np.array(vals, dtype=np.float64)
+
+
+def to_db(x):
+    return 10.0 * np.log10(np.clip(x, 1e-30, None))
 
 
 def moving_average(x, window):
@@ -92,6 +101,12 @@ def moving_average(x, window):
         return x
     kernel = np.ones(window) / window
     return np.convolve(x, kernel, mode="valid")
+
+
+def smooth_pair(steps, values, window):
+    if window <= 1:
+        return steps, values
+    return steps[window - 1 :], moving_average(values, window)
 
 
 def main():
@@ -120,23 +135,33 @@ def main():
     out_dir = Path(args.out_root) / results_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    def save(fig, stem):
+        out_png = out_dir / f"{stem}.png"
+        out_pdf = out_dir / f"{stem}.pdf"
+        fig.savefig(out_png)
+        fig.savefig(out_pdf)
+        plt.close(fig)
+        print(f"Saved: {out_png}")
+        print(f"Saved: {out_pdf}")
+
+    # Loss plot
     fig, ax = plt.subplots(figsize=(6, 4))
-
     for run_name, config, metrics in runs:
-        steps, loss = global_steps_and_loss(metrics)
-        if loss.size == 0:
+        if not metrics:
             continue
-        if args.smooth > 1:
-            loss_s = moving_average(loss, args.smooth)
-            steps_s = steps[args.smooth - 1 :]
-        else:
-            steps_s = steps
-            loss_s = loss
+        steps = global_steps(metrics)
+        loss = metric_series(metrics, "loss")
+        if loss is None:
+            continue
+        steps_s, loss_s = smooth_pair(steps, loss, args.smooth)
         model = config.get("model", run_name)
-        label = MODEL_LABELS.get(model, model)
-        color = MODEL_COLORS.get(model, None)
-        ax.plot(steps_s, loss_s, label=label, color=color, alpha=0.9)
-
+        ax.plot(
+            steps_s,
+            loss_s,
+            label=MODEL_LABELS.get(model, model),
+            color=MODEL_COLORS.get(model, None),
+            alpha=0.9,
+        )
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     ax.set_yscale("log")
@@ -144,14 +169,47 @@ def main():
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
+    save(fig, f"{args.depth}")
 
-    out_png = out_dir / f"{args.depth}.png"
-    out_pdf = out_dir / f"{args.depth}.pdf"
-    fig.savefig(out_png)
-    fig.savefig(out_pdf)
-    plt.close(fig)
-    print(f"Saved: {out_png}")
-    print(f"Saved: {out_pdf}")
+    # SNR plot (if all SNR metrics are present)
+    snr_keys = [
+        ("input_snr", "Input SNR (dB)"),
+        ("output_snr", "Output SNR (dB)"),
+        ("snr_queried", "Queried SNR (dB)"),
+    ]
+    has_snr = all(
+        metric_series(m, k) is not None
+        for _, _, m in runs
+        for k, _ in snr_keys
+        if m
+    )
+    if has_snr:
+        fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=True)
+        for ax, (key, ylabel) in zip(axes, snr_keys):
+            for run_name, config, metrics in runs:
+                if not metrics:
+                    continue
+                steps = global_steps(metrics)
+                vals = metric_series(metrics, key)
+                if vals is None:
+                    continue
+                vals_db = to_db(vals)
+                steps_s, vals_s = smooth_pair(steps, vals_db, args.smooth)
+                model = config.get("model", run_name)
+                ax.plot(
+                    steps_s,
+                    vals_s,
+                    label=MODEL_LABELS.get(model, model),
+                    color=MODEL_COLORS.get(model, None),
+                    alpha=0.9,
+                )
+            ax.set_ylabel(ylabel)
+            ax.grid(True, which="both", alpha=0.3)
+        axes[0].set_title(f"{results_name} — depth {args.depth}")
+        axes[-1].set_xlabel("Step")
+        axes[0].legend()
+        fig.tight_layout()
+        save(fig, f"{args.depth}_snr")
 
 
 if __name__ == "__main__":

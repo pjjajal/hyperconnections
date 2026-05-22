@@ -118,7 +118,8 @@ def generate_subspace_basis(
         torch.manual_seed(seed)
 
     basis = torch.randn(n_samples, n_basis_vectors, n_streams)
-    return basis
+    Q, _ = torch.linalg.qr(basis.mT)
+    return Q.mT
 
 
 def sample_keys_from_basis(
