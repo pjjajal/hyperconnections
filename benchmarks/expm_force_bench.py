@@ -34,13 +34,19 @@ from datetime import date
 from itertools import product
 from typing import Sequence
 
+import numpy as np
 import torch
 import triton
 import triton.testing
 
 from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton as _expm_t18_block_triton
 
-from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row
+from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base
+
+
+def _corr_row(*args, **kwargs):
+    """expm_force_bench uses a wider Check column ('quantity vs reference')."""
+    return _corr_row_base(*args, check_width=12, **kwargs)
 
 
 ###
@@ -122,6 +128,24 @@ _A_LABEL = {
 def ref_torch_matrix_exp(A: torch.Tensor) -> torch.Tensor:
     return torch.linalg.matrix_exp(A.float()).to(A.dtype)
 
+
+def ref_phi1_quadrature(A: torch.Tensor, n_nodes: int = 64) -> torch.Tensor:
+    """Ground-truth phi_1(A) = integral_0^1 exp(theta A) d theta.
+
+    Gauss-Legendre quadrature in float64. exp(theta A) is entire in theta,
+    so GL converges super-algebraically; 64 nodes reach fp64 machine
+    precision. Each node uses torch.linalg.matrix_exp (ground-truth exp).
+    Independent of the T18 polynomial, so comparing both the PyTorch and
+    Triton psi against it isolates algorithm error from kernel error.
+    """
+    nodes, weights = np.polynomial.legendre.leggauss(n_nodes)
+    A64 = A.double()
+    psi = torch.zeros_like(A64)
+    for x, w in zip(nodes, weights):
+        theta = 0.5 * (x + 1.0)          # [-1,1] -> [0,1]
+        psi += (0.5 * w) * torch.linalg.matrix_exp(theta * A64)
+    return psi.to(A.dtype)
+
 expm_t18_block_triton = torch.compile(_expm_t18_block_triton,fullgraph=False,mode="max-autotune")
 torch._dynamo.config.cache_size_limit = 12
 EXPMT18_COMPILE_MODE = os.environ.get("EXPMT18_COMPILE_MODE", "max-autotune")
@@ -142,8 +166,11 @@ def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, flo
     return max_err <= atol * (1.0 + ref_mag), max_err
 
 
-_CORR_HDR = f"{'Config':>34}  {'Variant':>10}  {'Check':>10}  {'MaxErr':>10}  {'atol':>8}  Result"
-_CORR_SEP = "-" * 92
+### Variant = implementation under test; Check = "<quantity> vs <reference>".
+### References: exp = torch.linalg.matrix_exp, T18 = pure-torch
+### expm_t18_augmented_sparse, quad = Gauss-Legendre integral ground truth.
+_CORR_HDR = f"{'Config':>34}  {'Variant':>10}  {'Check':>12}  {'MaxErr':>10}  {'atol':>8}  Result"
+_CORR_SEP = "-" * 94
 
 
 def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
@@ -153,27 +180,42 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
 
     got_E, got_psi = expm_t18_block_triton(A)
     ref_E, ref_psi = expm_t18_augmented_sparse(A)
-    gt_E = ref_torch_matrix_exp(A)
+    gt_E   = ref_torch_matrix_exp(A)
+    gt_psi = ref_phi1_quadrature(A)
 
-    ### E vs ground truth (torch.linalg.matrix_exp)
+    ### triton E vs exp ground truth (torch.linalg.matrix_exp)
     passed, err = _check(got_E, gt_E, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "triton", "E vs gt", err, atol_f, passed))
-    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "E vs gt",
+    print(_corr_row(cfg_str, "triton", "E vs exp", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "E vs exp",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
-    ### E vs same-algorithm pure-torch reference
+    ### triton E vs same-algorithm pure-torch reference
     passed, err = _check(got_E, ref_E, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "vs T18", "E", err, atol_f, passed))
-    csv_rows.append({"config": cfg_str, "variant": "vs T18", "check": "E",
+    print(_corr_row(cfg_str, "triton", "E vs T18", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "E vs T18",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
-    ### psi vs same-algorithm pure-torch reference
+    ### triton psi vs same-algorithm pure-torch reference
     passed, err = _check(got_psi, ref_psi, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "vs T18", "psi", err, atol_f, passed))
-    csv_rows.append({"config": cfg_str, "variant": "vs T18", "check": "psi",
+    print(_corr_row(cfg_str, "triton", "psi vs T18", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "psi vs T18",
+                     "max_err": err, "atol": atol_f, "passed": passed})
+
+    ### triton psi vs quadrature ground truth — independent of T18
+    passed, err = _check(got_psi, gt_psi, atol_f)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "triton", "psi vs quad", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "psi vs quad",
+                     "max_err": err, "atol": atol_f, "passed": passed})
+
+    ### pytorch-T18 psi vs quadrature ground truth — isolates algorithm error
+    passed, err = _check(ref_psi, gt_psi, atol_f)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "torch", "psi vs quad", err, atol_f, passed))
+    csv_rows.append({"config": cfg_str, "variant": "torch", "check": "psi vs quad",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
     return all_passed
@@ -236,10 +278,12 @@ def run_correctness(
 ###
 ### Performance benchmark
 ###
+### Speedup columns name the comparator they divide by, matching the
+### timing columns: 'vs matrix_exp' = matrix_exp ms / blk_triton ms, etc.
 _PERF_HDR = (
     f"{'Config':>26}  {'AType':>5}  {'dtype':>6}  "
     f"{'blk_triton ms':>14}  {'matrix_exp ms':>14}  {'blk_t18 ms':>11}  "
-    f"{'vs torch':>9}  {'vs T18':>7}"
+    f"{'vs matrix_exp':>13}  {'vs blk_t18':>10}"
 )
 _PERF_SEP = "-" * 115
 
@@ -252,7 +296,7 @@ def _perf_row(config, atype, dtype_name, t_tri, t_torch, t_t18):
     return (
         f"{config:>26}  {atype:>5}  {dtype_name:>6}  "
         f"{t_tri:>14.3f}  {t_torch:>14.3f}  {t_t18:>11.3f}  "
-        f"{_sp(t_torch):>9}  {_sp(t_t18):>7}"
+        f"{_sp(t_torch):>13}  {_sp(t_t18):>10}"
     )
 
 

@@ -29,10 +29,10 @@ def _dtype(name: str) -> torch.dtype:
 
 def _corr_row(
     config, variant, check, max_err, atol, passed,
-    config_width: int = 34, variant_width: int = 10,
+    config_width: int = 34, variant_width: int = 10, check_width: int = 10,
 ) -> str:
     result = ok("PASS") if passed else fail("FAIL")
     return (
-        f"{config:>{config_width}}  {variant:>{variant_width}}  {check:>10}"
+        f"{config:>{config_width}}  {variant:>{variant_width}}  {check:>{check_width}}"
         f"  {max_err:>10.2e}  {atol:>8.0e}  {result}"
     )
