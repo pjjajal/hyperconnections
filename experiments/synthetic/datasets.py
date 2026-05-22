@@ -223,4 +223,6 @@ class SignalFilteringDataset(Dataset):
             "input": self.H_0[idx],  # [n_streams, d]
             "target": self.H_target[idx],  # [n_streams, d]
             "noise": self.noise[idx],  # [n_layers, n_streams, d]
+            "signal_basis": self.signal_basis[idx],  # [n_signal_basis, n_streams]
+            "noise_basis": self.noise_basis[idx],  # [n_noise_basis, n_streams]
         }

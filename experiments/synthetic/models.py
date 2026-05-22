@@ -101,6 +101,7 @@ class StreamDynamicsModel(nn.Module):
         Args:
             H: Input stream state [B, n_streams, d]
             noise: Optional noise to add at specific layers [B, n_noise_layers, n_streams, d]
+                   Note: Noise is NOT added on the last layer (model needs clean step to filter)
 
         Returns:
             Output stream state [B, n_streams, d]
@@ -116,8 +117,9 @@ class StreamDynamicsModel(nn.Module):
         for step in range(self.n_layers):
             x = self.layer(x)
 
-            # Add noise if provided and within noise layer range
-            if noise is not None and noise_idx < noise.shape[1]:
+            # Add noise if provided, within range, and NOT on the last step
+            # (last step should be clean so model can filter)
+            if noise is not None and noise_idx < noise.shape[1] and step < self.n_layers - 1:
                 x_reshaped = x.reshape(B, self.n_streams, self.d)
                 x_reshaped = x_reshaped + noise[:, noise_idx]
                 x = x_reshaped.reshape(B, -1)
