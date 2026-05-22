@@ -15,6 +15,7 @@ from experiments.synthetic import (
     ZeroModule,
     mse_loss,
 )
+from einops import einsum
 from experiments.synthetic.logger import ExperimentLogger
 
 
@@ -55,21 +56,34 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
             # Log energy statistics for filtering task
             if noise is not None:
                 B = inputs.shape[0]
+                signal_basis = batch.get("signal_basis", None)
+                noise_basis = batch.get("noise_basis", None)
 
                 # Input SNR: ||signal|| / ||total_noise||
-                signal_norm = torch.norm(inputs.reshape(B, -1), dim=1).mean().item()
+                signal_norm = torch.norm(inputs.reshape(B, -1), dim=1).pow(2).mean().item()
 
                 # Sum noise across all layers then compute norm
                 # noise shape: [B, n_layers, n_streams, d]
                 total_noise = noise.sum(dim=1)  # [B, n_streams, d]
-                total_noise_norm = torch.norm(total_noise.reshape(B, -1), dim=1).mean().item()
+                total_noise_norm = torch.norm(total_noise.reshape(B, -1), dim=1).pow(2).mean().item()
 
                 input_snr = signal_norm / (total_noise_norm + 1e-8)
 
                 # Output SNR: ||targets|| / ||outputs - targets||
-                output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).mean().item()
-                output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).mean().item()
+                output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).pow(2).mean().item()
+                output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).pow(2).mean().item()
                 output_snr = output_signal_norm / (output_error_norm + 1e-8)
+
+                # Queried Signal Norm:
+                vs = einsum("bnd,bkn->bkd", inputs, signal_basis)
+                outputs_vs = einsum("bnd,bkn->bkd", outputs, signal_basis)
+
+                vs_energy = vs.norm(dim=-1).pow(2).mean().item()
+                outputs_vs_energy = outputs_vs.norm(dim=-1).pow(2).mean().item()
+                residual_energy = (vs - outputs_vs).norm(dim=-1).pow(2).mean().item()
+
+                snr_queried = vs_energy / (residual_energy + 1e-8)
+
 
                 metrics.update({
                     "signal_norm": signal_norm,
@@ -78,6 +92,10 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
                     "output_signal_norm": output_signal_norm,
                     "output_error_norm": output_error_norm,
                     "output_snr": output_snr,
+                    "vs_energy_queried": vs_energy,
+                    "outputs_vs_energy_queried": outputs_vs_energy,
+                    "residual_energy_queried": residual_energy,
+                    "snr_queried": snr_queried,
                 })
 
             logger.log_metrics(epoch, step, metrics)

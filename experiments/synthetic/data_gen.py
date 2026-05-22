@@ -35,6 +35,7 @@ def generate_memory_state(
 
     # Generate random keys and values
     keys = torch.randn(n_samples, n_memories, n_streams)
+    keys = keys / (torch.norm(keys, dim=-1, keepdim=True) + 1e-8)  # Normalize keys
     values = torch.randn(n_samples, n_memories, d)
 
     # Construct memory matrices: H = sum_i k_i @ v_i^T
@@ -145,5 +146,6 @@ def sample_keys_from_basis(
 
     # Keys = coefficients @ basis
     keys = torch.einsum('bmk,bkn->bmn', coeffs, basis)
+    keys = keys / (torch.norm(keys, dim=-1, keepdim=True) + 1e-8)  # Normalize keys
 
     return keys
