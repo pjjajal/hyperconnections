@@ -56,15 +56,10 @@ identity matrix used in the polynomial is full-NP×NP.
 from __future__ import annotations
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-except ModuleNotFoundError as exc:
-    if exc.name != "triton":
-        raise
-    HAS_TRITON = False
+import triton
+import triton.language as tl
 
+HAS_TRITON = True
 
 ###
 ### T18 Constants
