@@ -142,9 +142,34 @@ def ref_phi1_quadrature(A: torch.Tensor, n_nodes: int = 64) -> torch.Tensor:
     A64 = A.double()
     psi = torch.zeros_like(A64)
     for x, w in zip(nodes, weights):
-        theta = 0.5 * (x + 1.0)          # [-1,1] -> [0,1]
+        theta = 0.5 * (x + 1.0) # [-1,1] -> [0,1]
         psi += (0.5 * w) * torch.linalg.matrix_exp(theta * A64)
     return psi.to(A.dtype)
+
+
+def _build_aug_2N(A: torch.Tensor) -> torch.Tensor:
+    """[[A, I], [0, 0]] of shape [B, 2N, 2N], preserving autograd through A."""
+    B_, N_, _ = A.shape
+    eye  = torch.eye(N_, dtype=A.dtype, device=A.device).expand(B_, N_, N_).contiguous()
+    zero = torch.zeros_like(eye)
+    top = torch.cat([A,    eye ], dim=-1)        # [B, N, 2N]
+    bot = torch.cat([zero, zero], dim=-1)        # [B, N, 2N]
+    return torch.cat([top, bot], dim=-2)         # [B, 2N, 2N]
+
+
+def ref_grad_matrix_exp_aug(A: torch.Tensor) -> torch.Tensor:
+    """Ground-truth dL/dA for L = E.sum() + psi.sum() where (E, psi) =
+    upper-row blocks of matrix_exp([[A, I], [0, 0]]).  fp32; cast at call site.
+
+    Independent of the T18 polynomial — uses torch.linalg.matrix_exp as the
+    reference and autograd's adjoint through the explicit 2N x 2N construction.
+    Analogous to ref_phi1_quadrature for the forward.
+    """
+    A_r = A.detach().float().requires_grad_(True)
+    M = _build_aug_2N(A_r)
+    expM = torch.linalg.matrix_exp(M)
+    expM[:, :A_r.shape[-1], :].sum().backward() # E.sum() + psi.sum()
+    return A_r.grad
 
 
 torch._dynamo.config.cache_size_limit = 12
@@ -169,14 +194,18 @@ def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, flo
 
 
 ### Variant = implementation under test; Check = "<quantity> vs <reference>".
-### References: exp = torch.linalg.matrix_exp, T18 = pure-torch
-### expm_t18_augmented_sparse, quad = Gauss-Legendre integral ground truth.
+### References:
+###   exp  = torch.linalg.matrix_exp
+###   T18  = pure-torch expm_t18_augmented_sparse (same algorithm)
+###   quad = Gauss-Legendre integral ground truth for psi
+###   aug  = autograd through matrix_exp of explicit 2N augmented matrix
+###          (ground-truth backward, independent of T18)
 _CORR_HDR = f"{'Config':>34}  {'Variant':>10}  {'Check':>12}  {'MaxErr':>10}  {'atol':>8}  Result"
 _CORR_SEP = "-" * 94
 
 
 def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
-                atol_f: float, all_passed: bool,
+                atol_f: float, atol_b: float, all_passed: bool,
                 csv_rows: list[dict]) -> bool:
     """Run correctness checks on one A; return updated all_passed."""
 
@@ -220,6 +249,40 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     csv_rows.append({"config": cfg_str, "variant": "torch", "check": "psi vs quad",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
+    ### --- Backward: dL/dA for L = E.sum() + psi.sum() ---
+    A_t = A.detach().clone().requires_grad_(True)
+    E_t, psi_t = expm_t18_block_triton(A_t)
+    (E_t.sum() + psi_t.sum()).backward()
+    g_tri = A_t.grad
+
+    A_r = A.detach().clone().requires_grad_(True)
+    E_r, psi_r = expm_t18_augmented_sparse(A_r)
+    (E_r.sum() + psi_r.sum()).backward()
+    g_torch = A_r.grad
+
+    g_aug = ref_grad_matrix_exp_aug(A).to(A.dtype)
+
+    ### triton grad vs same-algorithm pure-torch reference
+    passed, err = _check(g_tri, g_torch, atol_b)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "triton", "grad vs T18", err, atol_b, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad vs T18",
+                     "max_err": err, "atol": atol_b, "passed": passed})
+
+    ### triton grad vs augmented-matrix ground truth — independent of T18
+    passed, err = _check(g_tri, g_aug, atol_b)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "triton", "grad vs aug", err, atol_b, passed))
+    csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad vs aug",
+                     "max_err": err, "atol": atol_b, "passed": passed})
+
+    ### pytorch-T18 grad vs augmented-matrix ground truth — isolates algorithm error
+    passed, err = _check(g_torch, g_aug, atol_b)
+    all_passed &= passed
+    print(_corr_row(cfg_str, "torch", "grad vs aug", err, atol_b, passed))
+    csv_rows.append({"config": cfg_str, "variant": "torch", "check": "grad vs aug",
+                     "max_err": err, "atol": atol_b, "passed": passed})
+
     return all_passed
 
 
@@ -240,12 +303,15 @@ def run_correctness(
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
+        ### Backward gradients have larger magnitude than the outputs they came
+        ### from (||L|| scales with ||exp(A)||), so atol_b is loosened vs atol_f.
         atol_f = 5e-4 if dtype == torch.float32 else 5e-2
+        atol_b = 5e-3 if dtype == torch.float32 else 1e-1
 
         for B, N in product(bs, ns):
             A = _A_FACTORIES["random"](B, N, dtype)
             cfg_str = f"B={B} N={N} {dtype_name}"
-            all_passed = _corr_block(A, cfg_str, dtype, atol_f, all_passed, csv_rows)
+            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
         print(_CORR_SEP)
 
@@ -260,11 +326,12 @@ def run_correctness(
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
         atol_f = 1e-3 if dtype == torch.float32 else 5e-2
+        atol_b = 5e-3 if dtype == torch.float32 else 1e-1
 
         for kind, B, N in product(["skew", "neg_psd", "diagonal", "large"], bs, ns):
             A = _A_FACTORIES[kind](B, N, dtype)
             cfg_str = f"[{_A_LABEL[kind]}] B={B} N={N} {dtype_name}"
-            all_passed = _corr_block(A, cfg_str, dtype, atol_f, all_passed, csv_rows)
+            all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
         print(_CORR_SEP)
 
@@ -308,6 +375,8 @@ def run_perf(
     dtypes: Sequence[str],
     warmup: int = 25,
     rep: int = 200,
+    fwd: bool = True,
+    bwd: bool = False,
 ) -> list[dict]:
     print()
     print(bold("=" * 115))
@@ -328,15 +397,45 @@ def run_perf(
                 A = _A_FACTORIES[kind](B, N, dtype)
                 label = _A_LABEL[kind]
 
-                t_tri   = triton.testing.do_bench(lambda: expm_t18_block_triton(A),    warmup=warmup, rep=rep)
-                t_torch = triton.testing.do_bench(lambda: ref_torch_matrix_exp(A),     warmup=warmup, rep=rep)
-                t_t18   = triton.testing.do_bench(lambda: expm_t18_augmented_sparse(A), warmup=warmup, rep=rep)
-                print(_perf_row(cfg_str, label + " fwd", dtype_name, t_tri, t_torch, t_t18))
-                csv_rows.append({
-                    "config": cfg_str, "atype": label + " fwd", "dtype": dtype_name,
-                    "blk_triton_ms": t_tri, "matrix_exp_ms": t_torch, "blk_t18_ms": t_t18,
-                    "speedup_vs_torch": t_torch / t_tri, "speedup_vs_t18": t_t18 / t_tri,
-                })
+                if fwd:
+                    t_tri   = triton.testing.do_bench(lambda: expm_t18_block_triton(A),    warmup=warmup, rep=rep)
+                    t_torch = triton.testing.do_bench(lambda: ref_torch_matrix_exp(A),     warmup=warmup, rep=rep)
+                    t_t18   = triton.testing.do_bench(lambda: expm_t18_augmented_sparse(A), warmup=warmup, rep=rep)
+                    print(_perf_row(cfg_str, label + " fwd", dtype_name, t_tri, t_torch, t_t18))
+                    csv_rows.append({
+                        "config": cfg_str, "atype": label + " fwd", "dtype": dtype_name,
+                        "blk_triton_ms": t_tri, "matrix_exp_ms": t_torch, "blk_t18_ms": t_t18,
+                        "speedup_vs_torch": t_torch / t_tri, "speedup_vs_t18": t_t18 / t_tri,
+                    })
+
+                if bwd:
+                    A_g = A.detach().clone().requires_grad_(True)
+
+                    def _b_tri():
+                        A_g.grad = None
+                        E, psi = expm_t18_block_triton(A_g)
+                        (E.sum() + psi.sum()).backward()
+
+                    def _b_aug():
+                        ### Ground-truth: build [[A, I], [0, 0]] and backprop through
+                        ### matrix_exp.  E.sum() + psi.sum() = expM[:, :N, :].sum().
+                        A_g.grad = None
+                        torch.linalg.matrix_exp(_build_aug_2N(A_g))[:, :N, :].sum().backward()
+
+                    def _b_t18():
+                        A_g.grad = None
+                        E, psi = expm_t18_augmented_sparse(A_g)
+                        (E.sum() + psi.sum()).backward()
+
+                    t_b_tri = triton.testing.do_bench(_b_tri, warmup=warmup, rep=rep)
+                    t_b_aug = triton.testing.do_bench(_b_aug, warmup=warmup, rep=rep)
+                    t_b_t18 = triton.testing.do_bench(_b_t18, warmup=warmup, rep=rep)
+                    print(_perf_row(cfg_str, label + " bwd", dtype_name, t_b_tri, t_b_aug, t_b_t18))
+                    csv_rows.append({
+                        "config": cfg_str, "atype": label + " bwd", "dtype": dtype_name,
+                        "blk_triton_ms": t_b_tri, "matrix_exp_ms": t_b_aug, "blk_t18_ms": t_b_t18,
+                        "speedup_vs_torch": t_b_aug / t_b_tri, "speedup_vs_t18": t_b_t18 / t_b_tri,
+                    })
 
             print()  # blank between (N, B) groups
 
@@ -375,7 +474,18 @@ def main():
         "--rep", type=int, default=128,
         help="Triton do_bench repetitions (default: 128)",
     )
+    parser.add_argument(
+        "--fwd", action="store_true", default=False,
+        help="Benchmark forward (default when neither --fwd nor --bwd is given)",
+    )
+    parser.add_argument(
+        "--bwd", action="store_true", default=False,
+        help="Benchmark backward",
+    )
     args = parser.parse_args()
+
+    run_fwd = args.fwd or not args.bwd
+    run_bwd = args.bwd
 
     if not torch.cuda.is_available():
         print(fail("No CUDA device found. Exiting."))
@@ -386,8 +496,16 @@ def main():
     print(f"N vals    : {args.n}")
     print(f"B vals    : {args.b}")
     print(f"dtypes    : {args.dtype}")
+    print(f"bench fwd : {run_fwd}")
+    print(f"bench bwd : {run_bwd}")
 
     today = date.today().strftime("%Y_%m_%d")
+    if run_fwd and run_bwd:
+        dir_tag = "fwdbwd"
+    elif run_bwd:
+        dir_tag = "bwd"
+    else:
+        dir_tag = "fwd"
     report_dir = os.path.normpath(_REPORT_DIR)
 
     passed = True
@@ -399,9 +517,10 @@ def main():
 
     if args.mode in ("perf", "all"):
         perf_rows = run_perf(args.n, args.b, args.dtype,
-                             warmup=args.warmup, rep=args.rep)
+                             warmup=args.warmup, rep=args.rep,
+                             fwd=run_fwd, bwd=run_bwd)
         perf_path = os.path.join(report_dir,
-                                 f"benchmark_expm_force_perf_fwd_{today}.CSV")
+                                 f"benchmark_expm_force_perf_{dir_tag}_{today}.CSV")
         _write_csv(perf_rows, perf_path)
 
     if args.mode in ("correctness", "all") and not passed:

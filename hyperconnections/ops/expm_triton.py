@@ -672,20 +672,63 @@ def _expm_t18_augmented_no_grad(
 
 
 ###
-### Autograd Function (forward-only)
+### Autograd Function
+###
+### Backward decomposes into two adjoint Frechet derivatives:
+###
+###   dL/dA = L_exp(A^T, grad_E)  +  L_phi_1(A^T, grad_psi)
+###
+### Part 1 — L_exp(A^T, grad_E):
+###   Najfeld-Havel / Higham §10.6: upper-right block of exp([[A^T, G],[0,A^T]]).
+###   Reuses _expm_t18_structure_no_grad (block-structured at N).
+###
+### Part 2 — L_phi_1(A^T, grad_psi):
+###   For the 3N block-upper-triangular matrix
+###       M = [[A^T,  G,   0],
+###            [ 0,  A^T,  I],
+###            [ 0,   0,   0]],
+###   the (1,3) N-block of exp(M) is integral_{s+t<=1} exp(sA^T) G exp(tA^T) ds dt
+###   = L_phi_1(A^T, G).  We assemble M and reuse the dense forward kernel
+###   _expm_t18_no_grad at N -> 3N; for the common N=4 case this is 12x12,
+###   still in the unrolled regime.  No new Triton kernel required.
 ###
 class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A: torch.Tensor):
         E, psi = _expm_t18_augmented_no_grad(A, out_dtype=A.dtype)
-        ctx.save_for_backward(A)
+        ctx.save_for_backward(A.float().transpose(-1, -2).contiguous())
+        ctx.input_dtype = A.dtype
         return E, psi
 
     @staticmethod
     def backward(ctx, grad_E: torch.Tensor, grad_psi: torch.Tensor):
-        raise NotImplementedError(
-            "expm_t18_block_triton backward not yet implemented"
-        )
+        if not ctx.needs_input_grad[0]:
+            return None
+
+        (A_T,) = ctx.saved_tensors
+        out_dtype = ctx.input_dtype
+        B, N, _ = A_T.shape
+        G_E   = grad_E.float().contiguous()
+        G_psi = grad_psi.float().contiguous()
+
+        ### Part 1: L_exp(A^T, grad_E) via block-structured backward at N.
+        dA_E = _expm_t18_structure_no_grad(A_T, G_E, out_dtype=out_dtype)
+
+        ### Part 2: L_phi_1(A^T, grad_psi) via 3N x 3N augmented exp.
+        ### M = [[A^T, G_psi, 0], [0, A^T, I], [0, 0, 0]] — (1,3) block of
+        ### exp(M) is integral_{s+t<=1} exp(sA^T) G_psi exp(tA^T) ds dt
+        ### = L_phi_1(A^T, G_psi).
+        M = torch.zeros(B, 3 * N, 3 * N, dtype=torch.float32, device=A_T.device)
+        M[:,  :N,      :N   ] = A_T
+        M[:,  :N,     N:2*N ] = G_psi
+        M[:, N:2*N,   N:2*N ] = A_T
+        eye = torch.eye(N, dtype=torch.float32, device=A_T.device)
+        M[:, N:2*N, 2*N:3*N] = eye
+
+        expM = _expm_t18_no_grad(M, out_dtype=out_dtype)
+        dA_psi = expM[:, :N, 2*N:3*N]
+
+        return dA_E + dA_psi
 
 
 ###
