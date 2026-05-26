@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from hyperconnections import cghc, mhc, ghc, identity_hc
-from experiments.synthetic import (
+from experiments.synthetic_dynamics import (
     SignalPreservationDataset,
     SignalRotationDataset,
     SignalFilteringDataset,
@@ -16,7 +16,7 @@ from experiments.synthetic import (
     mse_loss,
 )
 from einops import einsum
-from experiments.synthetic.logger import ExperimentLogger
+from experiments.synthetic_dynamics.logger import ExperimentLogger
 
 
 # Mapping from model name to class

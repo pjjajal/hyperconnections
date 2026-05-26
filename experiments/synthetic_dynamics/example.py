@@ -2,7 +2,7 @@
 
 import torch
 from hyperconnections import cghc, mhc, ghc, identity_hc
-from experiments.synthetic import (
+from experiments.synthetic_dynamics import (
     SignalPreservationDataset,
     SignalRotationDataset,
     SignalFilteringDataset,
