@@ -7,7 +7,7 @@ set -e  # Exit on error
 TASK="filtering"
 N_SAMPLES=10000
 N_STREAMS=4
-D=32
+D=64
 EPOCHS=100
 BATCH_SIZE=64
 DEVICE="cuda"
@@ -18,13 +18,13 @@ N_SIGNAL_BASIS=1
 N_SIGNAL_MEMORIES=1
 N_NOISE_BASIS=2
 N_NOISE_MEMORIES=1
-NOISE_SCALE=0.50
+NOISE_SCALE=3.0
 
 # Model types to test
 MODELS=("cghc" "mhc" "ghc" "identity_hc")
 
 # Depths to test
-DEPTHS=(1 4 8 16 32 64)
+DEPTHS=(4 8 16 32 64)
 
 echo "Starting filtering task sweep..."
 echo "Models: ${MODELS[@]}"
@@ -61,8 +61,9 @@ for model in "${MODELS[@]}"; do
             --seed $SEED \
             --run-name $run_name \
             --dt 0.01 \
-            --projection mean
-
+            --projection mean \
+            --generator-type conservative_diag_diss \
+            --lr 1e-3
         echo ""
         echo "Completed: $run_name"
         echo ""

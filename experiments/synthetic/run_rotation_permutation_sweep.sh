@@ -16,7 +16,8 @@ DEVICE="cuda"
 SEED=42
 
 # Model types to test
-MODELS=("cghc" "mhc" "ghc" "identity_hc")
+# MODELS=("cghc" "mhc" "ghc" "identity_hc")
+MODELS=("mhc")
 
 # Depths to test
 DEPTHS=(1 4 8 16 32 64)
@@ -51,7 +52,8 @@ for model in "${MODELS[@]}"; do
             --seed $SEED \
             --run-name $run_name \
             --dt 0.01 \
-            --projection mean
+            --projection mean \
+            --lr 1e-3
 
         echo ""
         echo "Completed: $run_name"

@@ -191,6 +191,8 @@ class SignalFilteringDataset(Dataset):
         H_0 = torch.einsum('bkn,bkd->bnd', signal_keys, signal_values)
 
         self.H_0 = H_0
+        self.signal_keys = signal_keys
+        self.signal_values = signal_values
         self.signal_basis = signal_basis
         self.noise_basis = noise_basis
 
@@ -227,4 +229,6 @@ class SignalFilteringDataset(Dataset):
             "noise": self.noise[idx],  # [n_layers, n_streams, d]
             "signal_basis": self.signal_basis[idx],  # [n_signal_basis, n_streams]
             "noise_basis": self.noise_basis[idx],  # [n_noise_basis, n_streams]
+            "signal_keys": self.signal_keys[idx],  # [n_signal_memories, n_streams]
+            "signal_values": self.signal_values[idx],  # [n_signal_memories, d]
         }

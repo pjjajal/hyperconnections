@@ -43,3 +43,5 @@ ptx_ir_dump/
 
 # Exceptions
 !benchmark_small_n_exhaustive_4_3_2026.log
+
+experiments/synthetic/runs

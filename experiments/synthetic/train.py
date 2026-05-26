@@ -28,7 +28,7 @@ HC_MODELS = {
 }
 
 
-def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
+def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0, retrieval_loss=False):
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
@@ -40,10 +40,23 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
         noise = batch.get("noise", None)
         if noise is not None:
             noise = noise.to(device)
+        signal_keys = batch.get("signal_keys", None)
+        signal_values = batch.get("signal_values", None)
+        if signal_keys is not None:
+            signal_keys = signal_keys.to(device)
+            signal_values = signal_values.to(device)
 
         optimizer.zero_grad()
         outputs = model(inputs, noise=noise)
-        loss = mse_loss(outputs, targets)
+
+        if retrieval_loss:
+            if signal_keys is None:
+                raise ValueError("retrieval_loss requires signal_keys/signal_values in batch (filtering task only)")
+            retrieved = einsum(signal_keys, outputs, "b m n, b n d -> b m d")
+            loss = mse_loss(retrieved, signal_values)
+        else:
+            loss = mse_loss(outputs, targets)
+
         loss.backward()
         optimizer.step()
 
@@ -62,21 +75,28 @@ def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0):
                 # Input SNR: ||signal|| / ||total_noise||
                 signal_norm = torch.norm(inputs.reshape(B, -1), dim=1).pow(2).mean().item()
 
-                # Sum noise across all layers then compute norm
+                # Total injected noise budget: sum of per-layer squared norms.
                 # noise shape: [B, n_layers, n_streams, d]
-                total_noise = noise.sum(dim=1)  # [B, n_streams, d]
-                total_noise_norm = torch.norm(total_noise.reshape(B, -1), dim=1).pow(2).mean().item()
+                total_noise_norm = (
+                    noise.reshape(B, noise.shape[1], -1).norm(dim=2).pow(2).sum(dim=1).mean().item()
+                )
 
                 input_snr = signal_norm / (total_noise_norm + 1e-8)
 
-                # Output SNR: ||targets|| / ||outputs - targets||
-                output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).pow(2).mean().item()
-                output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).pow(2).mean().item()
+                # Output SNR
+                if retrieval_loss:
+                    # Retrieval SNR: ||values|| / ||retrieved - values||
+                    output_signal_norm = torch.norm(signal_values.reshape(B, -1), dim=1).pow(2).mean().item()
+                    output_error_norm = torch.norm((retrieved - signal_values).reshape(B, -1), dim=1).pow(2).mean().item()
+                else:
+                    # Reconstruction SNR: ||targets|| / ||outputs - targets||
+                    output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).pow(2).mean().item()
+                    output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).pow(2).mean().item()
                 output_snr = output_signal_norm / (output_error_norm + 1e-8)
 
                 # Queried Signal Norm:
-                vs = einsum(inputs, signal_basis, "bnd,bkn->bkd")
-                outputs_vs = einsum(outputs, signal_basis, "bnd,bkn->bkd")
+                vs = einsum(inputs, signal_basis, "b n d, b k n -> b k d")
+                outputs_vs = einsum(outputs, signal_basis, "b n d, b k n -> b k d")
 
                 vs_energy = vs.norm(dim=-1).pow(2).mean().item()
                 outputs_vs_energy = outputs_vs.norm(dim=-1).pow(2).mean().item()
@@ -160,6 +180,10 @@ def main():
                        help="Number of noise key-value pairs per layer")
     parser.add_argument("--noise-scale", type=float, default=1.0,
                        help="Noise scale for filtering task")
+    parser.add_argument("--retrieval-loss", action="store_true",
+                       help="Filtering task only: train on retrieval loss "
+                            "(MSE between keys@outputs and signal_values) instead of "
+                            "reconstructing H_0")
 
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
@@ -201,6 +225,9 @@ def main():
                        help="Run name (default: timestamp)")
 
     args = parser.parse_args()
+
+    if args.retrieval_loss and args.task != "filtering":
+        parser.error("--retrieval-loss is only supported with --task filtering")
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -323,7 +350,10 @@ def main():
     # Training loop
     best_loss = float('inf')
     for epoch in range(args.epochs):
-        train_loss = train_epoch(model, dataloader, optimizer, args.device, logger, epoch)
+        train_loss = train_epoch(
+            model, dataloader, optimizer, args.device, logger, epoch,
+            retrieval_loss=args.retrieval_loss,
+        )
 
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {train_loss:.6f}")
 

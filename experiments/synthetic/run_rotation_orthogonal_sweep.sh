@@ -15,7 +15,8 @@ DEVICE="cuda"
 SEED=42
 
 # Model types to test
-MODELS=("cghc" "mhc" "ghc" "identity_hc")
+# MODELS=("cghc" "mhc" "ghc" "identity_hc")
+MODELS=("mhc")
 
 # Depths to test
 DEPTHS=(1 4 8 16 32 64)
@@ -47,8 +48,10 @@ for model in "${MODELS[@]}"; do
             --batch-size $BATCH_SIZE \
             --device $DEVICE \
             --seed $SEED \
-            --run-name $run_name
-
+            --run-name $run_name \
+            --projection mean \
+            --dt 0.01 \
+            --lr 1e-3
         echo ""
         echo "Completed: $run_name"
         echo ""
