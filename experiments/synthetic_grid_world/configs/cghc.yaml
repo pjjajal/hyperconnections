@@ -1,0 +1,44 @@
+exp_name: cghc
+
+data:
+  n_samples_per_grid: 5000
+  n_grids: 5
+  n_rows: 6
+  n_cols: 6
+  n_colours: 3
+  trajectory_length: 12
+  ambiguous_threshold: 0.50
+  final_unique: true
+  seed: 532
+
+model:
+  dim: 16
+  num_heads: 4
+  ffn_ratio: 4
+  num_layers: 12
+  qkv_bias: false
+  proj_bias: true
+  hc:
+    type: cghc
+    n: 4
+    m: 1
+    dt: 0.01
+    generator_type: conservative_diag_diss
+    projection: mean
+    learn_dt: true
+    dt_min: 0.001
+    dt_max: 0.15
+    vec_dt: true
+    elementwise_affine: true
+    use_triton: false
+
+training:
+  batch_size: 128
+  epochs: 100
+  lr: 1e-3
+  weight_decay: 0.01
+  device: auto
+
+logging:
+  log_dir: experiments/synthetic_grid_world/runs
+  run_name: null
