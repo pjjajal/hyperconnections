@@ -181,7 +181,7 @@ def main():
         qkv_bias=cfg.model.qkv_bias,
         proj_bias=cfg.model.proj_bias,
     ).to(device)
-
+    model.compile()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
     print(f"Train samples: {len(train_dataset)}  |  Val samples: {len(val_dataset)}")
