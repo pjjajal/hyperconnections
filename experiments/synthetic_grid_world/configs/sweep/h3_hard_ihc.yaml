@@ -1,0 +1,36 @@
+data:
+  n_samples: 100000
+  n_rows: 6
+  n_cols: 6
+  n_colours: 3
+  trajectory_length: 10
+  ambiguous_threshold: 0.65
+  final_unique: true
+  seed: 42
+  train_cache_path: experiments/synthetic_grid_world/datasets/h3_hard_train.pt
+  val_cache_path: experiments/synthetic_grid_world/datasets/h3_hard_val.pt
+
+model:
+  dim: 64
+  num_heads: null   # derived: dim // 16
+  num_layers: null  # derived: max(2, dim // 10)
+  ffn_ratio: 4
+  qkv_bias: false
+  proj_bias: true
+  hc:
+    type: identity_hc
+    n: 4
+    m: 1
+    bias: false
+    elementwise_affine: false
+
+training:
+  batch_size: 256
+  epochs: 100
+  lr: 1e-3
+  weight_decay: 0.01
+  device: auto
+
+logging:
+  log_dir: experiments/synthetic_grid_world/runs
+  run_name: null

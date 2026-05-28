@@ -80,7 +80,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         actions_padded = torch.cat([actions, null], dim=1)
 
         optimizer.zero_grad()
-        logits = model(obs, actions_padded, batch.grid_idx.to(device))
+        logits = model(obs, actions_padded, batch.grid.to(device))
         loss = F.cross_entropy(logits, final_pos)
         loss.backward()
         optimizer.step()
@@ -108,7 +108,7 @@ def evaluate(model, dataloader, device):
         null = torch.full((B, 1), NULL_ACTION, dtype=torch.long, device=device)
         actions_padded = torch.cat([actions, null], dim=1)
 
-        logits = model(obs, actions_padded, batch.grid_idx.to(device))
+        logits = model(obs, actions_padded, batch.grid.to(device))
         loss = F.cross_entropy(logits, final_pos)
 
         total_loss += loss.item()
@@ -128,28 +128,30 @@ def main():
     print(f"Device: {device}")
 
     # ── Datasets ──────────────────────────────────────────────────────────
-    shared = dict(
-        n_grids=cfg.data.n_grids,
+    dataset_kwargs = dict(
         n_rows=cfg.data.n_rows,
         n_cols=cfg.data.n_cols,
         n_colours=cfg.data.n_colours,
         trajectory_length=cfg.data.trajectory_length,
         ambiguous_threshold=cfg.data.ambiguous_threshold,
         final_unique=cfg.data.final_unique,
-        seed=cfg.data.seed,
     )
+    train_cache = cfg.data.get("train_cache_path") or None
+    val_cache = cfg.data.get("val_cache_path") or None
     train_dataset = GridWorldDataset(
-        n_samples_per_grid=cfg.data.n_samples_per_grid, split="train", **shared
+        n_samples=cfg.data.n_samples, seed=cfg.data.seed,
+        cache_path=train_cache, **dataset_kwargs
     )
     val_dataset = GridWorldDataset(
-        n_samples_per_grid=cfg.data.n_samples_per_grid // 5, split="test", **shared
+        n_samples=cfg.data.n_samples // 5, seed=cfg.data.seed + 1,
+        cache_path=val_cache, **dataset_kwargs
     )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
-        shuffle=True,
         num_workers=4,
+        shuffle=True,
         persistent_workers=True,
     )
     val_loader = DataLoader(
@@ -162,21 +164,26 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────
     n_positions = cfg.data.n_rows * cfg.data.n_cols
+    n_grid_tokens = cfg.data.n_rows * cfg.data.n_cols
     seq_len = cfg.data.trajectory_length + 1
 
     hc_cls, input_dim = build_hc_cls(cfg.model.hc, cfg.model.dim)
 
+    dim = cfg.model.dim
+    num_heads = cfg.model.get("num_heads") or max(1, dim // 16)
+    num_layers = cfg.model.get("num_layers") or max(2, dim // 10)
+
     model = Transformer(
-        n_grids=cfg.data.n_grids,
+        n_grid_tokens=n_grid_tokens,
         n_observations=cfg.data.n_colours,
         n_actions=N_ACTIONS,
         n_positions=n_positions,
         seq_len=seq_len,
-        dim=cfg.model.dim,
+        dim=dim,
         input_dim=input_dim,
-        num_heads=cfg.model.num_heads,
+        num_heads=num_heads,
         ffn_ratio=cfg.model.ffn_ratio,
-        num_layers=cfg.model.num_layers,
+        num_layers=num_layers,
         hc_cls=hc_cls,
         qkv_bias=cfg.model.qkv_bias,
         proj_bias=cfg.model.proj_bias,

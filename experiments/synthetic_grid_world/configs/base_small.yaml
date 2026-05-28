@@ -1,8 +1,7 @@
 exp_name: base
 
 data:
-  n_samples_per_grid: 5000
-  n_grids: 5
+  n_samples: 25000
   n_rows: 6
   n_cols: 6
   n_colours: 3

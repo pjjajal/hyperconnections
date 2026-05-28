@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from torch.utils.data import Dataset
 from typing import NamedTuple
@@ -28,7 +30,7 @@ class Hardness(NamedTuple):
 
 
 class Sample(NamedTuple):
-    grid_idx: int
+    grid: torch.Tensor      # [n_rows, n_cols]
     trajectory: Trajectory
     hardness: Hardness
     belief_masks: torch.Tensor
@@ -247,79 +249,64 @@ def hardness_check(
 
 class GridWorldDataset(torch.utils.data.Dataset):
     """
-    Dataset of synthetic grid worlds. Each grid is a 2D array of colour indices.
+    Dataset of synthetic grid worlds. Each sample has a unique randomly-generated grid.
     """
 
     def __init__(
         self,
-        n_samples_per_grid,
-        n_grids,
+        n_samples,
         n_rows,
         n_cols,
         n_colours,
         trajectory_length,
         ambiguous_threshold: float = 0.75,
         final_unique: bool = True,
-        split: str = "train",
         seed: int = 42,
+        cache_path: str | Path | None = None,
     ):
-        assert split in {"train", "test"}, f"Invalid split: {split}"
-        self.n_samples_per_grid = n_samples_per_grid
-        self.n_grids = n_grids
         self.n_rows = n_rows
         self.n_cols = n_cols
         self.n_colours = n_colours
         self.trajectory_length = trajectory_length
         self.ambiguous_threshold = ambiguous_threshold
         self.final_unique = final_unique
-        self.seed = seed
 
-        self.grid_generator = torch.Generator().manual_seed(seed)
-        self.trajectory_generator = torch.Generator().manual_seed(
-            seed + (0 if split == "train" else 1)
-        )
-        self.grids, self.positions = generate_grid(
-            n_grids, n_rows, n_cols, n_colours, self.grid_generator
-        )
+        if cache_path is not None and Path(cache_path).exists():
+            self.samples = torch.load(cache_path, weights_only=False)
+            print(f"Loaded {len(self.samples)} samples from {cache_path}")
+            return
 
+        self.rng = torch.Generator().manual_seed(seed)
         self.samples = []
-        self._generate_samples()
+        self._generate_samples(n_samples)
 
-    def _generate_samples(self, max_attempts: int = 50000):
-        for grid_idx, grid in enumerate(tqdm(self.grids, desc="Generating samples")):
-            n_collected = 0
-            attempts = 0
-            while n_collected < self.n_samples_per_grid:
-                if attempts >= max_attempts:
-                    grid = torch.randint(0, self.n_colours, (self.n_rows, self.n_cols), generator=self.grid_generator)
-                    self.grids[grid_idx] = grid
-                    attempts = 0
-                    print(
-                        f"\nWarning: grid {grid_idx} resampled (hardness criteria unsatisfiable)."
-                    )
+        if cache_path is not None:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(self.samples, cache_path)
+            print(f"Saved {len(self.samples)} samples to {cache_path}")
 
-                trajectory = generate_trajectory(
-                    grid, self.trajectory_length, self.trajectory_generator
-                )
-                belief_masks, candidate_counts = compute_belief_trajectory(
-                    grid, trajectory.actions, trajectory.observations
-                )
+    def _generate_samples(self, n_samples: int):
+        pbar = tqdm(total=n_samples, desc="Generating samples")
+        while len(self.samples) < n_samples:
+            grid = torch.randint(
+                0, self.n_colours, (self.n_rows, self.n_cols), generator=self.rng
+            )
+            trajectory = generate_trajectory(grid, self.trajectory_length, self.rng)
+            belief_masks, candidate_counts = compute_belief_trajectory(
+                grid, trajectory.actions, trajectory.observations
+            )
+            if hardness_check(candidate_counts, self.ambiguous_threshold, self.final_unique):
                 hardness = compute_hardness(candidate_counts)
-
-                if hardness_check(
-                    candidate_counts, self.ambiguous_threshold, self.final_unique
-                ):
-                    self.samples.append(
-                        Sample(
-                            grid_idx=grid_idx,
-                            trajectory=trajectory,
-                            hardness=hardness,
-                            belief_masks=belief_masks,
-                        )
+                self.samples.append(
+                    Sample(
+                        grid=grid,
+                        trajectory=trajectory,
+                        hardness=hardness,
+                        belief_masks=belief_masks,
                     )
-                    n_collected += 1
-
-                attempts += 1
+                )
+                pbar.update(1)
+        pbar.close()
 
     def __len__(self):
         return len(self.samples)

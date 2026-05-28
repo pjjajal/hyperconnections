@@ -168,7 +168,7 @@ class HCBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
         self,
-        n_grids: int,
+        n_grid_tokens: int,
         n_observations: int,
         n_actions: int,
         n_positions: int,
@@ -186,9 +186,9 @@ class Transformer(nn.Module):
         # input_dim is (n/m)*dim for HC; equals dim for standard transformer.
         input_dim = input_dim or dim
 
-        self.grid_embed = nn.Embedding(n_grids, dim)
         self.observation_embed = nn.Embedding(n_observations, dim)
         self.action_embed = nn.Embedding(n_actions, dim)
+        self.grid_pos_embed = nn.Embedding(n_grid_tokens, dim)
         self.stream_proj = (
             nn.Linear(dim, input_dim, bias=False) if input_dim != dim else nn.Identity()
         )
@@ -200,7 +200,7 @@ class Transformer(nn.Module):
                     dim=dim,
                     num_heads=num_heads,
                     ffn_ratio=ffn_ratio,
-                    max_seq_len=seq_len + 1,  # +1 for the prepended grid token
+                    max_seq_len=n_grid_tokens + seq_len,
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                 )
@@ -210,13 +210,19 @@ class Transformer(nn.Module):
 
         self.head = nn.Linear(input_dim, n_positions)
 
-    def forward(self, observations, actions, grid_idx):
-        obs_emb = self.observation_embed(observations)   # [B, T+1, dim]
-        act_emb = self.action_embed(actions)             # [B, T+1, dim]
-        x = self.stream_proj(obs_emb + act_emb)         # [B, T+1, input_dim]
+    def forward(self, observations, actions, grid):
+        B = grid.shape[0]
+        grid_flat = grid.view(B, -1)                                    # [B, n_grid_tokens]
+        pos_ids = torch.arange(grid_flat.shape[1], device=grid.device)
+        grid_emb = self.stream_proj(
+            self.observation_embed(grid_flat) + self.grid_pos_embed(pos_ids)
+        )                                                               # [B, n_grid_tokens, input_dim]
 
-        g = self.stream_proj(self.grid_embed(grid_idx)).unsqueeze(1)  # [B, 1, input_dim]
-        x = torch.cat([g, x], dim=1)                    # [B, T+2, input_dim]
+        obs_emb = self.observation_embed(observations)
+        act_emb = self.action_embed(actions)
+        x = self.stream_proj(obs_emb + act_emb)                         # [B, T+1, input_dim]
+
+        x = torch.cat([grid_emb, x], dim=1)                             # [B, n_grid_tokens + T+1, input_dim]
 
         for layer in self.layers:
             x = layer(x)

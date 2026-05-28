@@ -1,20 +1,20 @@
-exp_name: identity_hc
-
 data:
   n_samples: 100000
-  n_rows: 4
-  n_cols: 4
+  n_rows: 6
+  n_cols: 6
   n_colours: 2
   trajectory_length: 12
-  ambiguous_threshold: 0.75
+  ambiguous_threshold: 0.80
   final_unique: true
   seed: 42
+  train_cache_path: experiments/synthetic_grid_world/datasets/h4_veryhard_train.pt
+  val_cache_path: experiments/synthetic_grid_world/datasets/h4_veryhard_val.pt
 
 model:
-  dim: 128
-  num_heads: 4
+  dim: 64
+  num_heads: null   # derived: dim // 16
+  num_layers: null  # derived: max(2, dim // 10)
   ffn_ratio: 4
-  num_layers: 6
   qkv_bias: false
   proj_bias: true
   hc:
@@ -25,9 +25,9 @@ model:
     elementwise_affine: false
 
 training:
-  batch_size: 128
-  epochs: 50
-  lr: 3e-4
+  batch_size: 256
+  epochs: 100
+  lr: 1e-3
   weight_decay: 0.01
   device: auto
 

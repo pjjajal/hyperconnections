@@ -1,8 +1,7 @@
 exp_name: mhc
 
 data:
-  n_samples_per_grid: 500
-  n_grids: 200
+  n_samples: 100000
   n_rows: 4
   n_cols: 4
   n_colours: 2
