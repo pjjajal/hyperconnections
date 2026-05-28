@@ -13,6 +13,8 @@ from experiments.synthetic_grid_world.logger import ExperimentLogger
 from experiments.synthetic_grid_world.model import Transformer
 from hyperconnections import cghc, ghc, identity_hc, mhc
 
+torch.set_float32_matmul_precision('high')
+
 # Actions 0-3 are NSEW; 4 is the null token appended to the final observation.
 NULL_ACTION = 4
 N_ACTIONS = 5
@@ -150,16 +152,18 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
-        num_workers=4,
+        num_workers=8,
         shuffle=True,
         persistent_workers=True,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
         persistent_workers=True,
+        pin_memory=True,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────

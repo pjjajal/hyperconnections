@@ -45,3 +45,5 @@ ptx_ir_dump/
 !benchmark_small_n_exhaustive_4_3_2026.log
 
 experiments/synthetic_dynamics/runs
+
+**/*/*.pt
