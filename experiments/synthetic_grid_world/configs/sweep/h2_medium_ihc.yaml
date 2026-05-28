@@ -23,6 +23,9 @@ model:
     m: 1
     bias: false
     elementwise_affine: false
+  mup:
+    enabled: false
+    base_dim: 64
 
 training:
   batch_size: 256

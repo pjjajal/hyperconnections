@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Brief LR sweep for the baseline at each backbone dim.
-# Runs two dim-groups in parallel; stored in runs_lr/.
+# Stored in runs_lr/.
 # Run from the repo root:
 #   bash experiments/synthetic_grid_world/sweep_lr.sh
 
@@ -38,10 +38,7 @@ run_dims() {
     done
 }
 
-# Pair small+large dims so both workers stay busy for similar durations
-run_dims 16 128 &
-PID=$!
-run_dims 32 64
-wait $PID
+# Run all dimensions sequentially
+run_dims 16 32 64 128
 
 echo "Sweep complete."

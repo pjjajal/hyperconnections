@@ -19,6 +19,9 @@ model:
   proj_bias: true
   hc:
     type: null
+  mup:
+    enabled: false
+    base_dim: 64
 
 training:
   batch_size: 256

@@ -3,6 +3,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from functools import partial
+from typing import Literal
+import math
+
+
+class MuPConfig:
+    """Configuration for Maximal Update Parametrization (muP)
+
+    muP enables hyperparameter transfer across model widths by:
+    1. Scaling weight initialization appropriately
+    2. Scaling learning rates per parameter type
+    3. Scaling output logits
+
+    Args:
+        enabled: Whether muP is active
+        base_dim: Reference width where hyperparameters are tuned
+        target_dim: Current model width
+    """
+    def __init__(self, enabled: bool = False, base_dim: int = 64, target_dim: int = None):
+        self.enabled = enabled
+        self.base_dim = base_dim
+        self.target_dim = target_dim or base_dim
+        self.width_mult = self.target_dim / self.base_dim if enabled else 1.0
+
+    def scale_init_std(self, std: float, param_type: Literal['hidden', 'output', 'embedding']) -> float:
+        """Scale initialization standard deviation based on muP rules
+
+        Args:
+            std: Base standard deviation
+            param_type: Type of parameter (hidden/output/embedding)
+
+        Returns:
+            Scaled standard deviation
+        """
+        if not self.enabled:
+            return std
+        if param_type == 'hidden':
+            # Hidden-to-hidden: use N(0, 1/fan_in) - no additional scaling needed
+            return std
+        elif param_type == 'output':
+            # Output: additional 1/width scaling
+            return std / self.width_mult
+        elif param_type == 'embedding':
+            # Embeddings: scale by 1/√width
+            return std / math.sqrt(self.width_mult)
+        return std
+
+    def get_lr_mult(self, param_type: Literal['hidden', 'output', 'embedding', 'hc_special']) -> float:
+        """Get learning rate multiplier for parameter type
+
+        Args:
+            param_type: Type of parameter
+
+        Returns:
+            Learning rate multiplier to apply to base LR
+        """
+        if not self.enabled:
+            return 1.0
+        if param_type in ['hidden', 'output']:
+            # Hidden and output layers: scale by 1/width
+            return 1.0 / self.width_mult
+        else:  # embedding, hc_special
+            # Embeddings and HC special params: no scaling
+            return 1.0
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -181,10 +244,12 @@ class Transformer(nn.Module):
         input_dim: int | None = None,
         qkv_bias: bool = False,
         proj_bias: bool = True,
+        mup_config: MuPConfig | None = None,
     ):
         super().__init__()
         # input_dim is (n/m)*dim for HC; equals dim for standard transformer.
         input_dim = input_dim or dim
+        self.mup_config = mup_config or MuPConfig(enabled=False)
 
         self.observation_embed = nn.Embedding(n_observations, dim)
         self.action_embed = nn.Embedding(n_actions, dim)
@@ -210,6 +275,55 @@ class Transformer(nn.Module):
 
         self.head = nn.Linear(input_dim, n_positions)
 
+        # Apply muP initialization if enabled
+        if self.mup_config.enabled:
+            self._apply_mup_init()
+
+    def _apply_mup_init(self):
+        """Apply Maximal Update Parametrization (muP) initialization
+
+        muP uses different initialization scales for different parameter types:
+        - Embeddings: scale by 1/√width_mult
+        - Hidden layers: N(0, 1/fan_in) instead of N(0, 1/√fan_in)
+        - Output layer: additional 1/width_mult scaling
+        - HC parameters: preserved (already initialized by HC modules)
+        """
+        # Scale embeddings by 1/√width_mult
+        for emb_name, emb in [
+            ('observation_embed', self.observation_embed),
+            ('action_embed', self.action_embed),
+            ('grid_pos_embed', self.grid_pos_embed)
+        ]:
+            if isinstance(emb, nn.Embedding):
+                std = emb.weight.std().item()
+                new_std = self.mup_config.scale_init_std(std, 'embedding')
+                with torch.no_grad():
+                    emb.weight.mul_(new_std / std)
+
+        # Reinitialize Linear layers with muP scaling
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Skip HC-specific parameters (they have custom initialization)
+                # HC projections (proj_read_in, proj_write_out, etc.) should get muP init
+                is_hc_static = any(x in name for x in ['read_in', 'write_out', 'stream_mixing', 'alpha_']) and 'proj_' not in name
+                if is_hc_static:
+                    continue
+
+                # Determine parameter type based on module name
+                if 'head' in name:
+                    param_type = 'output'
+                else:
+                    param_type = 'hidden'
+
+                # muP uses 1/fan_in variance instead of 1/√fan_in
+                fan_in = module.weight.shape[1]
+                std = 1.0 / fan_in
+                std = self.mup_config.scale_init_std(std, param_type)
+
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, observations, actions, grid):
         B = grid.shape[0]
         grid_flat = grid.view(B, -1)                                    # [B, n_grid_tokens]
@@ -226,4 +340,10 @@ class Transformer(nn.Module):
 
         for layer in self.layers:
             x = layer(x)
-        return self.head(x[:, -1])
+        logits = self.head(x[:, -1])
+
+        # Apply muP output scaling
+        if self.mup_config.enabled:
+            logits = logits / self.mup_config.width_mult
+
+        return logits

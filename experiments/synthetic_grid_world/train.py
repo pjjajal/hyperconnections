@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from experiments.synthetic_grid_world.grid_gen import GridWorldDataset
 from experiments.synthetic_grid_world.logger import ExperimentLogger
-from experiments.synthetic_grid_world.model import Transformer
+from experiments.synthetic_grid_world.model import Transformer, MuPConfig
 from hyperconnections import cghc, ghc, identity_hc, mhc
 
 torch.set_float32_matmul_precision('high')
@@ -120,6 +120,89 @@ def evaluate(model, dataloader, device):
     return total_loss / len(dataloader), correct / total
 
 
+def build_optimizer_param_groups(model, base_lr, weight_decay, mup_config):
+    """Create parameter groups with muP-scaled learning rates
+
+    Args:
+        model: The model to create parameter groups for
+        base_lr: Base learning rate (tuned at base_dim)
+        weight_decay: Weight decay coefficient
+        mup_config: MuPConfig instance
+
+    Returns:
+        List of parameter groups for optimizer
+    """
+    if not mup_config or not mup_config.enabled:
+        # Standard optimizer: single parameter group
+        return [{'params': model.parameters(), 'lr': base_lr, 'weight_decay': weight_decay}]
+
+    # muP optimizer: separate groups for different parameter types
+    embedding_params = []
+    hidden_params = []
+    output_params = []
+    hc_special_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Embeddings
+        if 'embed' in name and 'weight' in name:
+            embedding_params.append(param)
+        # Output layer
+        elif 'head' in name:
+            output_params.append(param)
+        # HC special parameters (static matrices, alphas, norms)
+        elif any(x in name for x in ['read_in', 'write_out', 'stream_mixing', 'alpha_', 'norm']):
+            # Check if it's the static matrix/parameter or a projection (Linear)
+            if 'proj_' not in name:
+                hc_special_params.append(param)
+            else:
+                hidden_params.append(param)
+        # All other hidden-to-hidden
+        else:
+            hidden_params.append(param)
+
+    param_groups = [
+        {
+            'params': embedding_params,
+            'lr': base_lr * mup_config.get_lr_mult('embedding'),
+            'weight_decay': weight_decay,
+            'name': 'embedding'
+        },
+        {
+            'params': hidden_params,
+            'lr': base_lr * mup_config.get_lr_mult('hidden'),
+            'weight_decay': weight_decay,
+            'name': 'hidden'
+        },
+        {
+            'params': output_params,
+            'lr': base_lr * mup_config.get_lr_mult('output'),
+            'weight_decay': weight_decay,
+            'name': 'output'
+        },
+        {
+            'params': hc_special_params,
+            'lr': base_lr * mup_config.get_lr_mult('hc_special'),
+            'weight_decay': weight_decay,
+            'name': 'hc_special'
+        },
+    ]
+
+    # Filter out empty groups
+    param_groups = [g for g in param_groups if len(g['params']) > 0]
+
+    # Print parameter group info
+    if param_groups:
+        print("muP parameter groups:")
+        for group in param_groups:
+            n_params = sum(p.numel() for p in group['params'])
+            print(f"  {group['name']:12s}: lr={group['lr']:.2e}  ({n_params:,} params)")
+
+    return param_groups
+
+
 def main():
     args = parse_args()
     cfg = load_config(args)
@@ -152,7 +235,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
-        num_workers=8,
+        num_workers=4,
         shuffle=True,
         persistent_workers=True,
         pin_memory=True,
@@ -161,7 +244,7 @@ def main():
         val_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=4,
         persistent_workers=True,
         pin_memory=True,
     )
@@ -177,6 +260,13 @@ def main():
     num_heads = cfg.model.get("num_heads") or max(1, dim // 16)
     num_layers = cfg.model.get("num_layers") or max(2, dim // 10)
 
+    # Create muP config if enabled
+    mup_config = None
+    if cfg.model.get('mup', {}).get('enabled', False):
+        base_dim = cfg.model.mup.get('base_dim', 64)
+        mup_config = MuPConfig(enabled=True, base_dim=base_dim, target_dim=dim)
+        print(f"muP enabled: base_dim={base_dim}, target_dim={dim}, width_mult={mup_config.width_mult:.2f}")
+
     model = Transformer(
         n_grid_tokens=n_grid_tokens,
         n_observations=cfg.data.n_colours,
@@ -191,6 +281,7 @@ def main():
         hc_cls=hc_cls,
         qkv_bias=cfg.model.qkv_bias,
         proj_bias=cfg.model.proj_bias,
+        mup_config=mup_config,
     ).to(device)
     model.compile()
     n_params = sum(p.numel() for p in model.parameters())
@@ -198,11 +289,13 @@ def main():
     print(f"Train samples: {len(train_dataset)}  |  Val samples: {len(val_dataset)}")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
+    param_groups = build_optimizer_param_groups(
+        model,
+        cfg.training.lr,
+        cfg.training.weight_decay,
+        mup_config
     )
+    optimizer = torch.optim.AdamW(param_groups)
 
     # ── Logging ───────────────────────────────────────────────────────────
     logger = ExperimentLogger(cfg.logging.log_dir, cfg.logging.run_name)
