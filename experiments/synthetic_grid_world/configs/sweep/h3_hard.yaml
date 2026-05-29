@@ -22,8 +22,8 @@ model:
 
 training:
   batch_size: 256
-  epochs: 100
-  lr: 1e-3
+  epochs: 50
+  lr: 1e-2
   weight_decay: 0.01
   device: auto
 

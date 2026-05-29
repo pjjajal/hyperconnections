@@ -11,7 +11,7 @@ set -euo pipefail
 DIMS=(16 32 64 128)
 DEPTH=12
 LEVELS=(h1_easy h2_medium h3_hard h4_veryhard)
-N_STREAMS=(4 8 16)
+N_STREAMS=(4)
 RUNS_DIR=experiments/synthetic_grid_world/runs
 CONFIG_DIR=experiments/synthetic_grid_world/configs/sweep
 
