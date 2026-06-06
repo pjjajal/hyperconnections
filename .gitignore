@@ -40,6 +40,7 @@ Thumbs.db
 .claude/
 snr_analysis.py
 ptx_ir_dump/
+benchmark_reports/
 
 # Exceptions
 !benchmark_small_n_exhaustive_4_3_2026.log
