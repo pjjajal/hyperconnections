@@ -41,13 +41,12 @@ from pathlib import Path
 from typing import Sequence
 
 import torch
-import triton
-import triton.testing
 from einops import einsum
 
 from hyperconnections.ops import stream_mix_add
 
-from bench_utils import DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base
+from bench_utils import (DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base,
+                         bench_stats, stat_fields)
 
 
 def _corr_row(config, variant, check, max_err, atol, passed):
@@ -343,35 +342,36 @@ def _bytes_proj_bwd(B, N, D, elem_bytes):
 
 _PERF_HDR = (
     f"{'Config':>30}  {'Variant':>12}  {'dtype':>6}  "
-    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  "
+    f"{'Triton ms':>10}  {'Tri p99':>9}  {'Tri var':>9}  {'Eager ms':>9}  {'Compiled ms':>12}  "
     f"{'vs Eager':>9}  {'vs Cmp':>7}  {'BW GB/s':>9}"
 )
-_PERF_SEP = "-" * 120
+_PERF_SEP = "-" * 140
 
 
-def _perf_row(config, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs):
+def _perf_row(config, variant, dtype_name, s_tri, s_eager, s_compiled, bw_gbs):
     def _sp(t_ref):
-        sp = t_ref / t_tri
+        sp = t_ref / s_tri.median
         s = f"{sp:.2f}x"
         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
     return (
         f"{config:>30}  {variant:>12}  {dtype_name:>6}  "
-        f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_compiled:>12.3f}  "
-        f"{_sp(t_eager):>9}  {_sp(t_compiled):>7}  {bw_gbs:>9.1f}"
+        f"{s_tri.median:>10.3f}  {s_tri.p99:>9.3f}  {s_tri.var:>9.2e}  "
+        f"{s_eager.median:>9.3f}  {s_compiled.median:>12.3f}  "
+        f"{_sp(s_eager.median):>9}  {_sp(s_compiled.median):>7}  {bw_gbs:>9.1f}"
     )
 
 
-def _csv_row(config, phi_type, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs) -> dict:
+def _csv_row(config, phi_type, variant, dtype_name, s_tri, s_eager, s_compiled, bw_gbs) -> dict:
     return {
         "config":               config,
         "phi_type":             phi_type,
         "variant":              variant,
         "dtype":                dtype_name,
-        "triton_ms":            t_tri,
-        "eager_ms":             t_eager,
-        "compiled_ms":          t_compiled,
-        "speedup_vs_eager":     t_eager / t_tri,
-        "speedup_vs_compiled":  t_compiled / t_tri,
+        **stat_fields("triton",   s_tri),
+        **stat_fields("eager",    s_eager),
+        **stat_fields("compiled", s_compiled),
+        "speedup_vs_eager":     s_eager.median / s_tri.median,
+        "speedup_vs_compiled":  s_compiled.median / s_tri.median,
         "bw_gbs":               bw_gbs,
     }
 
@@ -411,38 +411,20 @@ def run_perf(
 
             if fwd:
                 ### no-proj
-                t_tri = triton.testing.do_bench(
-                    lambda: stream_mix_add(Phi, x, Y),
-                    warmup=warmup, rep=rep,
-                )
-                t_eager = triton.testing.do_bench(
-                    lambda: ref_no_proj(Phi, x, Y),
-                    warmup=warmup, rep=rep,
-                )
-                t_compiled = triton.testing.do_bench(
-                    lambda: _ref_no_proj_compiled(Phi, x, Y),
-                    warmup=warmup, rep=rep,
-                )
-                bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "no-proj", dtype_name, t_tri, t_eager, t_compiled, bw))
-                rows.append(_csv_row(cfg_str, "random", "no-proj fwd", dtype_name, t_tri, t_eager, t_compiled, bw))
+                s_tri      = bench_stats(lambda: stream_mix_add(Phi, x, Y),       warmup, rep)
+                s_eager    = bench_stats(lambda: ref_no_proj(Phi, x, Y),          warmup, rep)
+                s_compiled = bench_stats(lambda: _ref_no_proj_compiled(Phi, x, Y), warmup, rep)
+                bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "no-proj", dtype_name, s_tri, s_eager, s_compiled, bw))
+                rows.append(_csv_row(cfg_str, "random", "no-proj fwd", dtype_name, s_tri, s_eager, s_compiled, bw))
 
                 ### proj
-                t_tri_p = triton.testing.do_bench(
-                    lambda: stream_mix_add(Phi, x, Y, v=v),
-                    warmup=warmup, rep=rep,
-                )
-                t_eager_p = triton.testing.do_bench(
-                    lambda: ref_proj(Phi, x, Y, v),
-                    warmup=warmup, rep=rep,
-                )
-                t_compiled_p = triton.testing.do_bench(
-                    lambda: _ref_proj_compiled(Phi, x, Y, v),
-                    warmup=warmup, rep=rep,
-                )
-                bw_p = _bytes_proj(B, N, D, elem) / (t_tri_p * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "proj", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
-                rows.append(_csv_row(cfg_str, "random", "proj fwd", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
+                s_tri_p      = bench_stats(lambda: stream_mix_add(Phi, x, Y, v=v),     warmup, rep)
+                s_eager_p    = bench_stats(lambda: ref_proj(Phi, x, Y, v),             warmup, rep)
+                s_compiled_p = bench_stats(lambda: _ref_proj_compiled(Phi, x, Y, v),   warmup, rep)
+                bw_p = _bytes_proj(B, N, D, elem) / (s_tri_p.median * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "proj", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
+                rows.append(_csv_row(cfg_str, "random", "proj fwd", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
 
             if bwd:
                 ### no-proj fwd+bwd
@@ -460,12 +442,12 @@ def run_perf(
                     Phi_g.grad = x_g.grad = Y_g.grad = None
                     _ref_no_proj_compiled(Phi_g, x_g, Y_g).sum().backward()
 
-                t_b   = triton.testing.do_bench(_b_tri, warmup=warmup, rep=rep)
-                t_b_e = triton.testing.do_bench(_b_ea,  warmup=warmup, rep=rep)
-                t_b_c = triton.testing.do_bench(_b_cmp, warmup=warmup, rep=rep)
-                bw_b  = _bytes_no_proj_bwd(B, N, D, elem) / (t_b * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "no-proj+bwd", dtype_name, t_b, t_b_e, t_b_c, bw_b))
-                rows.append(_csv_row(cfg_str, "random", "no-proj bwd", dtype_name, t_b, t_b_e, t_b_c, bw_b))
+                s_b   = bench_stats(_b_tri, warmup, rep)
+                s_b_e = bench_stats(_b_ea,  warmup, rep)
+                s_b_c = bench_stats(_b_cmp, warmup, rep)
+                bw_b  = _bytes_no_proj_bwd(B, N, D, elem) / (s_b.median * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "no-proj+bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
+                rows.append(_csv_row(cfg_str, "random", "no-proj bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
 
                 ### proj fwd+bwd
                 Phi_g2 = Phi.clone().requires_grad_(True)
@@ -482,12 +464,12 @@ def run_perf(
                     Phi_g2.grad = x_g2.grad = Y_g2.grad = None
                     _ref_proj_compiled(Phi_g2, x_g2, Y_g2, v).sum().backward()
 
-                t_bp   = triton.testing.do_bench(_bp_tri, warmup=warmup, rep=rep)
-                t_bp_e = triton.testing.do_bench(_bp_ea,  warmup=warmup, rep=rep)
-                t_bp_c = triton.testing.do_bench(_bp_cmp, warmup=warmup, rep=rep)
-                bw_bp  = _bytes_proj_bwd(B, N, D, elem) / (t_bp * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "proj+bwd", dtype_name, t_bp, t_bp_e, t_bp_c, bw_bp))
-                rows.append(_csv_row(cfg_str, "random", "proj bwd", dtype_name, t_bp, t_bp_e, t_bp_c, bw_bp))
+                s_bp   = bench_stats(_bp_tri, warmup, rep)
+                s_bp_e = bench_stats(_bp_ea,  warmup, rep)
+                s_bp_c = bench_stats(_bp_cmp, warmup, rep)
+                bw_bp  = _bytes_proj_bwd(B, N, D, elem) / (s_bp.median * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "proj+bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
+                rows.append(_csv_row(cfg_str, "random", "proj bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
 
         print(_PERF_SEP)
     print()
@@ -500,10 +482,11 @@ def run_perf(
 
 _SPHDR = (
     f"{'Config':>24}  {'PhiType':>8}  {'dtype':>6}  "
-    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  {'Speedup':>8}  "
+    f"{'Triton ms':>10}  {'Tri p99':>9}  {'Tri var':>9}  "
+    f"{'Eager ms':>9}  {'Compiled ms':>12}  {'Speedup':>8}  "
     f"{'Diag-fast ms':>13}  {'vs Diag':>8}"
 )
-_SPSEP = "-" * 125
+_SPSEP = "-" * 145
 
 
 def run_structured_perf(
@@ -550,30 +533,18 @@ def run_structured_perf(
                 label = _PHI_LABEL[phi_type]
 
                 if fwd:
-                    t_tri = triton.testing.do_bench(
-                        lambda: stream_mix_add(Phi, x, Y),
-                        warmup=warmup, rep=rep,
-                    )
-                    t_eager = triton.testing.do_bench(
-                        lambda: ref_no_proj(Phi, x, Y),
-                        warmup=warmup, rep=rep,
-                    )
-                    t_comp = triton.testing.do_bench(
-                        lambda: _ref_no_proj_compiled(Phi, x, Y),
-                        warmup=warmup, rep=rep,
-                    )
+                    s_tri  = bench_stats(lambda: stream_mix_add(Phi, x, Y),        warmup, rep)
+                    s_eager = bench_stats(lambda: ref_no_proj(Phi, x, Y),          warmup, rep)
+                    s_comp = bench_stats(lambda: _ref_no_proj_compiled(Phi, x, Y), warmup, rep)
 
                     def _sp(t_ref):
-                        sp = t_ref / t_tri
+                        sp = t_ref / s_tri.median
                         s = f"{sp:.2f}x"
                         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
 
                     if phi_type == "diagonal":
-                        t_diag = triton.testing.do_bench(
-                            lambda: ref_diagonal_add(Phi, x, Y),
-                            warmup=warmup, rep=rep,
-                        )
-                        ratio = t_diag / t_tri
+                        t_diag = bench_stats(lambda: ref_diagonal_add(Phi, x, Y), warmup, rep).median
+                        ratio = t_diag / s_tri.median
                         diag_str = f"{t_diag:>13.3f}"
                         vs_diag = f"{ratio:.2f}x"
                         vd_col = ok(vs_diag) if ratio >= 1.05 else (
@@ -583,13 +554,14 @@ def run_structured_perf(
                         diag_str = f"{'N/A':>13}"
                         vd_col   = f"{'N/A':>8}"
 
-                    bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
+                    bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
                     print(
                         f"{cfg_str:>24}  {label:>8}  {dtype_name:>6}  "
-                        f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_comp:>12.3f}  {_sp(t_eager):>8}  "
+                        f"{s_tri.median:>10.3f}  {s_tri.p99:>9.3f}  {s_tri.var:>9.2e}  "
+                        f"{s_eager.median:>9.3f}  {s_comp.median:>12.3f}  {_sp(s_eager.median):>8}  "
                         f"{diag_str}  {vd_col:>8}"
                     )
-                    rows.append(_csv_row(cfg_str, phi_type, "fwd", dtype_name, t_tri, t_eager, t_comp, bw))
+                    rows.append(_csv_row(cfg_str, phi_type, "fwd", dtype_name, s_tri, s_eager, s_comp, bw))
 
                 if bwd:
                     Phi_g = Phi.clone().requires_grad_(True)
@@ -606,23 +578,24 @@ def run_structured_perf(
                         Phi_g.grad = x_g.grad = Y_g.grad = None
                         _ref_no_proj_compiled(Phi_g, x_g, Y_g).sum().backward()
 
-                    t_tri_b  = triton.testing.do_bench(_sb_tri, warmup=warmup, rep=rep)
-                    t_ea_b   = triton.testing.do_bench(_sb_ea,  warmup=warmup, rep=rep)
-                    t_cmp_b  = triton.testing.do_bench(_sb_cmp, warmup=warmup, rep=rep)
+                    s_tri_b = bench_stats(_sb_tri, warmup, rep)
+                    s_ea_b  = bench_stats(_sb_ea,  warmup, rep)
+                    s_cmp_b = bench_stats(_sb_cmp, warmup, rep)
 
                     def _spb(t_ref):
-                        sp = t_ref / t_tri_b
+                        sp = t_ref / s_tri_b.median
                         s = f"{sp:.2f}x"
                         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
 
-                    bw_b    = _bytes_no_proj_bwd(B, N, D, elem) / (t_tri_b * 1e-3) / 1e9
+                    bw_b    = _bytes_no_proj_bwd(B, N, D, elem) / (s_tri_b.median * 1e-3) / 1e9
                     label_b = label.rstrip() + "+bwd"
                     print(
                         f"{cfg_str:>24}  {label_b:>8}  {dtype_name:>6}  "
-                        f"{t_tri_b:>10.3f}  {t_ea_b:>9.3f}  {t_cmp_b:>12.3f}  {_spb(t_ea_b):>8}  "
+                        f"{s_tri_b.median:>10.3f}  {s_tri_b.p99:>9.3f}  {s_tri_b.var:>9.2e}  "
+                        f"{s_ea_b.median:>9.3f}  {s_cmp_b.median:>12.3f}  {_spb(s_ea_b.median):>8}  "
                         f"{'N/A':>13}  {'N/A':>8}"
                     )
-                    rows.append(_csv_row(cfg_str, phi_type, "bwd", dtype_name, t_tri_b, t_ea_b, t_cmp_b, bw_b))
+                    rows.append(_csv_row(cfg_str, phi_type, "bwd", dtype_name, s_tri_b, s_ea_b, s_cmp_b, bw_b))
 
             print()   # blank line between (N,B,D) groups
 
@@ -717,7 +690,9 @@ def main():
             all_rows = perf_rows + struct_rows
             _CSV_FIELDS = [
                 "config", "phi_type", "variant", "dtype",
-                "triton_ms", "eager_ms", "compiled_ms",
+                "triton_median_ms", "triton_p99_ms", "triton_var", "triton_mean_ms",
+                "eager_median_ms", "eager_p99_ms", "eager_var", "eager_mean_ms",
+                "compiled_median_ms", "compiled_p99_ms", "compiled_var", "compiled_mean_ms",
                 "speedup_vs_eager", "speedup_vs_compiled", "bw_gbs",
             ]
             write_header = not args.csv.exists()

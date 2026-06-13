@@ -1,9 +1,13 @@
 """Shared formatting / dtype helpers for all benchmark scripts."""
 from __future__ import annotations
 
+import statistics
 import sys
+from dataclasses import dataclass
 
+import numpy as np
 import torch
+import triton.testing
 
 DEVICE = "cuda:0"
 
@@ -25,6 +29,47 @@ def bold(s):      return _col(s, _BOLD)
 
 def _dtype(name: str) -> torch.dtype:
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
+
+
+###
+### Per-iteration timing statistics
+###
+@dataclass(frozen=True)
+class BenchStats:
+    """Summary of one do_bench run's per-iteration times (all in ms)."""
+    median: float
+    p99: float
+    var: float
+    mean: float
+
+
+def bench_stats(fn, warmup, rep, grad_to_none=None) -> BenchStats:
+    """Benchmark `fn` once and return median / P99 / variance / mean of its
+    per-iteration runtimes.
+
+    Uses do_bench(return_mode="all"), which returns the raw list of timings from
+    a single benchmark run, so all four stats come at no extra timing cost.
+    (`quantiles=` must stay unset — it would override `return_mode`.)
+    """
+    times = triton.testing.do_bench(
+        fn, warmup=warmup, rep=rep, grad_to_none=grad_to_none, return_mode="all"
+    )
+    return BenchStats(
+        median=statistics.median(times),
+        p99=float(np.percentile(times, 99)),
+        var=statistics.pvariance(times),
+        mean=statistics.mean(times),
+    )
+
+
+def stat_fields(prefix: str, s: BenchStats) -> dict:
+    """Expand a BenchStats into CSV columns prefixed by the variant name."""
+    return {
+        f"{prefix}_median_ms": s.median,
+        f"{prefix}_p99_ms":    s.p99,
+        f"{prefix}_var":       s.var,
+        f"{prefix}_mean_ms":   s.mean,
+    }
 
 
 def _corr_row(
