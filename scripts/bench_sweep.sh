@@ -12,25 +12,43 @@ SINGLES_DIR="$SCRIPT_DIR/../benchmark_reports/singles"
 # ── Sweep grids ──────────────────────────────────────────────────────────────
 # Edit these arrays to choose which configs to sweep.
 
-EXPM_N=(4 8 16 32)
-EXPM_B=(1024 4096 8192 16384 32768 65536 120064)
+# EXPM_N=(4 8 16 32)
+# EXPM_B=(1024 4096 8192 16384 32768 65536 120064)
+# EXPM_DTYPE=(fp32 bf16)
+# EXPM_PASS=(fwd bwd)   # fwd | bwd | fwdbwd
+
+# EXPM_FORCE_N=(4 8 16 32)
+# EXPM_FORCE_B=(1024 4096 8192 16384 32768 65536 120064)
+# EXPM_FORCE_DTYPE=(fp32 bf16)
+# EXPM_FORCE_PASS=(fwd bwd)
+
+# STREAM_N=(4 8 16)
+# STREAM_M=(1)
+# STREAM_B=(1024 4096 8192 16384 32768 65536 120064)
+# STREAM_E=(1024 1536 2048)
+# STREAM_DTYPE=(bf16)
+# STREAM_PASS=(fwd)
+
+EXPM_N=(4 8)
+EXPM_B=(16384)
 EXPM_DTYPE=(fp32 bf16)
 EXPM_PASS=(fwd bwd)   # fwd | bwd | fwdbwd
 
-EXPM_FORCE_N=(4 8 16 32)
-EXPM_FORCE_B=(1024 4096 8192 16384 32768 65536 120064)
+EXPM_FORCE_N=(4 8)
+EXPM_FORCE_B=(16384)
 EXPM_FORCE_DTYPE=(fp32 bf16)
 EXPM_FORCE_PASS=(fwd bwd)
 
-STREAM_N=(4 8 16)
+STREAM_N=(4 8)
 STREAM_M=(1)
-STREAM_B=(1024 4096 8192 16384 32768 65536 120064)
-STREAM_E=(1024 1536 2048)
-STREAM_DTYPE=(bf16)
-STREAM_PASS=(fwd)
+STREAM_B=(2048)
+STREAM_E=(1536)
+STREAM_DTYPE=(fp32 bf16)
+STREAM_PASS=(fwd bwd)
 
-MODE=perf          # correctness | perf | all
-WARMUP=24
+
+MODE=all # correctness | perf | all
+WARMUP=16
 REP=128
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

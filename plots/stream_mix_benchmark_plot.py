@@ -14,15 +14,15 @@ plt.style.use(["science", "no-latex", "ieee"])
 matplotlib.rcParams["font.family"] = "monospace"
 
 METHODS = {
-    "triton_ms":   "Triton stream_mix",
-    "eager_ms":    "PyTorch eager",
-    "compiled_ms": "torch.compile",
+    "triton_median_ms":   "Triton stream_mix",
+    "eager_median_ms":    "PyTorch eager",
+    "compiled_median_ms": "torch.compile",
 }
 
 MARKERS = {
-    "triton_ms":   "^",
-    "eager_ms":    "o",
-    "compiled_ms": "s",
+    "triton_median_ms":   "^",
+    "eager_median_ms":    "o",
+    "compiled_median_ms": "s",
 }
 
 
@@ -93,9 +93,16 @@ def main() -> None:
     )
     parser.add_argument(
         "csvs",
-        nargs="+",
+        nargs="*",
         type=Path,
         help="One or more benchmark report CSV files.",
+    )
+    parser.add_argument(
+        "--singles-dir",
+        type=Path,
+        default=None,
+        dest="singles_dir",
+        help="Path to benchmark_reports/singles/; auto-discovers all stream_mix CSVs.",
     )
     parser.add_argument(
         "--phi-type",
@@ -116,15 +123,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    missing = [p for p in args.csvs if not p.exists()]
-    if missing:
-        for p in missing:
-            print(f"File not found: {p}", file=sys.stderr)
+    if args.singles_dir:
+        subdir = args.singles_dir / "stream_mix"
+        csvs = sorted(subdir.glob("**/*.csv")) + sorted(subdir.glob("**/*.CSV"))
+        if not csvs:
+            print(f"No CSVs found under {subdir}", file=sys.stderr)
+            sys.exit(1)
+    elif args.csvs:
+        csvs = args.csvs
+        missing = [p for p in csvs if not p.exists()]
+        if missing:
+            for p in missing:
+                print(f"File not found: {p}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("Provide CSV files or --singles-dir.", file=sys.stderr)
         sys.exit(1)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_csvs(args.csvs)
+    df = load_csvs(csvs)
 
     phi_types = sorted(df["phi_type"].unique())
     variants  = sorted(df["variant"].unique())

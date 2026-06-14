@@ -14,15 +14,24 @@ plt.style.use(["science", "no-latex", "ieee"])
 matplotlib.rcParams["font.family"] = "monospace"
 
 METHODS = {
-    "matrix_exp_ms": "torch.linalg.matrix_exp",
-    "t18_ms":        "compiled expm_t18",
-    "triton_ms":     "triton expm_t18",
+    "expm": {
+        "triton_median_ms":     "triton expm_t18",
+        "matrix_exp_median_ms": "torch.linalg.matrix_exp",
+        "t18_median_ms":        "compiled expm_t18",
+    },
+    "expm_force": {
+        "blk_triton_median_ms": "triton expm_force",
+        "matrix_exp_median_ms": "torch.linalg.matrix_exp",
+        "blk_t18_median_ms":    "compiled expm_force",
+    },
 }
 
 MARKERS = {
-    "matrix_exp_ms": "o",
-    "t18_ms":        "s",
-    "triton_ms":     "^",
+    "triton_median_ms":     "^",
+    "matrix_exp_median_ms": "o",
+    "t18_median_ms":        "s",
+    "blk_triton_median_ms": "^",
+    "blk_t18_median_ms":    "s",
 }
 
 
@@ -41,7 +50,7 @@ def load_csvs(paths: list[Path]) -> pd.DataFrame:
     return df
 
 
-def plot_for_atype(df_atype: pd.DataFrame, atype: str, out_dir: Path) -> None:
+def plot_for_atype(df_atype: pd.DataFrame, atype: str, methods: dict, out_dir: Path) -> None:
     ns = sorted(df_atype["n"].unique())
     ncols = len(ns)
     fig, axes = plt.subplots(1, ncols, figsize=(3.5 * ncols, 3), sharey=False)
@@ -50,7 +59,7 @@ def plot_for_atype(df_atype: pd.DataFrame, atype: str, out_dir: Path) -> None:
 
     for ax, n in zip(axes, ns):
         sub = df_atype[df_atype["n"] == n].sort_values("batch")
-        for col, label in METHODS.items():
+        for col, label in methods.items():
             ax.scatter(
                 sub["batch"],
                 sub[col],
@@ -85,9 +94,22 @@ def main() -> None:
     )
     parser.add_argument(
         "csvs",
-        nargs="+",
+        nargs="*",
         type=Path,
         help="One or more benchmark report CSV files.",
+    )
+    parser.add_argument(
+        "--bench",
+        choices=list(METHODS),
+        default="expm",
+        help="Which benchmark variant to plot: expm or expm_force (default: expm).",
+    )
+    parser.add_argument(
+        "--singles-dir",
+        type=Path,
+        default=None,
+        dest="singles_dir",
+        help="Path to benchmark_reports/singles/; auto-discovers all CSVs for --bench.",
     )
     parser.add_argument(
         "--matrix-type",
@@ -99,26 +121,38 @@ def main() -> None:
         "--out-dir",
         type=Path,
         default=Path("."),
-        help="Directory to write output PDFs (default: current directory).",
+        help="Directory to write output PNGs (default: current directory).",
     )
     args = parser.parse_args()
 
-    missing = [p for p in args.csvs if not p.exists()]
-    if missing:
-        for p in missing:
-            print(f"File not found: {p}", file=sys.stderr)
+    if args.singles_dir:
+        subdir = args.singles_dir / args.bench
+        csvs = sorted(subdir.glob("**/*.CSV")) + sorted(subdir.glob("**/*.csv"))
+        if not csvs:
+            print(f"No CSVs found under {subdir}", file=sys.stderr)
+            sys.exit(1)
+    elif args.csvs:
+        csvs = args.csvs
+        missing = [p for p in csvs if not p.exists()]
+        if missing:
+            for p in missing:
+                print(f"File not found: {p}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("Provide CSV files or --singles-dir.", file=sys.stderr)
         sys.exit(1)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_csvs(args.csvs)
+    df = load_csvs(csvs)
+    methods = METHODS[args.bench]
 
     atypes = sorted(df["atype"].unique())
     if args.matrix_type:
         atypes = [a for a in atypes if a == args.matrix_type]
 
     for atype in atypes:
-        plot_for_atype(df[df["atype"] == atype].copy(), atype, args.out_dir)
+        plot_for_atype(df[df["atype"] == atype].copy(), atype, methods, args.out_dir)
 
 
 if __name__ == "__main__":
