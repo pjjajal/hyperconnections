@@ -108,18 +108,30 @@ _FWD_CONFIGS = [
 ###
 @triton.jit
 def _matmul_nn(A, B, NP: tl.constexpr, n_idx):
-    """A @ B for square [NP, NP] register tiles, fp32, scalar-FFMA only.
+    """A @ B for square [NP, NP] register tiles, fp32, full mantissa.
 
-    Implemented as Σ_k outer(col_k(A), row_k(B)) via a static_range loop.
-    The naïve broadcast contraction tl.sum(A[:,:,None] * B[None,:,:], axis=1)
-    is mathematically identical but the Triton backend lowers it to a TF32
-    MMA at NP≥16 (verified empirically on sm_80, Triton 3.6) — which loses
-    13 mantissa bits and produces ~1e-3 errors in the BBC polynomial.
+    NP >= 16:  single tl.dot with input_precision="ieee" — true IEEE fp32
+        (NOT tf32, which is tl.dot's default on Ampere and loses 13 mantissa
+        bits → ~1e-3 errors on the BBC polynomial). On sm_80 fp32 has no
+        tensor-core path, so "ieee" lowers to an FMA dot — the same scalar
+        fp32 FFMAs as the static_range fallback, but emitted as ONE tt.dot op
+        the backend lowers compactly. The static_range path below unrolls
+        fully at the IR level and blows up PTXAS at NP>=32 (26 MB PTX → hang),
+        so tl.dot is mandatory once the tile is large enough to use it.
 
-    n_idx is passed in from the caller (it's the same tl.arange(0, NP) the
-    caller already built for load/store offsets) so we don't rebuild it
-    NP times across the per-k loop.
+    NP <  16:  tl.dot requires K >= 16 on NVIDIA (min_dot_size = (1,1,16)), so
+        fall back to Σ_k outer(col_k(A), row_k(B)) via static_range. Tiny NP ⇒
+        the unroll is cheap, and this keeps the precision-critical small-N
+        forward path bit-for-bit unchanged.
+
+    The NP>=16 test is on a tl.constexpr, so only the taken branch is ever
+    compiled (the NP<16 path never instantiates tl.dot, avoiding its assert).
+
+    n_idx is the caller's tl.arange(0, NP) (load/store offsets), reused here
+    so the per-k loop doesn't rebuild it; unused on the tl.dot branch.
     """
+    if NP >= 16:
+        return tl.dot(A, B, input_precision="ieee", out_dtype=tl.float32)
     R = tl.zeros([NP, NP], dtype=tl.float32)
     for k in tl.static_range(NP):
         e_k   = (n_idx == k).to(tl.float32)            # [NP]
@@ -689,8 +701,7 @@ def _expm_t18_augmented_no_grad(
 ###            [ 0,   0,   0]],
 ###   the (1,3) N-block of exp(M) is integral_{s+t<=1} exp(sA^T) G exp(tA^T) ds dt
 ###   = L_phi_1(A^T, G).  We assemble M and reuse the dense forward kernel
-###   _expm_t18_no_grad at N -> 3N; for the common N=4 case this is 12x12,
-###   still in the unrolled regime.  No new Triton kernel required.
+###   _expm_t18_no_grad at N -> 3N.
 ###
 class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
     @staticmethod
@@ -725,6 +736,8 @@ class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
         eye = torch.eye(N, dtype=torch.float32, device=A_T.device)
         M[:, N:2*N, 2*N:3*N] = eye
 
+        ### NOTE: Revisit this at some point... Debug it!
+        # expM = torch.linalg.matrix_exp(M).to(out_dtype)
         expM = _expm_t18_no_grad(M, out_dtype=out_dtype)
         dA_psi = expM[:, :N, 2*N:3*N]
 
