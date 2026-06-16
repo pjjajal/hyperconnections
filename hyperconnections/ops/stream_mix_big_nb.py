@@ -5,13 +5,6 @@ Uses tl.dot (tensor-core backed matmul) and processes *all N output rows*
 in a single CTA, which amortises the cost of loading Phi[b] and x[b, :, d_tile]
 from global memory instead of relying on L2 reuse across N separate CTAs.
 
-This variant should only be dispatched when:
-  N >= 16  and  N % 16 == 0  and  B*N*D*elem_bytes > 0.75 * 40 MB
-
-Below that footprint the L2 cache absorbs the cross-CTA x reuse for free,
-and the generic kernel (stream_mix_small_nb.py) is faster due to static-range
-unrolling.
-
 Kernel layout
 ─────────────
   _stream_mix_fwd_big_nb   grid: (B, cdiv(D, BLOCK_D))
@@ -25,12 +18,6 @@ Kernel layout
       Accumulates grad_Phi[b] = Σ_{d-tiles} tl.dot(G_tile, x_eff_tile^T) over D.
       v (loop-invariant) is loaded once before the loop.
       alpha ([B,D]) is loaded per tile.
-
-Precision note
-──────────────
-  All tl.dot calls use allow_tf32=False.  With fp32 inputs (all tensors are
-  upcasted before the dot), TF32 would round each mantissa from 23 bits to 10,
-  silently degrading gradient precision.  allow_tf32=False forces full fp32 FMAs.
 
 Backward shared intermediates (proj case, precomputed in Python):
   alpha  [B, D]  = v^T x          (removes O(N²) Phi loads from bwd_dx)

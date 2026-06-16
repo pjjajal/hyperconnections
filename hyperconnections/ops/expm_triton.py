@@ -103,33 +103,11 @@ _FWD_CONFIGS = [
     triton.Config({}, num_warps=8, num_stages=3),
 ]
 
-###
-### Triton kernel
-###
+
 @triton.jit
 def _matmul_nn(A, B, NP: tl.constexpr, n_idx):
-    """A @ B for square [NP, NP] register tiles, fp32, full mantissa.
-
-    NP >= 16:  single tl.dot with input_precision="ieee" — true IEEE fp32
-        (NOT tf32, which is tl.dot's default on Ampere and loses 13 mantissa
-        bits → ~1e-3 errors on the BBC polynomial). On sm_80 fp32 has no
-        tensor-core path, so "ieee" lowers to an FMA dot — the same scalar
-        fp32 FFMAs as the static_range fallback, but emitted as ONE tt.dot op
-        the backend lowers compactly. The static_range path below unrolls
-        fully at the IR level and blows up PTXAS at NP>=32 (26 MB PTX → hang),
-        so tl.dot is mandatory once the tile is large enough to use it.
-
-    NP <  16:  tl.dot requires K >= 16 on NVIDIA (min_dot_size = (1,1,16)), so
-        fall back to Σ_k outer(col_k(A), row_k(B)) via static_range. Tiny NP ⇒
-        the unroll is cheap, and this keeps the precision-critical small-N
-        forward path bit-for-bit unchanged.
-
-    The NP>=16 test is on a tl.constexpr, so only the taken branch is ever
-    compiled (the NP<16 path never instantiates tl.dot, avoiding its assert).
-
-    n_idx is the caller's tl.arange(0, NP) (load/store offsets), reused here
-    so the per-k loop doesn't rebuild it; unused on the tl.dot branch.
-    """
+    ### Use tl.dot (downcompiled to proper GEMM by Triton) for NP >= 16
+    ### Otherwise, use FFMA on register tiles.
     if NP >= 16:
         return tl.dot(A, B, input_precision="ieee", out_dtype=tl.float32)
     R = tl.zeros([NP, NP], dtype=tl.float32)
@@ -449,6 +427,22 @@ def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: t
 ### Autograd Function (Higham §10.6 augmented-matrix backward)
 ###
 class _ExpmT18TritonFn(torch.autograd.Function):
+    """
+    dL/dA = L_exp(A^T, grad_E) + L_phi1(A^T, grad_psi)
+
+    Part 1 -- L_exp(A^T, grad_E):
+    The standard block formula for the Fréchet derivative of the
+    matrix exponential gives
+
+        exp([[A, G],
+            [0, A]])
+        =
+        [[exp(A), L_exp(A,G)],
+        [0,      exp(A)]]
+
+    See Najfeld and Havel (1995), Mathias (1992), and Higham,
+    Functions of Matrices, Sec. 10.6.
+    """
     @staticmethod
     def forward(ctx, A: torch.Tensor) -> torch.Tensor:
         out = _expm_t18_no_grad(A, out_dtype=A.dtype)
@@ -686,24 +680,47 @@ def _expm_t18_augmented_no_grad(
 ###
 ### Autograd Function
 ###
-### Backward decomposes into two adjoint Frechet derivatives:
-###
-###   dL/dA = L_exp(A^T, grad_E)  +  L_phi_1(A^T, grad_psi)
-###
-### Part 1 — L_exp(A^T, grad_E):
-###   Najfeld-Havel / Higham §10.6: upper-right block of exp([[A^T, G],[0,A^T]]).
-###   Reuses _expm_t18_structure_no_grad (block-structured at N).
-###
-### Part 2 — L_phi_1(A^T, grad_psi):
-###   For the 3N block-upper-triangular matrix
-###       M = [[A^T,  G,   0],
-###            [ 0,  A^T,  I],
-###            [ 0,   0,   0]],
-###   the (1,3) N-block of exp(M) is integral_{s+t<=1} exp(sA^T) G exp(tA^T) ds dt
-###   = L_phi_1(A^T, G).  We assemble M and reuse the dense forward kernel
-###   _expm_t18_no_grad at N -> 3N.
-###
 class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
+    """
+    Backward decomposes into two adjoint Fréchet derivatives:
+
+    dL/dA = L_exp(A^T, grad_E) + L_phi1(A^T, grad_psi)
+
+    Part 1 -- L_exp(A^T, grad_E):
+    The standard block formula for the Fréchet derivative of the
+    matrix exponential gives
+
+        exp([[A, G],
+            [0, A]])
+        =
+        [[exp(A), L_exp(A,G)],
+        [0,      exp(A)]]
+
+    See Najfeld and Havel (1995), Mathias (1992), and Higham,
+    Functions of Matrices, Sec. 10.6.
+
+    Part 2 -- L_phi1(A^T, grad_psi):
+    Since phi_1(A) = integral_0^1 exp(theta A) d theta,
+    its Fréchet derivative is
+
+        L_phi1(A,G)
+            = integral_{s,t >= 0, s+t <= 1}
+                exp(sA) G exp(tA) ds dt.
+
+    This follows from the same Van Loan / block-upper-triangular
+    matrix exponential identity for integrals involving matrix
+    exponentials. In particular, for
+
+        M = [[A^T,  G,   0],
+            [0,    A^T, I],
+            [0,    0,   0]],
+
+    the (1,3) block of exp(M) is
+
+        integral_{s,t >= 0, s+t <= 1}
+            exp(sA^T) G exp(tA^T) ds dt
+        = L_phi1(A^T, G).
+    """
     @staticmethod
     def forward(ctx, A: torch.Tensor):
         E, psi = _expm_t18_augmented_no_grad(A, out_dtype=A.dtype)

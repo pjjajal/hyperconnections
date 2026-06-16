@@ -41,21 +41,12 @@ except ModuleNotFoundError as exc:
     _big_nb = None
     _has_triton = False
 
-### Playing around with new version
-# def _use_big_nb(x: torch.Tensor) -> bool:
-#     B, N, D = x.shape
-#     ### "Safety" buffer: switch kernels when x occupies > 75% of L2
-#     c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
-#     # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
-#     return c
-
 
 def _use_big_nb(x: torch.Tensor) -> bool:
     B, N, D = x.shape
-    if N < 16 or N % 16 != 0:
+    if N < 16 or B*N*D < _SM80_A100_L2_BYTES:
         return False
-    # "Safety" buffer: switch kernels when x occupies > 75% of L2
-    return B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 0.75
+    return True
 
 
 def stream_mix_add(
