@@ -9,6 +9,7 @@ from einops import einsum
 from timm.layers import trunc_normal_
 
 from hyperconnections.ops import HAS_TRITON, expm_t18, expm_t18_triton, stream_mix_add
+from hyperconnections.short_conv import DepthwiseShortConv1d
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -38,6 +39,8 @@ class ContinuousGenHyperConnections(nn.Module):
         use_triton: bool = True,
         vec_dt: bool = False,
         use_expm_t18: bool = False,
+        shortconv_kernel_size: int = 0,
+        shortconv_causal: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -118,6 +121,12 @@ class ContinuousGenHyperConnections(nn.Module):
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
+        # Optional over-width short conv on the read/source path (see forward).
+        self.short_conv = (
+            DepthwiseShortConv1d(input_dim, shortconv_kernel_size, causal=shortconv_causal)
+            if shortconv_kernel_size > 0
+            else None
+        )
         self._stream_mix = (
             self._stream_mix_triton
             if use_triton and HAS_TRITON
@@ -440,13 +449,20 @@ class ContinuousGenHyperConnections(nn.Module):
         leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
         B = x.shape[0]
-        x_norm = self.norm(x.view(B, -1))  ### [B*, input_dim]
+        ### Optional over-width short conv on the read/source path only: it feeds the
+        ### read-in and every x_norm-derived weight (read/write/generator/projection),
+        ### while the carried stream `x` that gets stream-mixed stays un-convolved.
+        if self.short_conv is not None:
+            src = self.short_conv(x.reshape(*leading, self.input_dim)).reshape(B, self.n, self.block_size)
+        else:
+            src = x
+        x_norm = self.norm(src.view(B, -1))  ### [B*, input_dim]
 
         write_out, read_in = self.compute_read_write_weights(x_norm)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
         ### Read in from over-width space to backbone width
-        x_read = einsum(read_in, x, "b m n, b n d -> b m d")  ### [B*, m, block_size]
+        x_read = einsum(read_in, src, "b m n, b n d -> b m d")  ### [B*, m, block_size]
 
         ### Process through the backbone module
         out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
