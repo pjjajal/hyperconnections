@@ -40,10 +40,18 @@ from itertools import product
 from typing import Sequence
 
 import torch
+import torch._logging
+
+torch._logging.set_logs(
+    dynamo=logging.ERROR,
+    aot=logging.ERROR,
+    inductor=logging.ERROR,
+    autotuning=False
+)
 
 from hyperconnections.ops import expm_t18 as _expm_t18, expm_t18_triton
 
-from bench_utils import ok, fail, warn, bold, _dtype, _corr_row, bench_stats, stat_fields
+from bench_utils import ok, fail, warn, bold, _dtype, _corr_row, bench_stats, stat_fields, logger, setup_logging
 from expm_common import (_REPORT_DIR, _write_csv, _A_FACTORIES, _A_LABEL,
                          _make_large_norm_A, ref_torch_matrix_exp, _check)
 
@@ -80,7 +88,7 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     ref = ref_torch_matrix_exp(A)
     passed, err = _check(got, ref, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "triton", "fwd", err, atol_f, passed))
+    logger.info(_corr_row(cfg_str, "triton", "fwd", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "fwd",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
@@ -88,7 +96,7 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     ref_t18 = expm_t18(A)
     passed, err = _check(got, ref_t18, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "vs T18", "fwd", err, atol_f, passed))
+    logger.info(_corr_row(cfg_str, "vs T18", "fwd", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "vs T18", "check": "fwd",
                      "max_err": err, "atol": atol_f, "passed": passed})
 
@@ -99,7 +107,7 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
 
     passed, err = _check(A_t.grad, grad_ref, atol_b)
     all_passed &= passed
-    print(_corr_row(cfg_str, "triton", "grad_A", err, atol_b, passed))
+    logger.info(_corr_row(cfg_str, "triton", "grad_A", err, atol_b, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad_A",
                      "max_err": err, "atol": atol_b, "passed": passed})
 
@@ -111,12 +119,7 @@ def run_correctness(
     bs: Sequence[int],
     dtypes: Sequence[str],
 ) -> tuple[bool, list[dict]]:
-    print()
-    print(bold("=" * 92))
-    print(bold("  CORRECTNESS — random A (small norm, no/few squarings)"))
-    print(bold("=" * 92))
-    print(_CORR_HDR)
-    print(_CORR_SEP)
+    logger.info("\n" + bold("=" * 92) + "\n" + bold("  CORRECTNESS — random A (small norm, no/few squarings)") + "\n" + bold("=" * 92) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
 
     all_passed = True
     csv_rows: list[dict] = []
@@ -134,15 +137,10 @@ def run_correctness(
             cfg_str = f"B={B} N={N} {dtype_name}"
             all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
-        print(_CORR_SEP)
+        logger.info(_CORR_SEP)
 
     ### Structured-A correctness
-    print()
-    print(bold("=" * 92))
-    print(bold("  CORRECTNESS — structured A (skew / neg_psd / diagonal / large-norm)"))
-    print(bold("=" * 92))
-    print(_CORR_HDR)
-    print(_CORR_SEP)
+    logger.info("\n" + bold("=" * 92) + "\n" + bold("  CORRECTNESS — structured A (skew / neg_psd / diagonal / large-norm)") + "\n" + bold("=" * 92) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
@@ -154,14 +152,12 @@ def run_correctness(
             cfg_str = f"[{_A_LABEL[kind]}] B={B} N={N} {dtype_name}"
             all_passed = _corr_block(A, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
-        print(_CORR_SEP)
+        logger.info(_CORR_SEP)
 
-    print()
     if all_passed:
         print(ok("All correctness checks passed."))
     else:
         print(fail("One or more correctness checks FAILED."))
-    print()
     return all_passed, csv_rows
 
 
@@ -200,12 +196,7 @@ def run_perf(
     fwd: bool = True,
     bwd: bool = False,
 ) -> list[dict]:
-    print()
-    print(bold("=" * 130))
-    print(bold("  PERFORMANCE — random / skew / neg_psd / diagonal / large-norm (per --norms)"))
-    print(bold("=" * 130))
-    print(_PERF_HDR)
-    print(_PERF_SEP)
+    logger.info("\n" + bold("=" * 130) + "\n" + bold("  PERFORMANCE — random / skew / neg_psd / diagonal / large-norm (per --norms)") + "\n" + bold("=" * 130) + "\n" + _PERF_HDR + "\n" + _PERF_SEP)
 
     std_kinds = ["random", "skew", "neg_psd", "diagonal"]
     csv_rows: list[dict] = []
@@ -224,7 +215,7 @@ def run_perf(
                     s_tri   = bench_stats(lambda: expm_t18_triton(A),      warmup, rep)
                     s_torch = bench_stats(lambda: ref_torch_matrix_exp(A), warmup, rep)
                     s_t18   = bench_stats(lambda: expm_t18(A),             warmup, rep)
-                    print(_perf_row(cfg_str, label + " fwd", dtype_name, s_tri, s_torch, s_t18))
+                    logger.info(_perf_row(cfg_str, label + " fwd", dtype_name, s_tri, s_torch, s_t18))
                     csv_rows.append({
                         "config": cfg_str, "atype": label + " fwd", "dtype": dtype_name, "norm": norm,
                         **stat_fields("triton", s_tri), **stat_fields("matrix_exp", s_torch),
@@ -251,7 +242,7 @@ def run_perf(
                     s_b_tri   = bench_stats(_b_tri,   warmup, rep)
                     s_b_torch = bench_stats(_b_torch, warmup, rep)
                     s_b_t18   = bench_stats(_b_t18,   warmup, rep)
-                    print(_perf_row(cfg_str, label + " bwd", dtype_name, s_b_tri, s_b_torch, s_b_t18))
+                    logger.info(_perf_row(cfg_str, label + " bwd", dtype_name, s_b_tri, s_b_torch, s_b_t18))
                     csv_rows.append({
                         "config": cfg_str, "atype": label + " bwd", "dtype": dtype_name, "norm": norm,
                         **stat_fields("triton", s_b_tri), **stat_fields("matrix_exp", s_b_torch),
@@ -260,10 +251,10 @@ def run_perf(
                         "speedup_vs_t18":   s_b_t18.median / s_b_tri.median,
                     })
 
-            print()  # blank between (N, B) groups
+            logger.info("")  # blank between (N, B) groups
 
-        print(_PERF_SEP)
-    print()
+        logger.info(_PERF_SEP)
+    logger.info("")
     return csv_rows
 
 
@@ -314,7 +305,12 @@ def main():
         "--out-dir", default=None, metavar="DIR",
         help="Directory to write CSV reports (overrides default benchmark_reports/)",
     )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", default=False,
+        help="Print per-row correctness/perf tables (quiet by default)",
+    )
     args = parser.parse_args()
+    setup_logging(args.verbose)
 
     run_fwd = args.fwd or not args.bwd
     run_bwd = args.bwd
@@ -324,12 +320,7 @@ def main():
         sys.exit(1)
 
     dev = torch.cuda.get_device_name(0)
-    print(f"\nDevice    : {dev}")
-    print(f"N vals    : {args.n}")
-    print(f"B vals    : {args.b}")
-    print(f"dtypes    : {args.dtype}")
-    print(f"bench fwd : {run_fwd}")
-    print(f"bench bwd : {run_bwd}")
+    logger.info(f"\nDevice    : {dev}\nN vals    : {args.n}\nB vals    : {args.b}\ndtypes    : {args.dtype}\nbench fwd : {run_fwd}\nbench bwd : {run_bwd}")
 
     today = date.today().strftime("%Y_%m_%d")
     if run_fwd and run_bwd:

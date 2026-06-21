@@ -25,7 +25,7 @@ def _write_csv(rows: list[dict], path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
-    print(f"  -> saved {path}")
+    print(f"[expm_common.py] saved {path}")
 
 
 ###

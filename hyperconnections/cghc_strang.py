@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
 from hyperconnections.ops import HAS_TRITON, stream_mix_add
 

@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import einsum
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
 
 class IdentityHyperConnections(nn.Module):

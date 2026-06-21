@@ -1,6 +1,7 @@
 """Shared formatting / dtype helpers for all benchmark scripts."""
 from __future__ import annotations
 
+import logging
 import statistics
 import sys
 from dataclasses import dataclass
@@ -25,6 +26,15 @@ def ok(s="PASS"): return _col(s, _GREEN)
 def fail(s):      return _col(s, _RED)
 def warn(s):      return _col(s, _YELLOW)
 def bold(s):      return _col(s, _BOLD)
+
+
+logger = logging.getLogger("bench")
+
+def setup_logging(verbose: bool) -> None:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(h)
+    logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
 
 
 def _dtype(name: str) -> torch.dtype:

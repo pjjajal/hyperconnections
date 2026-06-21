@@ -29,23 +29,27 @@ SINGLES_DIR="$SCRIPT_DIR/../benchmark_reports/singles"
 # STREAM_DTYPE=(bf16)
 # STREAM_PASS=(fwd)
 
+### Python cache warming
+python -c "import numpy; import torch; import transformers"
+unset TORCH_LOGS
+export TRITON_ALWAYS_COMPILE=0
+
 EXPM_N=(4 8)
 EXPM_B=(16384)
-EXPM_DTYPE=(fp32 bf16)
+EXPM_DTYPE=(fp32)
 EXPM_PASS=(fwd bwd)   # fwd | bwd | fwdbwd
 
 EXPM_FORCE_N=(4 8)
 EXPM_FORCE_B=(16384)
-EXPM_FORCE_DTYPE=(fp32 bf16)
+EXPM_FORCE_DTYPE=(fp32)
 EXPM_FORCE_PASS=(fwd bwd)
 
 STREAM_N=(4 8)
 STREAM_M=(1)
 STREAM_B=(2048)
 STREAM_E=(1536)
-STREAM_DTYPE=(fp32 bf16)
+STREAM_DTYPE=(fp32)
 STREAM_PASS=(fwd bwd)
-
 
 MODE=all # correctness | perf | all
 WARMUP=16
@@ -90,7 +94,6 @@ for n in "${EXPM_N[@]}"; do
         out_dir="$SINGLES_DIR/expm/$tag"
         mkdir -p "$out_dir"
         run_one "expm  $tag"
-        # shellcheck disable=SC2046
         python "$BENCH_DIR/expm_bench.py" \
             --mode  "$MODE"  \
             --n     "$n"     \
@@ -115,7 +118,6 @@ for n in "${EXPM_FORCE_N[@]}"; do
         out_dir="$SINGLES_DIR/expm_force/$tag"
         mkdir -p "$out_dir"
         run_one "expm_force  $tag"
-        # shellcheck disable=SC2046
         python "$BENCH_DIR/expm_force_bench.py" \
             --mode  "$MODE"  \
             --n     "$n"     \
@@ -143,7 +145,6 @@ for n in "${STREAM_N[@]}"; do
             mkdir -p "$out_dir"
             csv_path="$out_dir/stream_mix_perf.csv"
             run_one "stream_mix  $tag"
-            # shellcheck disable=SC2046
             python "$BENCH_DIR/stream_mix_bench.py" \
                 --mode  "$MODE"      \
                 --n     "$n"         \

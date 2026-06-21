@@ -41,12 +41,21 @@ from pathlib import Path
 from typing import Sequence
 
 import torch
+import torch._logging
+
+torch._logging.set_logs(
+    dynamo=logging.ERROR,
+    aot=logging.ERROR,
+    inductor=logging.ERROR,
+    autotuning=False
+)
+
 from einops import einsum
 
 from hyperconnections.ops import stream_mix_add
 
 from bench_utils import (DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base,
-                         bench_stats, stat_fields)
+                         bench_stats, stat_fields, logger, setup_logging)
 
 
 def _corr_row(config, variant, check, max_err, atol, passed):
@@ -193,14 +202,14 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
+    logger.info(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
 
     ### forward proj
     got = stream_mix_add(Phi, x, Y, v=v)
     ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    print(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
+    logger.info(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
 
     ### backward no-proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -216,7 +225,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        print(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
+        logger.info(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
 
     ### backward proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -232,7 +241,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        print(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
+        logger.info(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
 
     return all_passed
 
@@ -250,12 +259,7 @@ def run_correctness(
     dtypes: Sequence[str],
 ):
     """Run forward + backward correctness checks and print a summary table."""
-    print()
-    print(bold("=" * 90))
-    print(bold(" CORRECTNESS — random Phi"))
-    print(bold("=" * 90))
-    print(_CORR_HDR)
-    print(_CORR_SEP)
+    logger.info("\n" + bold("=" * 90) + "\n" + bold(" CORRECTNESS — random Phi") + "\n" + bold("=" * 90) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
 
     # D = embed_dim // m; deduplicate so the table stays concise
     # (correctness only depends on D, not on how it was derived from m)
@@ -276,16 +280,11 @@ def run_correctness(
             cfg_str = f"B={B} N={N} D={D} {dtype_name}"
             all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
-        print(_CORR_SEP)
+        logger.info(_CORR_SEP)
 
     ### Structured Phi correctness
     ### Focused config set to keep the table concise.
-    print()
-    print(bold("=" * 90))
-    print(bold("  CORRECTNESS — Structured Phi"))
-    print(bold("=" * 90))
-    print(_CORR_HDR)
-    print(_CORR_SEP)
+    logger.info("\n" + bold("=" * 90) + "\n" + bold("  CORRECTNESS — Structured Phi") + "\n" + bold("=" * 90) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
 
     for dtype_name in dtypes:
         struct_D_vals = _derive_D_vals(ms, embed_dims)
@@ -306,13 +305,11 @@ def run_correctness(
             cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D} {dtype_name}"
             all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
-    print(_CORR_SEP)
-    print()
+    logger.info(_CORR_SEP)
     if all_passed:
         print(ok("All correctness checks passed."))
     else:
         print(fail("One or more correctness checks FAILED."))
-    print()
     return all_passed
 
 
@@ -388,12 +385,7 @@ def run_perf(
     bwd: bool = False,
 ) -> list[dict]:
     """Benchmark Triton kernel vs PyTorch bmm+add reference."""
-    print()
-    print(bold("=" * 120))
-    print(bold("  PERFORMANCE"))
-    print(bold("=" * 120))
-    print(_PERF_HDR)
-    print(_PERF_SEP)
+    logger.info("\n" + bold("=" * 120) + "\n" + bold("  PERFORMANCE") + "\n" + bold("=" * 120) + "\n" + _PERF_HDR + "\n" + _PERF_SEP)
 
     rows: list[dict] = []
 
@@ -415,7 +407,7 @@ def run_perf(
                 s_eager    = bench_stats(lambda: ref_no_proj(Phi, x, Y),          warmup, rep)
                 s_compiled = bench_stats(lambda: _ref_no_proj_compiled(Phi, x, Y), warmup, rep)
                 bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "no-proj", dtype_name, s_tri, s_eager, s_compiled, bw))
+                logger.info(_perf_row(cfg_str, "no-proj", dtype_name, s_tri, s_eager, s_compiled, bw))
                 rows.append(_csv_row(cfg_str, "random", "no-proj fwd", dtype_name, s_tri, s_eager, s_compiled, bw))
 
                 ### proj
@@ -423,7 +415,7 @@ def run_perf(
                 s_eager_p    = bench_stats(lambda: ref_proj(Phi, x, Y, v),             warmup, rep)
                 s_compiled_p = bench_stats(lambda: _ref_proj_compiled(Phi, x, Y, v),   warmup, rep)
                 bw_p = _bytes_proj(B, N, D, elem) / (s_tri_p.median * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "proj", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
+                logger.info(_perf_row(cfg_str, "proj", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
                 rows.append(_csv_row(cfg_str, "random", "proj fwd", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
 
             if bwd:
@@ -446,7 +438,7 @@ def run_perf(
                 s_b_e = bench_stats(_b_ea,  warmup, rep)
                 s_b_c = bench_stats(_b_cmp, warmup, rep)
                 bw_b  = _bytes_no_proj_bwd(B, N, D, elem) / (s_b.median * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "no-proj+bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
+                logger.info(_perf_row(cfg_str, "no-proj+bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
                 rows.append(_csv_row(cfg_str, "random", "no-proj bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
 
                 ### proj fwd+bwd
@@ -468,11 +460,11 @@ def run_perf(
                 s_bp_e = bench_stats(_bp_ea,  warmup, rep)
                 s_bp_c = bench_stats(_bp_cmp, warmup, rep)
                 bw_bp  = _bytes_proj_bwd(B, N, D, elem) / (s_bp.median * 1e-3) / 1e9
-                print(_perf_row(cfg_str, "proj+bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
+                logger.info(_perf_row(cfg_str, "proj+bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
                 rows.append(_csv_row(cfg_str, "random", "proj bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
 
-        print(_PERF_SEP)
-    print()
+        logger.info(_PERF_SEP)
+    logger.info("")
     return rows
 
 
@@ -506,12 +498,7 @@ def run_structured_perf(
       ref_diagonal_add  uses  d * x + Y  (O(ND) vs O(N²D)), revealing the
       overhead of loading the full Phi matrix in the Triton kernel.
     """
-    print()
-    print(bold("=" * 125))
-    print(bold("  STRUCTURED-MATRIX PERFORMANCE"))
-    print(bold("=" * 125))
-    print(_SPHDR)
-    print(_SPSEP)
+    logger.info("\n" + bold("=" * 125) + "\n" + bold("  STRUCTURED-MATRIX PERFORMANCE") + "\n" + bold("=" * 125) + "\n" + _SPHDR + "\n" + _SPSEP)
 
     phi_types = list(_PHI_FACTORIES.keys())   # random, skew_sym, psd, diagonal
     rows: list[dict] = []
@@ -555,7 +542,7 @@ def run_structured_perf(
                         vd_col   = f"{'N/A':>8}"
 
                     bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
-                    print(
+                    logger.info(
                         f"{cfg_str:>24}  {label:>8}  {dtype_name:>6}  "
                         f"{s_tri.median:>10.3f}  {s_tri.p99:>9.3f}  {s_tri.var:>9.2e}  "
                         f"{s_eager.median:>9.3f}  {s_comp.median:>12.3f}  {_sp(s_eager.median):>8}  "
@@ -589,7 +576,7 @@ def run_structured_perf(
 
                     bw_b    = _bytes_no_proj_bwd(B, N, D, elem) / (s_tri_b.median * 1e-3) / 1e9
                     label_b = label.rstrip() + "+bwd"
-                    print(
+                    logger.info(
                         f"{cfg_str:>24}  {label_b:>8}  {dtype_name:>6}  "
                         f"{s_tri_b.median:>10.3f}  {s_tri_b.p99:>9.3f}  {s_tri_b.var:>9.2e}  "
                         f"{s_ea_b.median:>9.3f}  {s_cmp_b.median:>12.3f}  {_spb(s_ea_b.median):>8}  "
@@ -597,11 +584,11 @@ def run_structured_perf(
                     )
                     rows.append(_csv_row(cfg_str, phi_type, "bwd", dtype_name, s_tri_b, s_ea_b, s_cmp_b, bw_b))
 
-            print()   # blank line between (N,B,D) groups
+            logger.info("")  # blank line between (N,B,D) groups
 
-        print(_SPSEP)
+        logger.info(_SPSEP)
 
-    print()
+    logger.info("")
     return rows
 
 
@@ -656,7 +643,12 @@ def main():
         "--csv", type=Path, default=None, metavar="PATH",
         help="Write performance results to this CSV file (appends if file exists).",
     )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", default=False,
+        help="Print per-row correctness/perf tables (quiet by default)",
+    )
     args = parser.parse_args()
+    setup_logging(args.verbose)
 
     # --fwd and --bwd are independent; default (neither given) → fwd only
     run_fwd = args.fwd or not args.bwd
@@ -667,14 +659,7 @@ def main():
         sys.exit(1)
 
     dev = torch.cuda.get_device_name(0)
-    print(f"\nDevice     : {dev}")
-    print(f"N vals     : {args.n}")
-    print(f"m vals     : {args.m}")
-    print(f"B vals     : {args.b}")
-    print(f"embed_dims : {args.embed_dim}")
-    print(f"dtypes     : {args.dtype}")
-    print(f"bench fwd  : {run_fwd}")
-    print(f"bench bwd  : {run_bwd}")
+    logger.info(f"\nDevice     : {dev}\nN vals     : {args.n}\nm vals     : {args.m}\nB vals     : {args.b}\nembed_dims : {args.embed_dim}\ndtypes     : {args.dtype}\nbench fwd  : {run_fwd}\nbench bwd  : {run_bwd}")
 
     passed = True
     if args.mode in ("correctness", "all"):
