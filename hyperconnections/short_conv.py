@@ -37,7 +37,7 @@ class DepthwiseShortConv1d(nn.Module):
             self.padding = (kernel_size - 1, 0)
         else:
             self.padding = ((kernel_size - 1) // 2, kernel_size // 2)
-        self.weight = nn.Parameter(torch.empty(dim, dim, kernel_size))
+        self.weight = nn.Parameter(torch.empty(dim, kernel_size))
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -47,6 +47,6 @@ class DepthwiseShortConv1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)  # [B, C, T]
         x = F.pad(x, self.padding)
-
-        x = F.conv1d(x, self.weight)
+        # Depthwise conv: weight [dim, 1, kernel_size], one group per channel.
+        x = F.conv1d(x, self.weight.unsqueeze(1), groups=self.dim)
         return x.transpose(1, 2)  # [B, T, C]
