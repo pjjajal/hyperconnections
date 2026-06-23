@@ -1,33 +1,31 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #SBATCH -A davisjam
 #SBATCH -N 1
 #SBATCH -n 16
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-task=2
+#SBATCH --gpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=a100-80gb
 #SBATCH --time=3:59:00
 #SBATCH --job-name=stream_mix_bench
-#SBATCH --output=benchmark_reports/logs/stream_mix_%j.out
-#SBATCH --error=benchmark_reports/logs/stream_mix_%j.err
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJ_DIR="$SCRIPT_DIR/../.."
-BENCH_DIR="$PROJ_DIR/benchmarks"
-SINGLES_DIR="$PROJ_DIR/benchmark_reports/singles"
+cd /scratch/gilbreth/neliopou/pj-hyperconnections
 
-mkdir -p "$PROJ_DIR/benchmark_reports/logs"
+BENCH_DIR="benchmarks"
+SINGLES_DIR="benchmark_reports/singles"
+
+mkdir -p "benchmark_reports/logs"
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
-STREAM_N=(4 8 16)
+STREAM_N=(4 8 16 32)
 STREAM_M=(1)
-STREAM_B=(1024 4096 8192 16384 32768 65536 120064)
+STREAM_B=(1024 4096 8192 16384 32768)
 STREAM_E=(1024 1536 2048)
-STREAM_DTYPE=(bf16)
-STREAM_PASS=(fwd)
+STREAM_DTYPE=(fp32 bf16)
+STREAM_PASS=(fwd bwd)
 
 MODE=all
 WARMUP=16
@@ -47,7 +45,6 @@ total=$(( ${#STREAM_N[@]} * ${#STREAM_M[@]} * ${#STREAM_B[@]} * ${#STREAM_E[@]} 
 done_count=0
 
 # ── Environment ───────────────────────────────────────────────────────────────
-cd "$PROJ_DIR"
 python -c "import numpy; import torch; import transformers"
 unset TORCH_LOGS
 export TRITON_ALWAYS_COMPILE=0

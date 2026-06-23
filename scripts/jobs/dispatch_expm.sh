@@ -1,25 +1,23 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #SBATCH -A davisjam
 #SBATCH -N 1
 #SBATCH -n 16
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-task=2
+#SBATCH --gpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=a100-80gb
-#SBATCH --time=3:59:00
+#SBATCH --time=4:59:00
 #SBATCH --job-name=expm_bench
-#SBATCH --output=benchmark_reports/logs/expm_%j.out
-#SBATCH --error=benchmark_reports/logs/expm_%j.err
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJ_DIR="$SCRIPT_DIR/../.."
-BENCH_DIR="$PROJ_DIR/benchmarks"
-SINGLES_DIR="$PROJ_DIR/benchmark_reports/singles"
+cd /scratch/gilbreth/neliopou/pj-hyperconnections
 
-mkdir -p "$PROJ_DIR/benchmark_reports/logs"
+BENCH_DIR="benchmarks"
+SINGLES_DIR="benchmark_reports/singles"
+
+mkdir -p "benchmark_reports/logs"
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
 EXPM_N=(4 8 16 32)
@@ -45,7 +43,6 @@ total=$(( ${#EXPM_N[@]} * ${#EXPM_B[@]} * ${#EXPM_DTYPE[@]} * ${#EXPM_PASS[@]} )
 done_count=0
 
 # ── Environment ───────────────────────────────────────────────────────────────
-cd "$PROJ_DIR"
 python -c "import numpy; import torch; import transformers"
 unset TORCH_LOGS
 export TRITON_ALWAYS_COMPILE=0

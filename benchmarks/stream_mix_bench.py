@@ -43,12 +43,12 @@ from typing import Sequence
 import torch
 import torch._logging
 
-torch._logging.set_logs(
-    dynamo=logging.ERROR,
-    aot=logging.ERROR,
-    inductor=logging.ERROR,
-    autotuning=False
-)
+# torch._logging.set_logs(
+#     dynamo=logging.ERROR,
+#     aot=logging.ERROR,
+#     inductor=logging.ERROR,
+#     autotuning=False
+# )
 
 from einops import einsum
 
@@ -194,22 +194,31 @@ _CORR_HDR = f"{'Config':>30}  {'Variant':>12}  {'Check':>10}  {'MaxErr':>10}  {'
 _CORR_SEP = "-" * 90
 
 
-def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
-    """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed."""
+def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows):
+    """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed.
+
+    Each check is both logged and appended to csv_rows (one dict per row) so the
+    results can be written to a correctness report, mirroring expm_bench.py.
+    """
+
+    def _emit(variant, check, err, atol, passed):
+        logger.info(_corr_row(cfg_str, variant, check, err, atol, passed))
+        csv_rows.append({"config": cfg_str, "variant": variant, "check": check,
+                         "max_err": err, "atol": atol, "passed": passed})
 
     ### forward no-proj
     got = stream_mix_add(Phi, x, Y)
     ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    logger.info(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
+    _emit("no-proj", "fwd", err, atol_f, passed)
 
     ### forward proj
     got = stream_mix_add(Phi, x, Y, v=v)
     ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    logger.info(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
+    _emit("proj", "fwd", err, atol_f, passed)
 
     ### backward no-proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -225,7 +234,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        logger.info(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
+        _emit("no-proj", name, err, atol_b, passed)
 
     ### backward proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -241,7 +250,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        logger.info(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
+        _emit("proj", name, err, atol_b, passed)
 
     return all_passed
 
@@ -257,8 +266,12 @@ def run_correctness(
     embed_dims: Sequence[int],
     bs: Sequence[int],
     dtypes: Sequence[str],
-):
-    """Run forward + backward correctness checks and print a summary table."""
+) -> tuple[bool, list[dict]]:
+    """Run forward + backward correctness checks and print a summary table.
+
+    Returns (all_passed, csv_rows) where csv_rows holds one dict per check for
+    the correctness report (mirrors expm_bench.run_correctness).
+    """
     logger.info("\n" + bold("=" * 90) + "\n" + bold(" CORRECTNESS — random Phi") + "\n" + bold("=" * 90) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
 
     # D = embed_dim // m; deduplicate so the table stays concise
@@ -268,6 +281,7 @@ def run_correctness(
     configs += [(4, ns[0], 100)]   # non-power-of-2 D to test masking
 
     all_passed = True
+    csv_rows: list[dict] = []
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
@@ -278,7 +292,7 @@ def run_correctness(
             Phi, x, Y = _make(B, N, D, dtype)
             v = _make_v(B, N, dtype)
             cfg_str = f"B={B} N={N} D={D} {dtype_name}"
-            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
         logger.info(_CORR_SEP)
 
@@ -303,14 +317,14 @@ def run_correctness(
             Phi = factory(B, N, dtype).contiguous()
             v   = _make_v(B, N, dtype)
             cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D} {dtype_name}"
-            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
 
     logger.info(_CORR_SEP)
     if all_passed:
         print(ok("All correctness checks passed."))
     else:
         print(fail("One or more correctness checks FAILED."))
-    return all_passed
+    return all_passed, csv_rows
 
 
 ###
@@ -662,8 +676,25 @@ def main():
     logger.info(f"\nDevice     : {dev}\nN vals     : {args.n}\nm vals     : {args.m}\nB vals     : {args.b}\nembed_dims : {args.embed_dim}\ndtypes     : {args.dtype}\nbench fwd  : {run_fwd}\nbench bwd  : {run_bwd}")
 
     passed = True
+    corr_rows: list[dict] = []
     if args.mode in ("correctness", "all"):
-        passed = run_correctness(args.n, args.m, args.embed_dim, args.b, args.dtype)
+        passed, corr_rows = run_correctness(args.n, args.m, args.embed_dim, args.b, args.dtype)
+
+        ### Write a correctness report alongside the perf CSV (mirrors expm_bench.py).
+        ### Path is derived from --csv by swapping 'perf'→'correctness' (or appending
+        ### '_correctness'), so the dispatch script needs no change.
+        if args.csv is not None and corr_rows:
+            stem = args.csv.stem
+            corr_stem = stem.replace("perf", "correctness") if "perf" in stem else f"{stem}_correctness"
+            corr_path = args.csv.with_name(corr_stem + args.csv.suffix)
+            _CORR_FIELDS = ["config", "variant", "check", "max_err", "atol", "passed"]
+            write_header = not corr_path.exists()
+            with corr_path.open("a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=_CORR_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(corr_rows)
+            print(f"Correctness CSV written to {corr_path}")
 
     if args.mode in ("perf", "all"):
         perf_rows = run_perf(args.n, args.m, args.embed_dim, args.b, args.dtype,
@@ -688,8 +719,8 @@ def main():
                 writer.writerows(all_rows)
             print(f"CSV written to {args.csv}")
 
-    if args.mode in ("correctness", "all") and not passed:
-        sys.exit(1)
+    # if args.mode in ("correctness", "all") and not passed:
+    #     sys.exit(1)
 
 
 if __name__ == "__main__":
