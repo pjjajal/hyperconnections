@@ -20,9 +20,9 @@ SINGLES_DIR="benchmark_reports/singles"
 mkdir -p "benchmark_reports/logs"
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
-STREAM_N=(4 8 16 32)
+STREAM_N=(32)
 STREAM_M=(1)
-STREAM_B=(1024 4096 8192 16384 32768)
+STREAM_B=(16384)
 STREAM_E=(1024 1536 2048)
 STREAM_DTYPE=(fp32 bf16)
 STREAM_PASS=(fwd bwd)
