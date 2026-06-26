@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -49,7 +48,6 @@ class ContinuousGenHyperConnections(nn.Module):
         self.embed_dim = embed_dim
         self.generator_type = generator_type
         self.projection = projection
-        self.use_expm_t18 = use_expm_t18
 
         assert embed_dim % m == 0, (
             f"embed_dim ({embed_dim}) must be divisible by m ({m})"
@@ -73,12 +71,9 @@ class ContinuousGenHyperConnections(nn.Module):
         assert dt_min < dt < dt_max, (
             f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
         )
-        self.dt_min_cons = dt_min
-        self.dt_max_cons = dt_max
-        self.dt_min_diss = dt_min
-        self.dt_max_diss = dt_max
-        self.log_dt_init_cons = math.log(dt)
-        self.log_dt_init_diss = math.log(dt)
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.log_dt_init = math.log(dt)
         self.vec_dt = vec_dt
         n_dt = n if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
@@ -99,12 +94,12 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if conserv:
             self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conv_pred = nn.Linear(input_dim, n * n, bias=False)
+            self.conserv_pred = nn.Linear(input_dim, n * n, bias=False)
         if psd_diss:
             self.diss_A = nn.Parameter(torch.zeros(n, n))
             self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
         if diag_diss:
-            self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
+            self.diss_diag = nn.Parameter(torch.full((n,), -8.0))
             self.diss_pred = nn.Linear(input_dim, n, bias=False)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
@@ -136,6 +131,11 @@ class ContinuousGenHyperConnections(nn.Module):
             expm_t18_triton if use_triton and HAS_TRITON else self._matrix_exp_eager
         )
         self.init_weights()
+
+    def _init_log_dt(self, param: nn.Parameter) -> None:
+        target = (math.exp(self.log_dt_init) - self.dt_min) / (self.dt_max - self.dt_min)
+        target = min(max(target, 1e-4), 1 - 1e-4)
+        nn.init.constant_(param, math.log(target / (1 - target)))
 
     def init_weights(self):
         # read_in (semantic [m, n], stored as [n, m]):
@@ -189,8 +189,8 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.constant_(self.laplacian_A, -8.0)
 
         # Generator Dynamic Parameters
-        if hasattr(self, "conv_pred"):
-            nn.init.zeros_(self.conv_pred.weight)
+        if hasattr(self, "conserv_pred"):
+            nn.init.zeros_(self.conserv_pred.weight)
 
         if hasattr(self, "diss_pred"):
             nn.init.zeros_(self.diss_pred.weight)
@@ -198,23 +198,8 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "laplacian_pred"):
             nn.init.zeros_(self.laplacian_pred.weight)
 
-        # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
-        # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
-        dt_init_cons = math.exp(self.log_dt_init_cons)
-        target = (dt_init_cons - self.dt_min_cons) / (
-            self.dt_max_cons - self.dt_min_cons
-        )
-        target = min(max(target, 1e-4), 1 - 1e-4)
-        bias_init = math.log(target / (1 - target))
-        nn.init.constant_(self.log_dt_conserv, bias_init)
-
-        dt_init_diss = math.exp(self.log_dt_init_diss)
-        target = (dt_init_diss - self.dt_min_diss) / (
-            self.dt_max_diss - self.dt_min_diss
-        )
-        target = min(max(target, 1e-4), 1 - 1e-4)
-        bias_init = math.log(target / (1 - target))
-        nn.init.constant_(self.log_dt_diss, bias_init)
+        self._init_log_dt(self.log_dt_conserv)
+        self._init_log_dt(self.log_dt_diss)
 
         # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
         trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
@@ -270,11 +255,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- Conservative branch ---
         if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
+            M = self.conserv_A + self.conserv_pred(x_norm).reshape(B, self.n, self.n)
             logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min_cons + (
-                self.dt_max_cons - self.dt_min_cons
-            ) * torch.sigmoid(logit_conserv)
+            dt_conserv = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_conserv)
             skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
@@ -295,9 +278,7 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "laplacian_A")
         ):
             logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min_diss + (
-                self.dt_max_diss - self.dt_min_diss
-            ) * torch.sigmoid(logit_diss)
+            dt_diss = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_diss)
             sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
 
         # --- PSD dissipative (Gram matrix) branch ---
@@ -323,9 +304,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
-            score_bias = self.laplacian_A
-            scores = self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
-            scores = score_bias + scores
+            scores = self.laplacian_A + self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
@@ -353,8 +332,6 @@ class ContinuousGenHyperConnections(nn.Module):
         A = self.compute_generator(x_norm)
         return self._matrix_exp(A)
 
-    # This is a manual graph break so that the inner function is compiled with max-autotune
-    @torch.compiler.disable(recursive=False)
     def _expm_t18(self, A: torch.Tensor) -> torch.Tensor:
         """Compute matrix exponential using expm_t18 approximation."""
         return expm_t18(A)
@@ -421,22 +398,26 @@ class ContinuousGenHyperConnections(nn.Module):
                 transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
             )  # [B*, n, block_size]
         else:
-            proj_matrix = einsum(
-                projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
-            )  # [b, n, n]
-            orthogonal_proj = (
-                torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
-            )  # [b, n, n]
             x_proj = einsum(
-                proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
+                projection_dir,
+                projection_dir,
+                x,
+                "b n1, b n2, b n2 d -> b n1 d",
             )  # [b, n, block_size]
-            x_orth = einsum(
-                orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [b, n, block_size]
+            x_orth = x - x_proj
             x_mixed = x_proj + einsum(
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
             )  # [B*, n, block_size]
         return x_mixed + Y
+
+    def _transition_and_source(
+        self, x_norm: torch.Tensor, Y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (transition_matrix, Y) for stream mixing.
+
+        Subclasses override this to apply φ₁(A) to Y (forced/exact integration).
+        """
+        return self.compute_transition(x_norm), Y
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -471,11 +452,9 @@ class ContinuousGenHyperConnections(nn.Module):
         out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
 
-        ### Steam Mixing
-        ### Mixing: X_new_mix = Phi @ X  (or protected variant)
-        transition_matrix = self.compute_transition(x_norm)  ### [B, n, n]
+        ### Compute transition matrix and (optionally) apply φ₁ to Y
+        transition_matrix, Y = self._transition_and_source(x_norm, Y)
 
-        ### compute projection direction for projected mixing
         projection_dir = self.compute_projection(x_norm)  ### [B, n] or None
 
         return (

@@ -84,7 +84,7 @@ class TestInit:
     def test_conservative_laplacian_creates_conserv_params(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
         assert hasattr(cghc, "conserv_A"), "conserv_A must exist for conservative_laplacian"
-        assert hasattr(cghc, "conv_pred"), "conv_pred must exist for conservative_laplacian"
+        assert hasattr(cghc, "conserv_pred"), "conserv_pred must exist for conservative_laplacian"
         assert hasattr(cghc, "laplacian_A"), "laplacian_A must exist for conservative_laplacian"
 
     @pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
@@ -93,18 +93,31 @@ class TestInit:
 
     @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
     def test_read_in_init_value(self, n, m, embed_dim):
-        """sigmoid(read_in bias) should equal 1/n at init."""
+        """m=1: all read_in entries ≈ logit(1/n). m>1: block-diagonal (on ≈5, off ≈-5)."""
         cghc = make_cghc(n, m, embed_dim)
-        expected = 1.0 / n
-        actual = torch.sigmoid(cghc.read_in)
-        assert torch.allclose(actual, torch.full_like(actual, expected), atol=1e-6)
+        # [n, m] stored; transpose to [m, n] semantic view
+        W = cghc.read_in.detach()  # [n, m]
+        if m == 1:
+            expected_logit = math.log(1.0 / (n - 1)) if n > 1 else 10.0
+            assert torch.allclose(W, torch.full_like(W, expected_logit), atol=0.05)
+        else:
+            for j in range(m):
+                assert W[j, j].item() == pytest.approx(5.0, abs=0.05), f"on-diag [{j},{j}]"
+                for k in range(m):
+                    if k != j:
+                        assert W[j, k].item() == pytest.approx(-5.0, abs=0.05), f"off-diag [{j},{k}]"
 
     @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
     def test_write_out_init_value(self, n, m, embed_dim):
-        """2 * sigmoid(write_out bias) should equal 1 at init (bias=0)."""
+        """Round-robin: on-position bias ≈ 0 (2·σ(0)=1), off-position bias ≈ -5."""
         cghc = make_cghc(n, m, embed_dim)
-        actual = 2 * torch.sigmoid(cghc.write_out)
-        assert torch.allclose(actual, torch.ones_like(actual), atol=1e-6)
+        W = cghc.write_out.detach()  # [n, m]
+        for i in range(n):
+            on = i % m
+            assert W[i, on].item() == pytest.approx(0.0, abs=0.05), f"on [{i},{on}]"
+            for j in range(m):
+                if j != on:
+                    assert W[i, j].item() == pytest.approx(-5.0, abs=0.05), f"off [{i},{j}]"
 
     @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
     def test_alpha_negligible_at_init(self, n, m, embed_dim):
@@ -132,28 +145,30 @@ class TestGeneratorStructure:
             if hasattr(cghc, "diss_diag"):
                 cghc.diss_diag.add_(torch.randn_like(cghc.diss_diag) * 0.5)
             if hasattr(cghc, "laplacian_A"):
+                # init is -8 so softplus(-8)≈0; reset to 0 to get softplus(0)≈0.693 adjacency
+                cghc.laplacian_A.fill_(0.0)
                 cghc.laplacian_A.add_(torch.randn_like(cghc.laplacian_A) * 0.1)
+
+    def _x_norm(self, cghc, B=3):
+        return torch.randn(B, cghc.input_dim)
 
     def test_conservative_is_skew_symmetric(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative")
         self._perturb(cghc)
-        x = torch.randn(3, cghc.n, cghc.block_size)
-        A = cghc.compute_generator(x)
+        A = cghc.compute_generator(self._x_norm(cghc))
         assert torch.allclose(A + A.transpose(-1, -2), torch.zeros_like(A), atol=1e-5)
 
     def test_psd_diss_is_negative_semidefinite(self):
         cghc = make_cghc(4, 2, 8, generator_type="psd_diss")
         self._perturb(cghc)
-        x = torch.randn(3, cghc.n, cghc.block_size)
-        A = cghc.compute_generator(x)
+        A = cghc.compute_generator(self._x_norm(cghc))
         eigvals = torch.linalg.eigvalsh(A)
         assert (eigvals <= 1e-4).all(), "psd_diss generator must be NSD"
 
     def test_diagonal_diss_has_nonpositive_diagonal_and_zero_offdiag(self):
         cghc = make_cghc(4, 2, 8, generator_type="diagonal_diss")
         self._perturb(cghc)
-        x = torch.randn(3, cghc.n, cghc.block_size)
-        A = cghc.compute_generator(x)
+        A = cghc.compute_generator(self._x_norm(cghc))
         diag = torch.diagonal(A, dim1=-2, dim2=-1)
         off_diag_mask = ~torch.eye(cghc.n, dtype=torch.bool)
         assert (diag <= 0).all(), "diagonal entries must be non-positive"
@@ -161,19 +176,17 @@ class TestGeneratorStructure:
             A[:, off_diag_mask], torch.zeros(3, cghc.n * cghc.n - cghc.n), atol=1e-6
         ), "off-diagonal entries must be zero"
 
-    def test_laplacian_A_is_zero_at_init(self):
-        """At init (all params zero), adjacency = softplus(0) - log(2) = 0, so Laplacian = 0 and A = 0."""
+    def test_laplacian_A_small_at_init(self):
+        """laplacian_A=-8 at init gives softplus(-8)≈3e-4 adjacency → A near zero but not exact."""
         cghc = make_cghc(4, 2, 8, generator_type="laplacian")
-        x = torch.randn(3, cghc.n, cghc.block_size)
-        A = cghc.compute_generator(x)
-        assert torch.allclose(A, torch.zeros_like(A), atol=1e-6), "laplacian generator must be zero at init"
+        A = cghc.compute_generator(self._x_norm(cghc))
+        assert torch.allclose(A, torch.zeros_like(A), atol=1e-2), "laplacian A must be near zero at init"
 
     def test_conservative_laplacian_is_neither_symmetric_nor_skew(self):
         """Combined generator should have both conservative and dissipative parts."""
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
         self._perturb(cghc)
-        x = torch.randn(3, cghc.n, cghc.block_size)
-        A = cghc.compute_generator(x)
+        A = cghc.compute_generator(self._x_norm(cghc))
         # Not purely skew-symmetric (laplacian adds symmetric negative part)
         assert not torch.allclose(A + A.transpose(-1, -2), torch.zeros_like(A), atol=1e-3)
 
@@ -184,42 +197,30 @@ class TestGeneratorStructure:
 
 
 class TestInitialTransition:
-    """At initialization all dynamic deltas are zero, so A starts from its static base.
-    For all types except laplacian the static A = 0, giving Phi = I.
-    After the softplus shift fix, the laplacian also starts with A = 0, giving Phi = I.
+    """At initialization the dynamic predictors are zeroed, so A depends only on static params.
+    Static params have small noise at init, so A is small (not exactly zero) and Phi≈I.
+    diagonal_diss is intentionally initialized with diss_diag=-8 → softplus(-8)≈3e-4 dissipation.
     """
 
-    # diagonal_diss is intentionally initialized with diss_diag=-5 so softplus(-5)≈0.007 → Phi≈I,
-    # not exactly I. All other types produce A=0 exactly at init → Phi=I exactly.
-    EXACT_IDENTITY_TYPES = [
+    ALL_TYPES = [
         "conservative",
         "psd_diss",
+        "diagonal_diss",
         "laplacian",
+        "conservative_diag_diss",
         "conservative_psd_diss",
         "conservative_laplacian",
     ]
-    NEAR_IDENTITY_TYPES = ["diagonal_diss", "conservative_diag_diss"]
 
-    @pytest.mark.parametrize("generator_type", EXACT_IDENTITY_TYPES)
-    def test_transition_is_identity_at_init(self, generator_type):
-        n, m, embed_dim = 4, 2, 8
-        cghc = make_cghc(n, m, embed_dim, generator_type=generator_type)
-        x = torch.randn(3, n, embed_dim // m)
-        Phi = cghc.compute_transition(x)
-        I = torch.eye(n).unsqueeze(0).expand_as(Phi)
-        assert torch.allclose(Phi, I, atol=1e-5), (
-            f"Transition should be I at init for generator_type='{generator_type}'"
-        )
-
-    @pytest.mark.parametrize("generator_type", NEAR_IDENTITY_TYPES)
+    @pytest.mark.parametrize("generator_type", ALL_TYPES)
     def test_transition_is_near_identity_at_init(self, generator_type):
-        """diagonal_diss starts with softplus(-5)≈0.007 dissipation → Phi≈I but not exact."""
+        """All types start with small A (noise * dt ≈ 1e-4) so Phi is near I."""
         n, m, embed_dim = 4, 2, 8
         cghc = make_cghc(n, m, embed_dim, generator_type=generator_type)
-        x = torch.randn(3, n, embed_dim // m)
+        x = torch.randn(3, (n * embed_dim) // m)
         Phi = cghc.compute_transition(x)
         I = torch.eye(n).unsqueeze(0).expand_as(Phi)
-        assert torch.allclose(Phi, I, atol=0.01), (
+        assert torch.allclose(Phi, I, atol=1e-2), (
             f"Transition should be near-I at init for generator_type='{generator_type}'"
         )
 
@@ -231,7 +232,7 @@ class TestInitialTransition:
         cghc = make_cghc(4, 2, 8, generator_type=generator_type)
         with torch.no_grad():
             cghc.conserv_A.add_(torch.randn_like(cghc.conserv_A) * 0.5)
-        x = torch.randn(3, 4, 4)
+        x = torch.randn(3, cghc.input_dim)
         Phi = cghc.compute_transition(x)
         I = torch.eye(4).unsqueeze(0).expand_as(Phi)
         assert torch.allclose(Phi @ Phi.transpose(-1, -2), I, atol=1e-4)
@@ -247,30 +248,42 @@ class TestReadWriteWeights:
     def test_output_shapes(self, n, m, embed_dim):
         cghc = make_cghc(n, m, embed_dim)
         B = 3
-        x = torch.randn(B, n, embed_dim // m)
+        x = torch.randn(B, (n * embed_dim) // m)
         write_out, read_in = cghc.compute_read_write_weights(x)
         assert write_out.shape == (B, n, m)
         assert read_in.shape == (B, m, n)
 
     @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
     def test_read_in_static_at_init(self, n, m, embed_dim):
-        """With alpha ≈ 0.01, dynamic component is negligible; read_in ≈ sigmoid(bias) = 1/n."""
+        """With alpha=0.01, read_in ≈ sigmoid(bias). m=1: all ≈ 1/n. m>1: block-diagonal."""
         cghc = make_cghc(n, m, embed_dim)
         B = 3
-        x = torch.randn(B, n, embed_dim // m)
-        _, read_in = cghc.compute_read_write_weights(x)
-        expected = 1.0 / n
-        # tolerance loosened slightly because alpha=0.01 gives a small but nonzero dynamic offset
-        assert torch.allclose(read_in, torch.full_like(read_in, expected), atol=0.02)
+        x = torch.randn(B, (n * embed_dim) // m)
+        _, read_in = cghc.compute_read_write_weights(x)  # [B, m, n]
+        if m == 1:
+            expected = 1.0 / n
+            assert torch.allclose(read_in, torch.full_like(read_in, expected), atol=0.02)
+        else:
+            # Block-diagonal: read_in[b, j, j] ≈ sigmoid(5) ≈ 0.993, off ≈ sigmoid(-5) ≈ 0.007
+            for j in range(m):
+                assert read_in[:, j, j].mean().item() == pytest.approx(torch.sigmoid(torch.tensor(5.0)).item(), abs=0.05)
+                for k in range(n):
+                    if k != j:
+                        assert read_in[:, j, k].mean().item() == pytest.approx(torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05)
 
     @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
     def test_write_out_static_at_init(self, n, m, embed_dim):
-        """With alpha ≈ 0.01, write_out ≈ 2 * sigmoid(0) = 1."""
+        """With alpha=0.01, write_out ≈ 2*sigmoid(bias). On-position bias=0 → 1. Off-position bias=-5 → ~0.013."""
         cghc = make_cghc(n, m, embed_dim)
         B = 3
-        x = torch.randn(B, n, embed_dim // m)
-        write_out, _ = cghc.compute_read_write_weights(x)
-        assert torch.allclose(write_out, torch.ones_like(write_out), atol=0.02)
+        x = torch.randn(B, (n * embed_dim) // m)
+        write_out, _ = cghc.compute_read_write_weights(x)  # [B, n, m]
+        for i in range(n):
+            on = i % m
+            assert write_out[:, i, on].mean().item() == pytest.approx(1.0, abs=0.05)
+            for j in range(m):
+                if j != on:
+                    assert write_out[:, i, j].mean().item() == pytest.approx(2 * torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -323,24 +336,26 @@ class TestForwardShape:
 
 
 class TestForwardBehavior:
-    EXACT_IDENTITY_TYPES = [
+    ALL_GENERATOR_TYPES = [
         "conservative",
         "psd_diss",
+        "diagonal_diss",
         "laplacian",
+        "conservative_diag_diss",
         "conservative_psd_diss",
         "conservative_laplacian",
     ]
 
-    @pytest.mark.parametrize("generator_type", EXACT_IDENTITY_TYPES)
-    def test_zero_module_output_equals_input_at_init(self, generator_type):
+    @pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
+    def test_zero_module_output_near_input_at_init(self, generator_type):
         """
-        At init, Phi = I for these types (A=0 exactly).
-        ZeroModule gives Y = 0, so output = Phi @ x + 0 = x.
+        At init, static params have small noise so Phi≈I (A~O(noise*dt)~1e-4).
+        ZeroModule gives Y=0, so output = Phi @ x ≈ x.
         """
         n, m, embed_dim = 4, 2, 8
         cghc = make_cghc(n, m, embed_dim, generator_type=generator_type, module=ZeroModule())
         x = torch.randn(3, (n * embed_dim) // m)
-        assert torch.allclose(cghc(x), x, atol=1e-5)
+        assert torch.allclose(cghc(x), x, atol=1e-2)
 
     @pytest.mark.parametrize("generator_type", ["diagonal_diss", "conservative_diag_diss"])
     def test_zero_module_output_near_input_at_init(self, generator_type):
@@ -384,13 +399,13 @@ class TestForwardBehavior:
 
     @pytest.mark.parametrize("projection", ["mean", "v", "none"])
     def test_zero_module_with_projections_at_init(self, projection):
-        """Projection doesn't change the identity-at-init result with ZeroModule."""
+        """Projection doesn't change the near-identity result with ZeroModule."""
         n, m, embed_dim = 4, 2, 8
         cghc = make_cghc(
             n, m, embed_dim, projection=projection, module=ZeroModule(), generator_type="conservative_psd_diss"
         )
         x = torch.randn(3, (n * embed_dim) // m)
-        assert torch.allclose(cghc(x), x, atol=1e-5)
+        assert torch.allclose(cghc(x), x, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------
