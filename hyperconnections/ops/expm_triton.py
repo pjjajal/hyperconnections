@@ -105,10 +105,17 @@ _FWD_CONFIGS = [
 
 
 @triton.jit
-def _matmul_nn(A, B, NP: tl.constexpr, n_idx):
+def _matmul_nn(A, B, NP: tl.constexpr, n_idx, LOW_PREC: tl.constexpr = False):
     ### Use tl.dot (downcompiled to proper GEMM by Triton) for NP >= 16
     ### Otherwise, use FFMA on register tiles.
     if NP >= 16:
+        if LOW_PREC:
+            ### bf16/fp16 callers have ~1e-2 relative tolerance headroom, so feed
+            ### the tensor cores bf16 operands (2x the TF32 rate on A100, and 4x
+            ### IEEE-fp32 emulation) while KEEPING the fp32 accumulator via
+            ### out_dtype.  fp32 callers (out_dtype=fp32, bench atol 5e-4/5e-3)
+            ### fall through to the IEEE path below — bf16 inputs would blow that.
+            return tl.dot(A.to(tl.bfloat16), B.to(tl.bfloat16), out_dtype=tl.float32)
         return tl.dot(A, B, input_precision="ieee", out_dtype=tl.float32)
     R = tl.zeros([NP, NP], dtype=tl.float32)
     for k in tl.static_range(NP):
@@ -146,20 +153,20 @@ def _matmul_nn_alt(A, B, NP: tl.constexpr, n_idx):
 ### Helper for block-structured backward (or forward)
 ###
 @triton.jit
-def _pair_mul(D1, U1, D2, U2, NP: tl.constexpr, n_idx):
+def _pair_mul(D1, U1, D2, U2, NP: tl.constexpr, n_idx, LOW_PREC: tl.constexpr = False):
     ### Structured block product:
     ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
-    D = _matmul_nn(D1, D2, NP, n_idx)
-    U = _matmul_nn(D1, U2, NP, n_idx) + _matmul_nn(U1, D2, NP, n_idx)
+    D = _matmul_nn(D1, D2, NP, n_idx, LOW_PREC)
+    U = _matmul_nn(D1, U2, NP, n_idx, LOW_PREC) + _matmul_nn(U1, D2, NP, n_idx, LOW_PREC)
     return D, U
 
 
 @triton.jit
-def _pair_mul_alt(D1, U1, D2, U2, R, NP: tl.constexpr, n_idx):
+def _pair_mul_alt(D1, U1, D2, U2, R, NP: tl.constexpr, n_idx, LOW_PREC: tl.constexpr = False):
     ### Structured block product:
     ### [[D1, U1], [0, D1]] @ [[D2, U2], [0, D2]] = [[D1@D2, D1@U2 + U1@D2], [0, D1@D2]]
-    D = _matmul_nn(D1, D2, NP, n_idx)
-    U = _matmul_nn(D1, U2, NP, n_idx) + _matmul_nn(U1, D2, NP, n_idx)
+    D = _matmul_nn(D1, D2, NP, n_idx, LOW_PREC)
+    U = _matmul_nn(D1, U2, NP, n_idx, LOW_PREC) + _matmul_nn(U1, D2, NP, n_idx, LOW_PREC)
     return D, U
 
 
@@ -179,6 +186,7 @@ def _expm_t18_structured_fwd(
     NP:        tl.constexpr,
     MAX_S:     tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    LOW_PREC:  tl.constexpr = False,
 ):
     pid_b  = tl.program_id(0)
     n_idx  = tl.arange(0, NP)
@@ -213,9 +221,9 @@ def _expm_t18_structured_fwd(
     ### M^2 = (D2, U2)
     ### M^3 = (D3, U3)
     ### M^6 = (D6, U6)
-    D2, U2 = _pair_mul(D1, U1, D1, U1, NP, n_idx)
-    D3, U3 = _pair_mul(D2, U2, D1, U1, NP, n_idx)
-    D6, U6 = _pair_mul(D3, U3, D3, U3, NP, n_idx)
+    D2, U2 = _pair_mul(D1, U1, D1, U1, NP, n_idx, LOW_PREC)
+    D3, U3 = _pair_mul(D2, U2, D1, U1, NP, n_idx, LOW_PREC)
+    D6, U6 = _pair_mul(D3, U3, D3, U3, NP, n_idx, LOW_PREC)
 
     ### Identity contributes only to diagonal blocks.
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
@@ -241,7 +249,7 @@ def _expm_t18_structured_fwd(
     UB5 = _b24 * U2 + _b34 * U3 + _b64 * U6
 
     ### A9 = B1 @ B5 + B4
-    DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx)
+    DA9_tmp, UA9_tmp = _pair_mul(DB1, UB1, DB5, UB5, NP, n_idx, LOW_PREC)
 
     DA9 = DA9_tmp + DB4
     UA9 = UA9_tmp + UB4
@@ -250,7 +258,7 @@ def _expm_t18_structured_fwd(
     DC = DB3 + DA9
     UC = UB3 + UA9
 
-    DCA9, UCA9 = _pair_mul(DC, UC, DA9, UA9, NP, n_idx)
+    DCA9, UCA9 = _pair_mul(DC, UC, DA9, UA9, NP, n_idx, LOW_PREC)
 
     DT18 = DB2 + DCA9
     UT18 = UB2 + UCA9
@@ -260,7 +268,7 @@ def _expm_t18_structured_fwd(
     s_val = tl.load(s_ptr).to(tl.int32)
 
     for i in tl.static_range(MAX_S):
-        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx)
+        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
         DT18 = tl.where(s_val > i, D_sq, DT18)
         UT18 = tl.where(s_val > i, U_sq, UT18)
 
@@ -288,6 +296,7 @@ def _expm_t18_fwd(
     NP:        tl.constexpr,             # next_pow2(N) — Triton tile size
     MAX_S:     tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    LOW_PREC:  tl.constexpr = False,
 ):
     pid_b  = tl.program_id(0)
     n_idx  = tl.arange(0, NP)
@@ -306,9 +315,9 @@ def _expm_t18_fwd(
 
     ### A^2, A^3, A^6 — see _matmul_nn for why we don't use the naïve
     ### broadcast+sum contraction.
-    A2 = _matmul_nn(A,  A,  NP, n_idx)
-    A3 = _matmul_nn(A2, A,  NP, n_idx)
-    A6 = _matmul_nn(A3, A3, NP, n_idx)
+    A2 = _matmul_nn(A,  A,  NP, n_idx, LOW_PREC)
+    A3 = _matmul_nn(A2, A,  NP, n_idx, LOW_PREC)
+    A6 = _matmul_nn(A3, A3, NP, n_idx, LOW_PREC)
 
     ### Identity (NP×NP).  Padded diag ones live only in the [N:,N:] block.
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
@@ -320,16 +329,16 @@ def _expm_t18_fwd(
     B5 = _b24 * A2 + _b34 * A3 + _b64 * A6
 
     ### A9 = B1 @ B5 + B4
-    A9 = _matmul_nn(B1, B5, NP, n_idx) + B4
+    A9 = _matmul_nn(B1, B5, NP, n_idx, LOW_PREC) + B4
 
     ### T18 = B2 + (B3 + A9) @ A9
-    T18 = B2 + _matmul_nn(B3 + A9, A9, NP, n_idx)
+    T18 = B2 + _matmul_nn(B3 + A9, A9, NP, n_idx, LOW_PREC)
 
     ### Repeated squaring, gated by global s. Always evaluates the matmul;
     ### The wasted work is uniform across the grid and small vs polynomial.
     s_val = tl.load(s_ptr).to(tl.int32)
     for i in tl.static_range(MAX_S):
-        T18_sq = _matmul_nn(T18, T18, NP, n_idx)
+        T18_sq = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
         T18    = tl.where(s_val > i, T18_sq, T18)
 
     ### Store output
@@ -379,6 +388,7 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         *A_fp32.stride(), *out.stride(),
         N=N, NP=NP, MAX_S=_MAX_S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
+        LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
     return out
 
@@ -419,6 +429,7 @@ def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: t
         *X.stride(), *G.stride(), *out.stride(),
         N=N, NP=NP, MAX_S=_MAX_S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
+        LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
     return out
 
@@ -498,7 +509,7 @@ def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
 ### Helper for the augmented forcing matrix exp([[A, I]; [0, 0]])
 ###
 @triton.jit
-def _blk_mul_c(D1, U1, c1, D2, U2, c2, NP: tl.constexpr, n_idx):
+def _blk_mul_c(D1, U1, c1, D2, U2, c2, NP: tl.constexpr, n_idx, LOW_PREC: tl.constexpr = False):
     """Structured block product for the augmented forcing matrix.
 
     A block triple (D, U, c) represents [[D, U], [0, c*I]].  The product
@@ -511,8 +522,8 @@ def _blk_mul_c(D1, U1, c1, D2, U2, c2, NP: tl.constexpr, n_idx):
     structure [[D,U],[0,D]] (lower-right block = D); here the lower-right
     block is c*I, so the scalar c must be tracked and propagated.
     """
-    D = _matmul_nn(D1, D2, NP, n_idx)
-    U = _matmul_nn(D1, U2, NP, n_idx) + c2 * U1
+    D = _matmul_nn(D1, D2, NP, n_idx, LOW_PREC)
+    U = _matmul_nn(D1, U2, NP, n_idx, LOW_PREC) + c2 * U1
     c = c1 * c2
     return D, U, c
 
@@ -540,6 +551,7 @@ def _expm_t18_augmented_fwd(
     NP:        tl.constexpr,
     MAX_S:     tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    LOW_PREC:  tl.constexpr = False,
 ):
     """Structured T18 forward for Z = [[A, I], [0, 0]].
 
@@ -570,9 +582,9 @@ def _expm_t18_augmented_fwd(
 
     ### Structured powers of Z.  Each has c = 0 (0^k = 0 for k >= 1), so the
     ### c2*U1 cross-term vanishes for every Z-power product.
-    D2, U2, c2 = _blk_mul_c(D1, U1, c1, D1, U1, c1, NP, n_idx)
-    D3, U3, c3 = _blk_mul_c(D2, U2, c2, D1, U1, c1, NP, n_idx)
-    D6, U6, c6 = _blk_mul_c(D3, U3, c3, D3, U3, c3, NP, n_idx)
+    D2, U2, c2 = _blk_mul_c(D1, U1, c1, D1, U1, c1, NP, n_idx, LOW_PREC)
+    D3, U3, c3 = _blk_mul_c(D2, U2, c2, D1, U1, c1, NP, n_idx, LOW_PREC)
+    D6, U6, c6 = _blk_mul_c(D3, U3, c3, D3, U3, c3, NP, n_idx, LOW_PREC)
 
     ### Polynomial blocks.  The identity carries c = 1, so each block's
     ### scalar is its identity coefficient (a01=b01=b04=b14=0, hence
@@ -603,7 +615,7 @@ def _expm_t18_augmented_fwd(
     cB5 = 0.0
 
     ### A9 = B1 @ B5 + B4
-    DA9_tmp, UA9_tmp, cA9_tmp = _blk_mul_c(DB1, UB1, cB1, DB5, UB5, cB5, NP, n_idx)
+    DA9_tmp, UA9_tmp, cA9_tmp = _blk_mul_c(DB1, UB1, cB1, DB5, UB5, cB5, NP, n_idx, LOW_PREC)
     DA9 = DA9_tmp + DB4
     UA9 = UA9_tmp + UB4
     cA9 = cA9_tmp + cB4
@@ -612,7 +624,7 @@ def _expm_t18_augmented_fwd(
     DC = DB3 + DA9
     UC = UB3 + UA9
     cC = cB3 + cA9
-    DCA9, UCA9, cCA9 = _blk_mul_c(DC, UC, cC, DA9, UA9, cA9, NP, n_idx)
+    DCA9, UCA9, cCA9 = _blk_mul_c(DC, UC, cC, DA9, UA9, cA9, NP, n_idx, LOW_PREC)
     DT18 = DB2 + DCA9
     UT18 = UB2 + UCA9
     cT18 = cB2 + cCA9
@@ -620,7 +632,7 @@ def _expm_t18_augmented_fwd(
     ### Repeated squaring: (D, U, c)^2 = (D@D, D@U + c*U, c^2).
     s_val = tl.load(s_ptr).to(tl.int32)
     for i in tl.static_range(MAX_S):
-        D_sq, U_sq, c_sq = _blk_mul_c(DT18, UT18, cT18, DT18, UT18, cT18, NP, n_idx)
+        D_sq, U_sq, c_sq = _blk_mul_c(DT18, UT18, cT18, DT18, UT18, cT18, NP, n_idx, LOW_PREC)
         DT18 = tl.where(s_val > i, D_sq, DT18)
         UT18 = tl.where(s_val > i, U_sq, UT18)
         cT18 = tl.where(s_val > i, c_sq, cT18)
@@ -673,6 +685,7 @@ def _expm_t18_augmented_no_grad(
         *A_fp32.stride(), *E.stride(), *psi.stride(),
         N=N, NP=NP, MAX_S=_MAX_S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
+        LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
     return E, psi
 
