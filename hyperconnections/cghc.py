@@ -150,7 +150,7 @@ class ContinuousGenHyperConnections(nn.Module):
         else:
             read_in_init = torch.full((self.m, self.n), -5.0)
             for j in range(self.m):
-                read_in_init[j, j] = 5.0
+                read_in_init[j, j % self.n] = 5.0
             self.read_in.data.copy_(read_in_init.T)
 
         # write_out (semantic [n, m]): round-robin, matching GHC. Stream i writes
