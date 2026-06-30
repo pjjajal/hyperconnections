@@ -1,26 +1,28 @@
-# This is the constant forcing variant of CGHC.
+# Constant-forcing variant of CGHC.
+#
+# Exact integration of dx/dt = Ax + f over one step gives:
+#   x(1) = exp(A) x(0) + φ₁(A) f
+# where φ₁(A) = ∫₀¹ exp(θA) dθ.
+# Both exp(A) and φ₁(A) are computed together without materializing the 2n×2n
+# augmented system (see expm_t18_augmented_sparse in ops).
 
-import math
-from dataclasses import dataclass
 from typing import Literal
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from einops import einsum
-from timm.layers import trunc_normal_
 
-from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, stream_mix_add
+from hyperconnections.cghc import ContinuousGenHyperConnections
+from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, expm_t18_block_triton
 
 
-class ContinuousGenHyperConnectionsForced(nn.Module):
+class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
     def __init__(
         self,
         n: int,
         m: int,
         input_dim: int,
         embed_dim: int,
-        module: nn.Module,
+        module: torch.nn.Module,
         dt: float = 0.01,
         generator_type: Literal[
             "conservative",
@@ -39,427 +41,58 @@ class ContinuousGenHyperConnectionsForced(nn.Module):
         elementwise_affine: bool = False,
         use_triton: bool = True,
         vec_dt: bool = False,
-        use_expm_t18: bool = False,
+        shortconv_kernel_size: int = 0,
+        shortconv_causal: bool = True,
     ):
-        super().__init__()
-        self.n = n
-        self.m = m
-        self.input_dim = input_dim
-        self.embed_dim = embed_dim
-        self.generator_type = generator_type
-        self.projection = projection
-        self.use_expm_t18 = use_expm_t18
-
-        assert embed_dim % m == 0, (
-            f"embed_dim ({embed_dim}) must be divisible by m ({m})"
+        super().__init__(
+            n=n,
+            m=m,
+            input_dim=input_dim,
+            embed_dim=embed_dim,
+            module=module,
+            dt=dt,
+            generator_type=generator_type,
+            projection=projection,
+            learn_dt=learn_dt,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            bias=bias,
+            elementwise_affine=elementwise_affine,
+            use_triton=use_triton,
+            vec_dt=vec_dt,
+            shortconv_kernel_size=shortconv_kernel_size,
+            shortconv_causal=shortconv_causal,
         )
-        assert input_dim == int((n / m) * embed_dim), (
-            f"input_dim must be (n/m)*embed_dim, got {input_dim} vs {int((n / m) * embed_dim)}"
-        )
+        ### Custom-kernel path for the forced exponential (exp(A), φ₁(A)), gated on the
+        ### same use_triton flag as the base class's _matrix_exp / _stream_mix dispatch.
+        self._use_block_triton = bool(use_triton and HAS_TRITON)
 
-        self.block_size = embed_dim // m
-
-        # Read/write parameters following mHC convention
-        self.read_in = nn.Parameter(torch.empty(n, m))
-        self.alpha_read_in = nn.Parameter(torch.empty(1))
-        self.write_out = nn.Parameter(torch.empty(n, m))
-        self.alpha_write_out = nn.Parameter(torch.empty(1))
-
-        self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
-        self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
-
-        # dt parameters
-        assert dt_min < dt < dt_max, (
-            f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
-        )
-        self.dt_min_cons = dt_min
-        self.dt_max_cons = dt_max
-        self.dt_min_diss = dt_min
-        self.dt_max_diss = dt_max
-        self.log_dt_init_cons = math.log(dt)
-        self.log_dt_init_diss = math.log(dt)
-        self.vec_dt = vec_dt
-        n_dt = n if vec_dt else 1
-        self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
-        self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
-
-        # Generator parameters — boolean flags drive which components are created
-        conserv = generator_type in {
-            "conservative",
-            "conservative_diag_diss",
-            "conservative_psd_diss",
-            "conservative_laplacian",
-        }
-        psd_diss = generator_type in {"psd_diss", "conservative_psd_diss"}
-        diag_diss = generator_type in {"diagonal_diss", "conservative_diag_diss"}
-        laplacian = generator_type in {"laplacian", "conservative_laplacian"}
-
-        if conserv:
-            self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conv_pred = nn.Linear(input_dim, n * n, bias=False)
-        if psd_diss:
-            self.diss_A = nn.Parameter(torch.zeros(n, n))
-            self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
-        if diag_diss:
-            self.diss_diag = nn.Parameter(torch.full((n,), -8.0, requires_grad=True))
-            self.diss_pred = nn.Linear(input_dim, n, bias=False)
-        if laplacian:
-            self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=False)
-
-        # Projection Direction
-        if projection == "mean":
-            self.register_buffer("projection_dir", torch.ones(n) / math.sqrt(n))
-        elif projection == "v":
-            self.register_buffer("base_projection_dir", torch.ones(n) / math.sqrt(n))
-            self.projection_dir = nn.Linear(input_dim, n, bias=False)
-        elif projection == "none":
-            self.projection_dir = None
-
-        self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
-        self.module = module
-        self._stream_mix = (
-            self._stream_mix_triton
-            if use_triton and HAS_TRITON
-            else self._stream_mix_eager
-        )
-        self.init_weights()
-
-    def init_weights(self):
-        # read_in: σ(bias) = 1/n  →  bias = log(1/(n-1))
-        logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
-        nn.init.constant_(self.read_in, logit_1_over_n)
-        with torch.no_grad():
-            self.read_in.add_(
-                torch.randn_like(self.read_in) * 0.01
-            )  # small noise for asymmetry breaking
-        # write_out: 2·σ(0) = 1
-        trunc_normal_(self.write_out, std=0.01)
-        # Alpha gating: 0.01 so dynamic component starts negligible
-        nn.init.constant_(self.alpha_read_in, 0.01)
-        nn.init.constant_(self.alpha_write_out, 0.01)
-
-        # Generator Static Parameters
-        if hasattr(self, "conserv_A"):
-            nn.init.eye_(self.conserv_A)
-            # Small asymmetry so skew-sym part is non-zero at init
-            with torch.no_grad():
-                noise = torch.empty_like(self.conserv_A)
-                trunc_normal_(noise, std=0.01)
-                self.conserv_A.add_(noise)
-
-        if hasattr(self, "diss_A"):
-            trunc_normal_(self.diss_A, std=0.01)
-
-        if hasattr(self, "diss_diag"):
-            nn.init.constant_(self.diss_diag, -8.0)
-
-        if hasattr(self, "laplacian_A"):
-            nn.init.constant_(self.laplacian_A, -8.0)
-
-        # Generator Dynamic Parameters
-        if hasattr(self, "conv_pred"):
-            nn.init.zeros_(self.conv_pred.weight)
-
-        if hasattr(self, "diss_pred"):
-            nn.init.zeros_(self.diss_pred.weight)
-
-        if hasattr(self, "laplacian_pred"):
-            nn.init.zeros_(self.laplacian_pred.weight)
-
-        # Initialize log_dt so that sigmoid(log_dt) * (dt_max - dt_min) + dt_min = dt_init.
-        # log_dt has length n_dt (1 when vec_dt=False, n when vec_dt=True).
-        dt_init_cons = math.exp(self.log_dt_init_cons)
-        target = (dt_init_cons - self.dt_min_cons) / (
-            self.dt_max_cons - self.dt_min_cons
-        )
-        target = min(max(target, 1e-4), 1 - 1e-4)
-        bias_init = math.log(target / (1 - target))
-        nn.init.constant_(self.log_dt_conserv, bias_init)
-
-        dt_init_diss = math.exp(self.log_dt_init_diss)
-        target = (dt_init_diss - self.dt_min_diss) / (
-            self.dt_max_diss - self.dt_min_diss
-        )
-        target = min(max(target, 1e-4), 1 - 1e-4)
-        bias_init = math.log(target / (1 - target))
-        nn.init.constant_(self.log_dt_diss, bias_init)
-
-        # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
-        trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_conserv.bias)
-        trunc_normal_(self.dt_proj_diss.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_diss.bias)
-
-        # Projections: small random init for weights, zero bias so initial mean behaviour matches static biases
-        for proj in (self.proj_read_in, self.proj_write_out):
-            trunc_normal_(proj.weight, std=0.01)
-            if proj.bias is not None:
-                nn.init.zeros_(proj.bias)
-
-        # mean projection: set to mean direction.
-        # small noise for asymmetry breaking so projection isn't exactly static at init, but normalised to keep initial scale consistent.
-        if self.projection == "mean":
-            self.projection_dir.fill_(1.0 / math.sqrt(self.n))
-            with torch.no_grad():
-                self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01)
-                self.projection_dir.div_(self.projection_dir.norm())
-        # proj_v: zero init for weights to start at base_projection_dir with input-dependent variation
-        if self.projection == "v":
-            self.base_projection_dir.fill_(1.0 / math.sqrt(self.n))
-            nn.init.zeros_(self.projection_dir.weight)
-
-        # RMSNorm weights: must be ones for proper normalization
-        if hasattr(self.norm, "weight") and self.norm.weight is not None:
-            nn.init.ones_(self.norm.weight)
-
-    def compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Return the effective generator A of shape [B, n, n].
-
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-
-        When vec_dt=True, each stream has its own time scale and the generator is
-        built via a symmetric congruence sandwich:
-
-            A = D_S^{1/2} (S) D_S^{1/2}  -  D_Q^{1/2} (Q) D_Q^{1/2}
-
-        where D_S = diag(dt_conserv), D_Q = diag(dt_diss), each with shape [B, n]
-        and entries in (dt_min, dt_max). The sandwich preserves skew-symmetry of S
-        and PSD-ness of Q, so the Lyapunov stability argument carries through.
-        For the diagonal dissipation case, D_Q^{1/2} diag(d) D_Q^{1/2} = diag(dt_diss * d).
-
-        When vec_dt=False, dt_conserv and dt_diss are scalars (shape [B, 1]) shared
-        across all streams, reducing the sandwich to a simple scalar scaling:
-
-            A = dt_conserv * S  -  dt_diss * Q
-        """
-        B = x_norm.shape[0]
-        A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=x_norm.dtype)
-
-        # --- Conservative branch ---
-        if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conv_pred(x_norm).reshape(B, self.n, self.n)
-            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min_cons + (
-                self.dt_max_cons - self.dt_min_cons
-            ) * torch.sigmoid(logit_conserv)
-            skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                skew_dt = dt_conserv.unsqueeze(-1) * skew
-            else:
-                # Per-stream sandwich: (D^{1/2} skew D^{1/2})_{ij} = sqrt_dt_i * skew_{ij} * sqrt_dt_j
-                sqrt_dt_conserv = dt_conserv.sqrt()  # [B, n]
-                skew_dt = (
-                    sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
-                )
-
-            A = A + skew_dt
-
-        # --- Shared dissipative dt ---
-        if (
-            hasattr(self, "diss_A")
-            or hasattr(self, "diss_diag")
-            or hasattr(self, "laplacian_A")
-        ):
-            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min_diss + (
-                self.dt_max_diss - self.dt_min_diss
-            ) * torch.sigmoid(logit_diss)
-            sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
-
-        # --- PSD dissipative (Gram matrix) branch ---
-        if hasattr(self, "diss_A"):
-            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                diss_dt = dt_diss.unsqueeze(-1) * K
-            else:
-                # Per-stream sandwich: (D^{1/2} K D^{1/2})_{ij} = sqrt_dt_i * K_{ij} * sqrt_dt_j
-                diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
-            A = A - diss_dt
-
-        # --- Diagonal dissipative branch ---
-        if hasattr(self, "diss_diag"):
-            d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
-            # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
-            # = diag(dt_diss * d)
-            A = A - torch.diag_embed(
-                dt_diss * d
-            )  # dt_diss [B,1] * d [B,n] broadcasts correctly
-
-        # --- Laplacian dissipative branch ---
-        if hasattr(self, "laplacian_A"):
-            score_bias = self.laplacian_A
-            scores = self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
-            scores = score_bias + scores
-            scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
-            adjacency = F.softplus(scores)
-            adjacency = adjacency - torch.diag_embed(
-                torch.diagonal(adjacency, dim1=-2, dim2=-1)
-            )
-            degree = torch.diag_embed(adjacency.sum(dim=-1))
-            laplacian = degree - adjacency  # PSD
-            if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
-                laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
-            else:
-                laplacian_dt = (
-                    sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
-                )
-            A = A - laplacian_dt
-
-        return A
-
-    def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Return Phi = exp(dt * A), shape [B, n, n].
-
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-        """
-        A = self.compute_generator(x_norm)
-        return torch.linalg.matrix_exp(A.float()).to(x_norm.dtype)
-
-    # This is a manual graph break so that the inner function is compiled with max-autotune
+    # Manual graph break: an outer torch.compile treats the forced exp unit (Triton kernel
+    # or max-autotune eager) as opaque instead of tracing into it.
     @torch.compiler.disable(recursive=False)
-    def _expm_t18(self, A: torch.Tensor):
-        """Compute matrix exponential using expm_t18 approximation."""
+    def _expm_block(self, A: torch.Tensor):
+        """Return (exp(A), φ₁(A)) via the Triton forced kernel when available, else eager."""
+        if self._use_block_triton:
+            return expm_t18_block_triton(A)
         return expm_t18_augmented_sparse(A)
 
-    def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Alternative transition computation using expm_t18 approximation for efficiency.
+    def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (exp(A), φ₁(A)), both of shape [B, n, n].
 
         Args:
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        transition_matrix, psi = self._expm_t18(A.float())
+        transition_matrix, psi = self._expm_block(A.float())
         return transition_matrix.to(x_norm.dtype), psi.to(x_norm.dtype)
 
-    def compute_read_write_weights(self, x_norm: torch.Tensor):
-        """Compute dynamic read/write weights from the current stream state.
+    def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Return exp(A) only, shape [B, n, n]. Delegates to compute_transition_expm_t18."""
+        transition, _ = self.compute_transition_expm_t18(x_norm)
+        return transition
 
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-        """
-        B = x_norm.shape[0]
-
-        h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
-        h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
-
-        read_in = torch.sigmoid(
-            self.alpha_read_in * h_read_in + self.read_in
-        ).transpose(1, 2)  # [B, m, n]
-        write_out = 2 * torch.sigmoid(
-            self.alpha_write_out * h_write_out + self.write_out
-        )  # [B, n, m]
-
-        return write_out, read_in
-
-    def compute_projection(self, x_norm: torch.Tensor):
-        """Compute projection direction.
-
-        Args:
-            x_norm: Normalized input of shape [B, input_dim]
-        """
-        if self.projection == "mean":
-            return self.projection_dir.unsqueeze(0)  # [1, n]
-        elif self.projection == "v":
-            v = self.projection_dir(x_norm) + self.base_projection_dir  # [B, n]
-            return F.normalize(v, dim=-1)  # [B, n], unit norm
-        else:
-            return None
-
-    def _stream_mix_triton(
-        self,
-        x: torch.Tensor,
-        transition_matrix: torch.Tensor,
-        Y: torch.Tensor,
-        projection_dir: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if projection_dir is not None:
-            projection_dir = projection_dir.expand(
-                x.shape[0], -1
-            )  ### [1, N] ("mean" mode) --> [B, N]
-        return stream_mix_add(transition_matrix, x, Y, projection_dir)
-
-    def _stream_mix_eager(
-        self,
-        x: torch.Tensor,
-        transition_matrix: torch.Tensor,
-        Y: torch.Tensor,
-        projection_dir: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if projection_dir is None:
-            x_mixed = einsum(
-                transition_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [B*, n, block_size]
-        else:
-            proj_matrix = einsum(
-                projection_dir, projection_dir, "b n1, b n2 -> b n1 n2"
-            )  # [b, n, n]
-            orthogonal_proj = (
-                torch.eye(self.n, device=x.device, dtype=x.dtype) - proj_matrix
-            )  # [b, n, n]
-            x_proj = einsum(
-                proj_matrix, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [b, n, block_size]
-            x_orth = einsum(
-                orthogonal_proj, x, "b n1 n2, b n2 d -> b n1 d"
-            )  # [b, n, block_size]
-            x_mixed = x_proj + einsum(
-                transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
-            )  # [B*, n, block_size]
-        return x_mixed + Y
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            x: [B, *, input_dim]  (any number of leading dims, last dim = n * block_size)
-        Returns:
-            [B, *, input_dim]
-        """
-        ### x: [B, *, input_dim]
-        leading = x.shape[:-1]
-        x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
-        B = x.shape[0]
-        x_norm = self.norm(x.view(B, -1))  ### [B*, input_dim]
-
-        write_out, read_in = self.compute_read_write_weights(x_norm)
-
-        ### Source term Y = H^post F(H^pre X)  (read → compute → write)
-        ### Read in from over-width space to backbone width
-        x_read = einsum(read_in, x, "b m n, b n d -> b m d")  ### [B*, m, block_size]
-
-        ### Process through the backbone module
-        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
-
-        ### Write out from backbone width back to the over-width space
-        out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
-        Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
-
-        ### Stream Mixing
-        # Exact integration of dx/dt = Ax + f over one step gives:
-        #   x(1) = exp(A) x(0) + phi_1(A) f
-        # where phi_1(A) = integral_0^1 exp(theta A) d theta.
-        # transition_matrix = exp(A), psi = phi_1(A), both computed together
-        # without materializing the 2n x 2n augmented matrix.
-        transition_matrix, psi = self.compute_transition_expm_t18(x_norm)
-        Y = einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")
-
-        projection_dir = self.compute_projection(x_norm)  ### [B, n] or None
-
-        return (
-            self._stream_mix(
-                x=x,
-                transition_matrix=transition_matrix,
-                Y=Y,
-                projection_dir=projection_dir,
-            )
-            .unflatten(0, leading)
-            .flatten(-2)
-        )
+    def _transition_and_source(
+        self, x_norm: torch.Tensor, Y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        transition, psi = self.compute_transition_expm_t18(x_norm)
+        return transition, einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")

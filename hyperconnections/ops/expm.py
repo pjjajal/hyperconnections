@@ -15,10 +15,6 @@ from .numbers import (
 )
 
 
-@torch.compile(
-    fullgraph=True,
-    mode="max-autotune",
-)
 def expm_t18(A: torch.Tensor, S: int = 8) -> torch.Tensor:
     """Compute the matrix exponential of A using the T_18 Taylor approximation.
 

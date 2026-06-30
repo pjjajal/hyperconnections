@@ -79,10 +79,6 @@ def _blk_lincomb5(c0, X0, c1, X1, c2, X2, c3, X3, c4, X4):
     )
 
 
-# @torch.compile(
-#     fullgraph=True,
-#     mode="max-autotune",
-# )
 def expm_t18_augmented_sparse(A: torch.Tensor):
     """Structured T_18 exponential of [[A, I], [0, 0]].
 

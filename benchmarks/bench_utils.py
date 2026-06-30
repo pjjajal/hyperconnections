@@ -16,6 +16,7 @@ _RESET  = "\033[0m"
 _GREEN  = "\033[92m"
 _RED    = "\033[91m"
 _YELLOW = "\033[93m"
+_CYAN   = "\033[96m"
 _BOLD   = "\033[1m"
 
 
@@ -25,6 +26,7 @@ def _col(text: str, code: str) -> str:
 def ok(s="PASS"): return _col(s, _GREEN)
 def fail(s):      return _col(s, _RED)
 def warn(s):      return _col(s, _YELLOW)
+def cyan(s):      return _col(s, _CYAN)
 def bold(s):      return _col(s, _BOLD)
 
 

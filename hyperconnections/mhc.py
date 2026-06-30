@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from einops import einsum
 from timm.layers import trunc_normal_
 
+from hyperconnections.short_conv import DepthwiseShortConv1d
+
 
 # Input Dimension: d_in = (n / m) * embed_dim
 # n / m is the expansion ratio of the embedding dimension.
@@ -30,6 +32,8 @@ class ManifoldHyperConnections(nn.Module):
         elementwise_affine: bool = False,
         sinkhorn_iters: int = 20,
         sinkhorn_bias_init: float = _SINKHORN_BIAS_INIT,
+        shortconv_kernel_size: int = 0,
+        shortconv_causal: bool = True,
     ):
         super().__init__()
         self.n = n
@@ -65,6 +69,12 @@ class ManifoldHyperConnections(nn.Module):
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
 
         self.module = module
+        # Optional over-width short conv on the read/source path (see forward).
+        self.short_conv = (
+            DepthwiseShortConv1d(input_dim, shortconv_kernel_size, causal=shortconv_causal)
+            if shortconv_kernel_size > 0
+            else None
+        )
         self.init_weights()
 
     def init_weights(self):
@@ -128,14 +138,22 @@ class ManifoldHyperConnections(nn.Module):
         x = x.reshape(-1, self.n, self.block_size)  # [B*, n, block_size]
         B = x.shape[0]
 
-        write_out, read_in, stream_mixing = self.compute_mixing_weights(x)
+        # Optional over-width short conv on the read/source path only: it feeds the
+        # read-in and the mixing weights, while the carried stream `x` that gets
+        # stream-mixed stays un-convolved.
+        if self.short_conv is not None:
+            src = self.short_conv(x.reshape(*leading, self.input_dim)).reshape(B, self.n, self.block_size)
+        else:
+            src = x
+
+        write_out, read_in, stream_mixing = self.compute_mixing_weights(src)
         write_out = write_out.to(x.dtype)
         read_in = read_in.to(x.dtype)
         stream_mixing = stream_mixing.to(x.dtype)
         # [B*, n, m], [B*, m, n], [B*, n, n]
 
         # Read in from the over-width space to backbone width
-        x_read_in = einsum(read_in, x, "b m n, b n d -> b m d")  # [B*, m, block_size]
+        x_read_in = einsum(read_in, src, "b m n, b n d -> b m d")  # [B*, m, block_size]
 
         # Process through the backbone module
         out = self.module(x_read_in.reshape(*leading, self.embed_dim), **kwargs)

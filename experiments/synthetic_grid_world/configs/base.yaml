@@ -1,0 +1,32 @@
+exp_name: base
+
+data:
+  n_samples: 100000
+  n_rows: 6
+  n_cols: 6
+  n_colours: 2
+  trajectory_length: 16
+  ambiguous_threshold: 0.8
+  final_unique: true
+  seed: 532
+
+model:
+  dim: 64
+  num_heads: 8
+  ffn_ratio: 4
+  num_layers: 4
+  qkv_bias: false
+  proj_bias: true
+  hc:
+    type: null
+
+training:
+  batch_size: 32
+  epochs: 50
+  lr: 3e-4
+  weight_decay: 0.01
+  device: auto
+
+logging:
+  log_dir: experiments/synthetic_grid_world/runs
+  run_name: null
