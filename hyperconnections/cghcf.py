@@ -12,7 +12,7 @@ import torch
 from einops import einsum
 
 from hyperconnections.cghc import ContinuousGenHyperConnections
-from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, expm_t18_block_triton
+from hyperconnections.ops import expm_t18_augmented_sparse
 
 
 class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
@@ -63,17 +63,10 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
             shortconv_kernel_size=shortconv_kernel_size,
             shortconv_causal=shortconv_causal,
         )
-        ### Custom-kernel path for the forced exponential (exp(A), φ₁(A)), gated on the
-        ### same use_triton flag as the base class's _matrix_exp / _stream_mix dispatch.
-        self._use_block_triton = bool(use_triton and HAS_TRITON)
 
-    # Manual graph break: an outer torch.compile treats the forced exp unit (Triton kernel
-    # or max-autotune eager) as opaque instead of tracing into it.
+    # This is a manual graph break so that the inner function is compiled with max-autotune
     @torch.compiler.disable(recursive=False)
-    def _expm_block(self, A: torch.Tensor):
-        """Return (exp(A), φ₁(A)) via the Triton forced kernel when available, else eager."""
-        if self._use_block_triton:
-            return expm_t18_block_triton(A)
+    def _expm_t18(self, A: torch.Tensor):
         return expm_t18_augmented_sparse(A)
 
     def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,7 +76,7 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
             x_norm: Normalized input of shape [B, input_dim]
         """
         A = self.compute_generator(x_norm)
-        transition_matrix, psi = self._expm_block(A.float())
+        transition_matrix, psi = self._expm_t18(A.float())
         return transition_matrix.to(x_norm.dtype), psi.to(x_norm.dtype)
 
     def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:

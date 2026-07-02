@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 
 from hyperconnections.cghc import ContinuousGenHyperConnections
-from tests.conftest import IdentityModule, ZeroModule, should_use_triton
+from tests.conftest import IdentityModule, ZeroModule
 
 
 CONFIGS = [
@@ -41,21 +41,14 @@ def make_cghc(
     m: int,
     embed_dim: int,
     module: nn.Module | None = None,
-    device: str = "cpu",
-    use_triton: bool | None = None,
     **kwargs,
 ) -> ContinuousGenHyperConnections:
     input_dim = (n * embed_dim) // m
     if module is None:
         module = IdentityModule()
-    # Toggle the custom-kernel flag to match the device unless explicitly set:
-    # Triton kernels need CUDA tensors, so a CPU model must run the eager path.
-    if use_triton is None:
-        use_triton = should_use_triton(device)
     return ContinuousGenHyperConnections(
-        n=n, m=m, input_dim=input_dim, embed_dim=embed_dim, module=module,
-        use_triton=use_triton, **kwargs
-    ).to(device)
+        n=n, m=m, input_dim=input_dim, embed_dim=embed_dim, module=module, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------

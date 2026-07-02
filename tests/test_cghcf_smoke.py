@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from hyperconnections.cghcf import ContinuousGenHyperConnectionsForced
-from tests.conftest import IdentityModule, should_use_triton
+from tests.conftest import IdentityModule
 
 CONFIGS = [
     (2, 1, 8),
@@ -28,21 +28,17 @@ ALL_GENERATOR_TYPES = [
 ]
 
 
-def make_cghcf(n, m, embed_dim, device="cpu", use_triton=None, **kwargs) -> ContinuousGenHyperConnectionsForced:
+def make_cghcf(n, m, embed_dim, **kwargs) -> ContinuousGenHyperConnectionsForced:
     input_dim = (n * embed_dim) // m
-    # Toggle the custom-kernel flag to match the device unless explicitly set:
-    # Triton kernels need CUDA tensors, so a CPU model must run the eager path.
-    if use_triton is None:
-        use_triton = should_use_triton(device)
     return ContinuousGenHyperConnectionsForced(
         n=n,
         m=m,
         input_dim=input_dim,
         embed_dim=embed_dim,
         module=IdentityModule(),
-        use_triton=use_triton,
+        use_triton=False,
         **kwargs,
-    ).to(device)
+    )
 
 
 @pytest.mark.parametrize("n,m,embed_dim", CONFIGS)

@@ -32,21 +32,30 @@ try:
         _SM80_A100_L1_PER_SM_BYTES,
         _SM80_A100_L2_BYTES,
     )
-    _has_triton = True
+    HAS_TRITON = True
 
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
     _small_nb = None
     _big_nb = None
-    _has_triton = False
+    HAS_TRITON = False
+
+### Playing around with new version
+# def _use_big_nb(x: torch.Tensor) -> bool:
+#     B, N, D = x.shape
+#     ### "Safety" buffer: switch kernels when x occupies > 75% of L2
+#     c = B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 75 // 100
+#     # print(f"_use_big_nb: {str(c).upper()} | [{B},{N},{D}]")
+#     return c
 
 
 def _use_big_nb(x: torch.Tensor) -> bool:
     B, N, D = x.shape
-    if N < 16 or B*N*D < _SM80_A100_L2_BYTES:
+    if N < 16 or N % 16 != 0:
         return False
-    return True
+    # "Safety" buffer: switch kernels when x occupies > 75% of L2
+    return B * N * D * x.element_size() > _SM80_A100_L2_BYTES * 0.75
 
 
 def stream_mix_add(
@@ -66,7 +75,7 @@ def stream_mix_add(
     Returns:
         out: [B, N, D]
     """
-    if not _has_triton:
+    if not HAS_TRITON:
         raise RuntimeError("stream_mix_add requires Triton")
     if not x.is_cuda:
         raise RuntimeError("stream_mix_add requires CUDA tensors")
