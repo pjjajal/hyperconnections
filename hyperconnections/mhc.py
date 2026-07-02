@@ -21,6 +21,11 @@ _SINKHORN_BIAS_INIT = 5.0
 
 
 class ManifoldHyperConnections(nn.Module):
+    ### Static anchor matrices to exclude from weight decay (saturated-logit /
+    ### identity inits — see the weight-decay note in cghc.py). Collected by
+    ### ContinuousGenHyperConnections.split_decay_param_groups via hasattr.
+    NO_DECAY_PARAM_NAMES = frozenset({"read_in", "write_out", "stream_mixing"})
+
     def __init__(
         self,
         n: int,

@@ -5,6 +5,11 @@
 # where φ₁(A) = ∫₀¹ exp(θA) dθ.
 # Both exp(A) and φ₁(A) are computed together without materializing the 2n×2n
 # augmented system (see expm_t18_augmented_sparse in ops).
+#
+# Weight decay note: this class adds no parameters of its own — the exclusions
+# listed at the top of cghc.py apply unchanged (read_in, write_out, conserv_A,
+# diss_A, laplacian_A, and all 1-D params). The inherited
+# split_decay_param_groups(model, wd) classmethod builds the right groups.
 
 from typing import Literal
 

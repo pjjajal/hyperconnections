@@ -47,6 +47,11 @@ class Attention(nn.Module):
 # when m = n, we get the regular connections, where the input dimension is embed_dim.
 # when n > m > 1, we get a generalized version of hyperconnections, where the input dimension is (n / m) * embed_dim.
 class AttentionHyperConnections(nn.Module):
+    ### Static anchor matrices to exclude from weight decay (saturated-logit
+    ### inits — see the weight-decay note in cghc.py). Collected by
+    ### ContinuousGenHyperConnections.split_decay_param_groups via hasattr.
+    NO_DECAY_PARAM_NAMES = frozenset({"read_in", "write_out"})
+
     def __init__(
         self,
         n: int,

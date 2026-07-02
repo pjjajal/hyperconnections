@@ -30,7 +30,6 @@ model:
     vec_dt: true
     elementwise_affine: true
     use_triton: false
-    use_expm_t18: true
 
 training:
   batch_size: 256

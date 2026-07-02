@@ -12,6 +12,20 @@ from einops import einsum
 # when m = n, we get the regular connections, where the input dimension is embed_dim.
 # when n > m > 1, we get a generalized version of hyperconnections, where the input dimension is (n / m) * embed_dim.
 class GeneralizedHyperConnections(nn.Module):
+    ### Static anchor matrices to exclude from weight decay (identity / round-robin
+    ### / ones inits — see the weight-decay note in cghc.py). Collected by
+    ### ContinuousGenHyperConnections.split_decay_param_groups via hasattr.
+    NO_DECAY_PARAM_NAMES = frozenset(
+        {
+            "read_in",
+            "write_out",
+            "stream_mixing",
+            "dynamic_scaling_read_in",
+            "dynamic_scaling_write_out",
+            "dynamic_scaling_stream_mixing",
+        }
+    )
+
     def __init__(
         self,
         n: int,

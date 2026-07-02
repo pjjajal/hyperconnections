@@ -152,8 +152,10 @@ class TestGeneratorStructure:
             if hasattr(cghc, "diss_diag"):
                 cghc.diss_diag.add_(torch.randn_like(cghc.diss_diag) * 0.5)
             if hasattr(cghc, "laplacian_A"):
-                # init is -8 so softplus(-8)≈0; reset to 0 to get softplus(0)≈0.693 adjacency
-                cghc.laplacian_A.fill_(0.0)
+                # log-scale starts at log(1e-3) so the Laplacian is negligible;
+                # crank the scale to 1 so the perturbed generator has a visible
+                # dissipative part (anchor is already 0 → softplus(0)≈0.693 adjacency)
+                cghc.laplacian_log_scale.fill_(0.0)
                 cghc.laplacian_A.add_(torch.randn_like(cghc.laplacian_A) * 0.1)
 
     def _x_norm(self, cghc, B=3):
@@ -184,7 +186,7 @@ class TestGeneratorStructure:
         ), "off-diagonal entries must be zero"
 
     def test_laplacian_A_small_at_init(self):
-        """laplacian_A=-8 at init gives softplus(-8)≈3e-4 adjacency → A near zero but not exact."""
+        """laplacian_log_scale=log(1e-3) at init gives ~7e-4 adjacency → A near zero but not exact."""
         cghc = make_cghc(4, 2, 8, generator_type="laplacian")
         A = cghc.compute_generator(self._x_norm(cghc))
         assert torch.allclose(A, torch.zeros_like(A), atol=1e-2), "laplacian A must be near zero at init"
@@ -206,7 +208,7 @@ class TestGeneratorStructure:
 class TestInitialTransition:
     """At initialization the dynamic predictors are zeroed, so A depends only on static params.
     Static params have small noise at init, so A is small (not exactly zero) and Phi≈I.
-    diagonal_diss is intentionally initialized with diss_diag=-8 → softplus(-8)≈3e-4 dissipation.
+    diagonal_diss/laplacian start with log_scale=log(1e-3) → ~7e-4 dissipation.
     """
 
     ALL_TYPES = [
@@ -365,7 +367,7 @@ class TestForwardBehavior:
         assert torch.allclose(cghc(x), x, atol=1e-2)
 
     @pytest.mark.parametrize("generator_type", ["diagonal_diss", "conservative_diag_diss"])
-    def test_zero_module_output_near_input_at_init(self, generator_type):
+    def test_zero_module_output_near_input_at_init_diag_diss(self, generator_type):
         """diagonal_diss has Phi≈I (not exact) so output≈x with ZeroModule."""
         n, m, embed_dim = 4, 2, 8
         cghc = make_cghc(n, m, embed_dim, generator_type=generator_type, module=ZeroModule())

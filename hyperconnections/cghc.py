@@ -1,3 +1,17 @@
+# Weight decay note: several parameters are semantic anchors whose init values
+# encode structure — decaying them toward 0 changes the dynamics rather than
+# regularizing a feature transform. Turn weight decay OFF for:
+#   - read_in, write_out             (saturated ±5 logits / round-robin pattern)
+#   - conserv_A, diss_A, laplacian_A (static generator anchors)
+#   - every 1-D parameter: alpha_*, log_dt_*, diss_diag, the *_log_scale
+#     magnitudes, norm gains, biases. Decay is actively harmful for the
+#     log-scales: dragging log(scale) from log(1e-3) toward 0 pushes the scale
+#     toward 1, *increasing* dissipation by orders of magnitude.
+# Keep decay on the read/write projections, generator predictors, dt projections,
+# and the wrapped module's weights. Use
+# ContinuousGenHyperConnections.split_decay_param_groups(model, wd) to build
+# optimizer param groups with exactly this split.
+
 import math
 from typing import Literal
 
@@ -37,7 +51,6 @@ class ContinuousGenHyperConnections(nn.Module):
         elementwise_affine: bool = False,
         use_triton: bool = True,
         vec_dt: bool = False,
-        use_expm_t18: bool = False,
         shortconv_kernel_size: int = 0,
         shortconv_causal: bool = True,
     ):
@@ -67,12 +80,22 @@ class ContinuousGenHyperConnections(nn.Module):
         self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
         self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
 
-        # dt parameters
+        # dt parameters — log-space sigmoid interpolation:
+        #   dt = exp(log dt_min + (log dt_max - log dt_min) * σ(θ))
+        # Hard-bounded like a linear sigmoid, but with uniform *relative*
+        # sensitivity across the range, so a small dt init sits on the responsive
+        # part of the curve instead of the saturated tail (dt=0.01 in (0.001, 1.0)
+        # lands at logit ≈ -0.69 rather than -4.7).
+        assert dt_min > 0, (
+            f"dt_min must be positive (dt is parameterized in log space), got {dt_min}"
+        )
         assert dt_min < dt < dt_max, (
             f"Initial dt ({dt}) must lie strictly in (dt_min, dt_max) = ({dt_min}, {dt_max})"
         )
         self.dt_min = dt_min
         self.dt_max = dt_max
+        self.log_dt_min = math.log(dt_min)
+        self.log_dt_range = math.log(dt_max) - math.log(dt_min)
         self.log_dt_init = math.log(dt)
         self.vec_dt = vec_dt
         n_dt = n if vec_dt else 1
@@ -98,11 +121,19 @@ class ContinuousGenHyperConnections(nn.Module):
         if psd_diss:
             self.diss_A = nn.Parameter(torch.zeros(n, n))
             self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
+        # Dissipation magnitude is factored out of the softplus argument:
+        #   d = exp(log_scale) * softplus(anchor + pred(x))
+        # The anchor sits at 0 (softplus'(0) = 0.5, responsive) instead of deep in
+        # the saturated tail; the shared log-scale carries the "starts tiny"
+        # magnitude and learns multiplicatively, with its gradient pooled across
+        # streams and tokens.
         if diag_diss:
-            self.diss_diag = nn.Parameter(torch.full((n,), -8.0))
+            self.diss_diag = nn.Parameter(torch.zeros(n))
+            self.diss_log_scale = nn.Parameter(torch.empty(1))
             self.diss_pred = nn.Linear(input_dim, n, bias=False)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
+            self.laplacian_log_scale = nn.Parameter(torch.empty(1))
             self.laplacian_pred = nn.Linear(input_dim, n * n, bias=False)
 
         # Projection Direction
@@ -133,7 +164,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.init_weights()
 
     def _init_log_dt(self, param: nn.Parameter) -> None:
-        target = (math.exp(self.log_dt_init) - self.dt_min) / (self.dt_max - self.dt_min)
+        target = (self.log_dt_init - self.log_dt_min) / self.log_dt_range
         target = min(max(target, 1e-4), 1 - 1e-4)
         nn.init.constant_(param, math.log(target / (1 - target)))
 
@@ -182,11 +213,16 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "diss_A"):
             trunc_normal_(self.diss_A, std=0.01)
 
+        # Dissipation anchors at 0; magnitude in the log-scale, so dissipation
+        # starts at ~1e-3 * softplus(0) ≈ 7e-4 (matching the old -8 tail init in
+        # value, but on the responsive part of the softplus).
         if hasattr(self, "diss_diag"):
-            nn.init.constant_(self.diss_diag, -8.0)
+            nn.init.zeros_(self.diss_diag)
+            nn.init.constant_(self.diss_log_scale, math.log(1e-3))
 
         if hasattr(self, "laplacian_A"):
-            nn.init.constant_(self.laplacian_A, -8.0)
+            nn.init.zeros_(self.laplacian_A)
+            nn.init.constant_(self.laplacian_log_scale, math.log(1e-3))
 
         # Generator Dynamic Parameters
         if hasattr(self, "conserv_pred"):
@@ -229,6 +265,50 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
 
+    ### Static matrices whose init values are semantic anchors (see module note).
+    ### 1-D anchors (alpha_*, log_dt_*, diss_diag) are caught by the ndim rule in
+    ### split_decay_param_groups instead. Every HC class declares its own set;
+    ### consumers collect them from submodules via hasattr (see the classmethod).
+    NO_DECAY_PARAM_NAMES = frozenset(
+        {"read_in", "write_out", "conserv_A", "diss_A", "laplacian_A"}
+    )
+
+    @staticmethod
+    def split_decay_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+        """Optimizer param groups with weight decay off where it corrupts semantics.
+
+        Anchor names are collected from every submodule class that declares
+        NO_DECAY_PARAM_NAMES, so models mixing HC variants are covered. No decay
+        for those anchors and for all ndim <= 1 parameters; everything else keeps
+        `weight_decay`.
+
+        Usage:
+            optimizer = torch.optim.AdamW(
+                ContinuousGenHyperConnections.split_decay_param_groups(model, 0.05),
+                lr=lr,
+            )
+        """
+        anchor_leafs = frozenset().union(
+            *(
+                m.NO_DECAY_PARAM_NAMES
+                for m in model.modules()
+                if hasattr(m, "NO_DECAY_PARAM_NAMES")
+            )
+        )
+        decay, no_decay = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            leaf = name.rsplit(".", 1)[-1]
+            if p.ndim <= 1 or leaf in anchor_leafs:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
     def compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
         """Return the effective generator A of shape [B, n, n].
 
@@ -249,7 +329,14 @@ class ContinuousGenHyperConnections(nn.Module):
         across all streams, reducing the sandwich to a simple scalar scaling:
 
             A = dt_conserv * S  -  dt_diss * Q
+
+        Assembled in float32 with autocast disabled: A entries are O(dt * weight),
+        near bf16 resolution early in training, and the expm consumes fp32 anyway.
         """
+        with torch.autocast(device_type=x_norm.device.type, enabled=False):
+            return self._compute_generator(x_norm.float())
+
+    def _compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
         B = x_norm.shape[0]
         A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=x_norm.dtype)
 
@@ -257,7 +344,9 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "conserv_A"):
             M = self.conserv_A + self.conserv_pred(x_norm).reshape(B, self.n, self.n)
             logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
-            dt_conserv = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_conserv)
+            dt_conserv = torch.exp(
+                self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_conserv)
+            )
             skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
@@ -278,7 +367,9 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "laplacian_A")
         ):
             logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
-            dt_diss = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(logit_diss)
+            dt_diss = torch.exp(
+                self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_diss)
+            )
             sqrt_dt_diss = dt_diss.sqrt()  # [B, n]
 
         # --- PSD dissipative (Gram matrix) branch ---
@@ -295,7 +386,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
-            d = F.softplus(self.diss_diag + self.diss_pred(x_norm))  # [B, n], positive
+            d = torch.exp(self.diss_log_scale) * F.softplus(
+                self.diss_diag + self.diss_pred(x_norm)
+            )  # [B, n], positive
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
             A = A - torch.diag_embed(
@@ -306,7 +399,7 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "laplacian_A"):
             scores = self.laplacian_A + self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
-            adjacency = F.softplus(scores)
+            adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
                 torch.diagonal(adjacency, dim1=-2, dim2=-1)
             )
@@ -324,20 +417,16 @@ class ContinuousGenHyperConnections(nn.Module):
         return A
 
     def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Return Phi = exp(dt * A), shape [B, n, n].
+        """Return Phi = exp(A), shape [B, n, n] (dt is folded into A).
 
         Args:
             x_norm: Normalized input of shape [B, input_dim]
         """
-        A = self.compute_generator(x_norm)
-        return self._matrix_exp(A)
-
-    def _expm_t18(self, A: torch.Tensor) -> torch.Tensor:
-        """Compute matrix exponential using expm_t18 approximation."""
-        return expm_t18(A)
+        A = self.compute_generator(x_norm)  # fp32
+        return self._matrix_exp(A).to(x_norm.dtype)
 
     def _matrix_exp_eager(self, A: torch.Tensor) -> torch.Tensor:
-        return self._expm_t18(A.float()).to(A.dtype)
+        return expm_t18(A.float()).to(A.dtype)
 
     def compute_read_write_weights(self, x_norm: torch.Tensor):
         """Compute dynamic read/write weights from the current stream state.

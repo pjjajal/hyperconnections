@@ -200,9 +200,10 @@ def main():
 
     # ── Optimizer ─────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        cghc.ContinuousGenHyperConnections.split_decay_param_groups(
+            model, cfg.training.weight_decay
+        ),
         lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
     )
 
     # ── Learning Rate Scheduler ───────────────────────────────────────────

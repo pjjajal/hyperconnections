@@ -579,7 +579,10 @@ def main():
         args.batch_size, args.num_workers, args.data_dir
     )
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        ContinuousGenHyperConnections.split_decay_param_groups(
+            model, args.weight_decay
+        ),
+        lr=args.lr,
     )
     criterion = nn.CrossEntropyLoss()
 
