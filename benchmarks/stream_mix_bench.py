@@ -34,33 +34,41 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
 from itertools import product
 from pathlib import Path
 from typing import Sequence
 
 import torch
-import torch._logging
-
-# torch._logging.set_logs(
-#     dynamo=logging.ERROR,
-#     aot=logging.ERROR,
-#     inductor=logging.ERROR,
-#     autotuning=False
-# )
-
+import triton
+import triton.testing
 from einops import einsum
 
 from hyperconnections.ops import stream_mix_add
 
-from bench_utils import (DEVICE, ok, fail, warn, bold, _dtype, _corr_row as _corr_row_base,
-                         bench_stats, stat_fields, logger, setup_logging)
+###
+### Helpers
+###
+DEVICE = "cuda:0"
 
+_RESET  = "\033[0m"
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_BOLD   = "\033[1m"
 
-def _corr_row(config, variant, check, max_err, atol, passed):
-    return _corr_row_base(config, variant, check, max_err, atol, passed,
-                          config_width=30, variant_width=12)
+def _col(text: str, code: str) -> str:
+    return f"{code}{text}{_RESET}" if sys.stdout.isatty() else text
+def ok(s="PASS"):
+    return _col(s, _GREEN)
+def fail(s):
+    return _col(s, _RED)
+def warn(s):
+    return _col(s, _YELLOW)
+def bold(s):
+    return _col(s, _BOLD)
+def _dtype(name: str) -> torch.dtype:
+    return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
 
 def _make(B, N, D, dtype, seed=0):
@@ -194,31 +202,27 @@ _CORR_HDR = f"{'Config':>30}  {'Variant':>12}  {'Check':>10}  {'MaxErr':>10}  {'
 _CORR_SEP = "-" * 90
 
 
-def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows):
-    """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed.
+def _corr_row(config, variant, check, max_err, atol, passed):
+    result = ok("PASS") if passed else fail("FAIL")
+    return f"{config:>30}  {variant:>12}  {check:>10}  {max_err:>10.2e}  {atol:>8.0e}  {result}"
 
-    Each check is both logged and appended to csv_rows (one dict per row) so the
-    results can be written to a correctness report, mirroring expm_bench.py.
-    """
 
-    def _emit(variant, check, err, atol, passed):
-        logger.info(_corr_row(cfg_str, variant, check, err, atol, passed))
-        csv_rows.append({"config": cfg_str, "variant": variant, "check": check,
-                         "max_err": err, "atol": atol, "passed": passed})
+def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed):
+    """Run fwd+bwd correctness for one (Phi, x, Y, v) combo; return updated all_passed."""
 
     ### forward no-proj
     got = stream_mix_add(Phi, x, Y)
     ref = ref_no_proj(Phi.float(), x.float(), Y.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    _emit("no-proj", "fwd", err, atol_f, passed)
+    print(_corr_row(cfg_str, "no-proj", "fwd", err, atol_f, passed))
 
     ### forward proj
     got = stream_mix_add(Phi, x, Y, v=v)
     ref = ref_proj(Phi.float(), x.float(), Y.float(), v.float()).to(dtype)
     passed, err = _check("", got, ref, atol_f)
     all_passed &= passed
-    _emit("proj", "fwd", err, atol_f, passed)
+    print(_corr_row(cfg_str, "proj", "fwd", err, atol_f, passed))
 
     ### backward no-proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -234,7 +238,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_ro
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        _emit("no-proj", name, err, atol_b, passed)
+        print(_corr_row(cfg_str, "no-proj", name, err, atol_b, passed))
 
     ### backward proj
     Phi_t = Phi.detach().clone().requires_grad_(True)
@@ -250,7 +254,7 @@ def _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_ro
     ]:
         passed, err = _check("", got_g, ref_g, atol_b)
         all_passed &= passed
-        _emit("proj", name, err, atol_b, passed)
+        print(_corr_row(cfg_str, "proj", name, err, atol_b, passed))
 
     return all_passed
 
@@ -266,13 +270,14 @@ def run_correctness(
     embed_dims: Sequence[int],
     bs: Sequence[int],
     dtypes: Sequence[str],
-) -> tuple[bool, list[dict]]:
-    """Run forward + backward correctness checks and print a summary table.
-
-    Returns (all_passed, csv_rows) where csv_rows holds one dict per check for
-    the correctness report (mirrors expm_bench.run_correctness).
-    """
-    logger.info("\n" + bold("=" * 90) + "\n" + bold(" CORRECTNESS — random Phi") + "\n" + bold("=" * 90) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
+):
+    """Run forward + backward correctness checks and print a summary table."""
+    print()
+    print(bold("=" * 90))
+    print(bold(" CORRECTNESS — random Phi"))
+    print(bold("=" * 90))
+    print(_CORR_HDR)
+    print(_CORR_SEP)
 
     # D = embed_dim // m; deduplicate so the table stays concise
     # (correctness only depends on D, not on how it was derived from m)
@@ -281,7 +286,6 @@ def run_correctness(
     configs += [(4, ns[0], 100)]   # non-power-of-2 D to test masking
 
     all_passed = True
-    csv_rows: list[dict] = []
 
     for dtype_name in dtypes:
         dtype  = _dtype(dtype_name)
@@ -292,13 +296,18 @@ def run_correctness(
             Phi, x, Y = _make(B, N, D, dtype)
             v = _make_v(B, N, dtype)
             cfg_str = f"B={B} N={N} D={D} {dtype_name}"
-            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
-        logger.info(_CORR_SEP)
+        print(_CORR_SEP)
 
     ### Structured Phi correctness
     ### Focused config set to keep the table concise.
-    logger.info("\n" + bold("=" * 90) + "\n" + bold("  CORRECTNESS — Structured Phi") + "\n" + bold("=" * 90) + "\n" + _CORR_HDR + "\n" + _CORR_SEP)
+    print()
+    print(bold("=" * 90))
+    print(bold("  CORRECTNESS — Structured Phi"))
+    print(bold("=" * 90))
+    print(_CORR_HDR)
+    print(_CORR_SEP)
 
     for dtype_name in dtypes:
         struct_D_vals = _derive_D_vals(ms, embed_dims)
@@ -317,14 +326,16 @@ def run_correctness(
             Phi = factory(B, N, dtype).contiguous()
             v   = _make_v(B, N, dtype)
             cfg_str = f"[{_PHI_LABEL[phi_type]}] B={B} N={N} D={D} {dtype_name}"
-            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed, csv_rows)
+            all_passed = _corr_block(Phi, x, Y, v, cfg_str, dtype, atol_f, atol_b, all_passed)
 
-    logger.info(_CORR_SEP)
+    print(_CORR_SEP)
+    print()
     if all_passed:
         print(ok("All correctness checks passed."))
     else:
         print(fail("One or more correctness checks FAILED."))
-    return all_passed, csv_rows
+    print()
+    return all_passed
 
 
 ###
@@ -353,36 +364,35 @@ def _bytes_proj_bwd(B, N, D, elem_bytes):
 
 _PERF_HDR = (
     f"{'Config':>30}  {'Variant':>12}  {'dtype':>6}  "
-    f"{'Triton ms':>10}  {'Tri p99':>9}  {'Tri var':>9}  {'Eager ms':>9}  {'Compiled ms':>12}  "
+    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  "
     f"{'vs Eager':>9}  {'vs Cmp':>7}  {'BW GB/s':>9}"
 )
-_PERF_SEP = "-" * 140
+_PERF_SEP = "-" * 120
 
 
-def _perf_row(config, variant, dtype_name, s_tri, s_eager, s_compiled, bw_gbs):
+def _perf_row(config, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs):
     def _sp(t_ref):
-        sp = t_ref / s_tri.median
+        sp = t_ref / t_tri
         s = f"{sp:.2f}x"
         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
     return (
         f"{config:>30}  {variant:>12}  {dtype_name:>6}  "
-        f"{s_tri.median:>10.3f}  {s_tri.p99:>9.3f}  {s_tri.var:>9.2e}  "
-        f"{s_eager.median:>9.3f}  {s_compiled.median:>12.3f}  "
-        f"{_sp(s_eager.median):>9}  {_sp(s_compiled.median):>7}  {bw_gbs:>9.1f}"
+        f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_compiled:>12.3f}  "
+        f"{_sp(t_eager):>9}  {_sp(t_compiled):>7}  {bw_gbs:>9.1f}"
     )
 
 
-def _csv_row(config, phi_type, variant, dtype_name, s_tri, s_eager, s_compiled, bw_gbs) -> dict:
+def _csv_row(config, phi_type, variant, dtype_name, t_tri, t_eager, t_compiled, bw_gbs) -> dict:
     return {
         "config":               config,
         "phi_type":             phi_type,
         "variant":              variant,
         "dtype":                dtype_name,
-        **stat_fields("triton",   s_tri),
-        **stat_fields("eager",    s_eager),
-        **stat_fields("compiled", s_compiled),
-        "speedup_vs_eager":     s_eager.median / s_tri.median,
-        "speedup_vs_compiled":  s_compiled.median / s_tri.median,
+        "triton_ms":            t_tri,
+        "eager_ms":             t_eager,
+        "compiled_ms":          t_compiled,
+        "speedup_vs_eager":     t_eager / t_tri,
+        "speedup_vs_compiled":  t_compiled / t_tri,
         "bw_gbs":               bw_gbs,
     }
 
@@ -399,7 +409,12 @@ def run_perf(
     bwd: bool = False,
 ) -> list[dict]:
     """Benchmark Triton kernel vs PyTorch bmm+add reference."""
-    logger.info("\n" + bold("=" * 120) + "\n" + bold("  PERFORMANCE") + "\n" + bold("=" * 120) + "\n" + _PERF_HDR + "\n" + _PERF_SEP)
+    print()
+    print(bold("=" * 120))
+    print(bold("  PERFORMANCE"))
+    print(bold("=" * 120))
+    print(_PERF_HDR)
+    print(_PERF_SEP)
 
     rows: list[dict] = []
 
@@ -417,20 +432,38 @@ def run_perf(
 
             if fwd:
                 ### no-proj
-                s_tri      = bench_stats(lambda: stream_mix_add(Phi, x, Y),       warmup, rep)
-                s_eager    = bench_stats(lambda: ref_no_proj(Phi, x, Y),          warmup, rep)
-                s_compiled = bench_stats(lambda: _ref_no_proj_compiled(Phi, x, Y), warmup, rep)
-                bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
-                logger.info(_perf_row(cfg_str, "no-proj", dtype_name, s_tri, s_eager, s_compiled, bw))
-                rows.append(_csv_row(cfg_str, "random", "no-proj fwd", dtype_name, s_tri, s_eager, s_compiled, bw))
+                t_tri = triton.testing.do_bench(
+                    lambda: stream_mix_add(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+                t_eager = triton.testing.do_bench(
+                    lambda: ref_no_proj(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+                t_compiled = triton.testing.do_bench(
+                    lambda: _ref_no_proj_compiled(Phi, x, Y),
+                    warmup=warmup, rep=rep,
+                )
+                bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "no-proj", dtype_name, t_tri, t_eager, t_compiled, bw))
+                rows.append(_csv_row(cfg_str, "random", "no-proj fwd", dtype_name, t_tri, t_eager, t_compiled, bw))
 
                 ### proj
-                s_tri_p      = bench_stats(lambda: stream_mix_add(Phi, x, Y, v=v),     warmup, rep)
-                s_eager_p    = bench_stats(lambda: ref_proj(Phi, x, Y, v),             warmup, rep)
-                s_compiled_p = bench_stats(lambda: _ref_proj_compiled(Phi, x, Y, v),   warmup, rep)
-                bw_p = _bytes_proj(B, N, D, elem) / (s_tri_p.median * 1e-3) / 1e9
-                logger.info(_perf_row(cfg_str, "proj", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
-                rows.append(_csv_row(cfg_str, "random", "proj fwd", dtype_name, s_tri_p, s_eager_p, s_compiled_p, bw_p))
+                t_tri_p = triton.testing.do_bench(
+                    lambda: stream_mix_add(Phi, x, Y, v=v),
+                    warmup=warmup, rep=rep,
+                )
+                t_eager_p = triton.testing.do_bench(
+                    lambda: ref_proj(Phi, x, Y, v),
+                    warmup=warmup, rep=rep,
+                )
+                t_compiled_p = triton.testing.do_bench(
+                    lambda: _ref_proj_compiled(Phi, x, Y, v),
+                    warmup=warmup, rep=rep,
+                )
+                bw_p = _bytes_proj(B, N, D, elem) / (t_tri_p * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "proj", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
+                rows.append(_csv_row(cfg_str, "random", "proj fwd", dtype_name, t_tri_p, t_eager_p, t_compiled_p, bw_p))
 
             if bwd:
                 ### no-proj fwd+bwd
@@ -448,12 +481,12 @@ def run_perf(
                     Phi_g.grad = x_g.grad = Y_g.grad = None
                     _ref_no_proj_compiled(Phi_g, x_g, Y_g).sum().backward()
 
-                s_b   = bench_stats(_b_tri, warmup, rep)
-                s_b_e = bench_stats(_b_ea,  warmup, rep)
-                s_b_c = bench_stats(_b_cmp, warmup, rep)
-                bw_b  = _bytes_no_proj_bwd(B, N, D, elem) / (s_b.median * 1e-3) / 1e9
-                logger.info(_perf_row(cfg_str, "no-proj+bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
-                rows.append(_csv_row(cfg_str, "random", "no-proj bwd", dtype_name, s_b, s_b_e, s_b_c, bw_b))
+                t_b   = triton.testing.do_bench(_b_tri, warmup=warmup, rep=rep)
+                t_b_e = triton.testing.do_bench(_b_ea,  warmup=warmup, rep=rep)
+                t_b_c = triton.testing.do_bench(_b_cmp, warmup=warmup, rep=rep)
+                bw_b  = _bytes_no_proj_bwd(B, N, D, elem) / (t_b * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "no-proj+bwd", dtype_name, t_b, t_b_e, t_b_c, bw_b))
+                rows.append(_csv_row(cfg_str, "random", "no-proj bwd", dtype_name, t_b, t_b_e, t_b_c, bw_b))
 
                 ### proj fwd+bwd
                 Phi_g2 = Phi.clone().requires_grad_(True)
@@ -470,15 +503,15 @@ def run_perf(
                     Phi_g2.grad = x_g2.grad = Y_g2.grad = None
                     _ref_proj_compiled(Phi_g2, x_g2, Y_g2, v).sum().backward()
 
-                s_bp   = bench_stats(_bp_tri, warmup, rep)
-                s_bp_e = bench_stats(_bp_ea,  warmup, rep)
-                s_bp_c = bench_stats(_bp_cmp, warmup, rep)
-                bw_bp  = _bytes_proj_bwd(B, N, D, elem) / (s_bp.median * 1e-3) / 1e9
-                logger.info(_perf_row(cfg_str, "proj+bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
-                rows.append(_csv_row(cfg_str, "random", "proj bwd", dtype_name, s_bp, s_bp_e, s_bp_c, bw_bp))
+                t_bp   = triton.testing.do_bench(_bp_tri, warmup=warmup, rep=rep)
+                t_bp_e = triton.testing.do_bench(_bp_ea,  warmup=warmup, rep=rep)
+                t_bp_c = triton.testing.do_bench(_bp_cmp, warmup=warmup, rep=rep)
+                bw_bp  = _bytes_proj_bwd(B, N, D, elem) / (t_bp * 1e-3) / 1e9
+                print(_perf_row(cfg_str, "proj+bwd", dtype_name, t_bp, t_bp_e, t_bp_c, bw_bp))
+                rows.append(_csv_row(cfg_str, "random", "proj bwd", dtype_name, t_bp, t_bp_e, t_bp_c, bw_bp))
 
-        logger.info(_PERF_SEP)
-    logger.info("")
+        print(_PERF_SEP)
+    print()
     return rows
 
 
@@ -488,11 +521,10 @@ def run_perf(
 
 _SPHDR = (
     f"{'Config':>24}  {'PhiType':>8}  {'dtype':>6}  "
-    f"{'Triton ms':>10}  {'Tri p99':>9}  {'Tri var':>9}  "
-    f"{'Eager ms':>9}  {'Compiled ms':>12}  {'Speedup':>8}  "
+    f"{'Triton ms':>10}  {'Eager ms':>9}  {'Compiled ms':>12}  {'Speedup':>8}  "
     f"{'Diag-fast ms':>13}  {'vs Diag':>8}"
 )
-_SPSEP = "-" * 145
+_SPSEP = "-" * 125
 
 
 def run_structured_perf(
@@ -512,7 +544,12 @@ def run_structured_perf(
       ref_diagonal_add  uses  d * x + Y  (O(ND) vs O(N²D)), revealing the
       overhead of loading the full Phi matrix in the Triton kernel.
     """
-    logger.info("\n" + bold("=" * 125) + "\n" + bold("  STRUCTURED-MATRIX PERFORMANCE") + "\n" + bold("=" * 125) + "\n" + _SPHDR + "\n" + _SPSEP)
+    print()
+    print(bold("=" * 125))
+    print(bold("  STRUCTURED-MATRIX PERFORMANCE"))
+    print(bold("=" * 125))
+    print(_SPHDR)
+    print(_SPSEP)
 
     phi_types = list(_PHI_FACTORIES.keys())   # random, skew_sym, psd, diagonal
     rows: list[dict] = []
@@ -534,18 +571,30 @@ def run_structured_perf(
                 label = _PHI_LABEL[phi_type]
 
                 if fwd:
-                    s_tri  = bench_stats(lambda: stream_mix_add(Phi, x, Y),        warmup, rep)
-                    s_eager = bench_stats(lambda: ref_no_proj(Phi, x, Y),          warmup, rep)
-                    s_comp = bench_stats(lambda: _ref_no_proj_compiled(Phi, x, Y), warmup, rep)
+                    t_tri = triton.testing.do_bench(
+                        lambda: stream_mix_add(Phi, x, Y),
+                        warmup=warmup, rep=rep,
+                    )
+                    t_eager = triton.testing.do_bench(
+                        lambda: ref_no_proj(Phi, x, Y),
+                        warmup=warmup, rep=rep,
+                    )
+                    t_comp = triton.testing.do_bench(
+                        lambda: _ref_no_proj_compiled(Phi, x, Y),
+                        warmup=warmup, rep=rep,
+                    )
 
                     def _sp(t_ref):
-                        sp = t_ref / s_tri.median
+                        sp = t_ref / t_tri
                         s = f"{sp:.2f}x"
                         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
 
                     if phi_type == "diagonal":
-                        t_diag = bench_stats(lambda: ref_diagonal_add(Phi, x, Y), warmup, rep).median
-                        ratio = t_diag / s_tri.median
+                        t_diag = triton.testing.do_bench(
+                            lambda: ref_diagonal_add(Phi, x, Y),
+                            warmup=warmup, rep=rep,
+                        )
+                        ratio = t_diag / t_tri
                         diag_str = f"{t_diag:>13.3f}"
                         vs_diag = f"{ratio:.2f}x"
                         vd_col = ok(vs_diag) if ratio >= 1.05 else (
@@ -555,14 +604,13 @@ def run_structured_perf(
                         diag_str = f"{'N/A':>13}"
                         vd_col   = f"{'N/A':>8}"
 
-                    bw = _bytes_no_proj(B, N, D, elem) / (s_tri.median * 1e-3) / 1e9
-                    logger.info(
+                    bw = _bytes_no_proj(B, N, D, elem) / (t_tri * 1e-3) / 1e9
+                    print(
                         f"{cfg_str:>24}  {label:>8}  {dtype_name:>6}  "
-                        f"{s_tri.median:>10.3f}  {s_tri.p99:>9.3f}  {s_tri.var:>9.2e}  "
-                        f"{s_eager.median:>9.3f}  {s_comp.median:>12.3f}  {_sp(s_eager.median):>8}  "
+                        f"{t_tri:>10.3f}  {t_eager:>9.3f}  {t_comp:>12.3f}  {_sp(t_eager):>8}  "
                         f"{diag_str}  {vd_col:>8}"
                     )
-                    rows.append(_csv_row(cfg_str, phi_type, "fwd", dtype_name, s_tri, s_eager, s_comp, bw))
+                    rows.append(_csv_row(cfg_str, phi_type, "fwd", dtype_name, t_tri, t_eager, t_comp, bw))
 
                 if bwd:
                     Phi_g = Phi.clone().requires_grad_(True)
@@ -579,30 +627,29 @@ def run_structured_perf(
                         Phi_g.grad = x_g.grad = Y_g.grad = None
                         _ref_no_proj_compiled(Phi_g, x_g, Y_g).sum().backward()
 
-                    s_tri_b = bench_stats(_sb_tri, warmup, rep)
-                    s_ea_b  = bench_stats(_sb_ea,  warmup, rep)
-                    s_cmp_b = bench_stats(_sb_cmp, warmup, rep)
+                    t_tri_b  = triton.testing.do_bench(_sb_tri, warmup=warmup, rep=rep)
+                    t_ea_b   = triton.testing.do_bench(_sb_ea,  warmup=warmup, rep=rep)
+                    t_cmp_b  = triton.testing.do_bench(_sb_cmp, warmup=warmup, rep=rep)
 
                     def _spb(t_ref):
-                        sp = t_ref / s_tri_b.median
+                        sp = t_ref / t_tri_b
                         s = f"{sp:.2f}x"
                         return ok(s) if sp >= 1.05 else (warn(s) if sp >= 0.95 else fail(s))
 
-                    bw_b    = _bytes_no_proj_bwd(B, N, D, elem) / (s_tri_b.median * 1e-3) / 1e9
+                    bw_b    = _bytes_no_proj_bwd(B, N, D, elem) / (t_tri_b * 1e-3) / 1e9
                     label_b = label.rstrip() + "+bwd"
-                    logger.info(
+                    print(
                         f"{cfg_str:>24}  {label_b:>8}  {dtype_name:>6}  "
-                        f"{s_tri_b.median:>10.3f}  {s_tri_b.p99:>9.3f}  {s_tri_b.var:>9.2e}  "
-                        f"{s_ea_b.median:>9.3f}  {s_cmp_b.median:>12.3f}  {_spb(s_ea_b.median):>8}  "
+                        f"{t_tri_b:>10.3f}  {t_ea_b:>9.3f}  {t_cmp_b:>12.3f}  {_spb(t_ea_b):>8}  "
                         f"{'N/A':>13}  {'N/A':>8}"
                     )
-                    rows.append(_csv_row(cfg_str, phi_type, "bwd", dtype_name, s_tri_b, s_ea_b, s_cmp_b, bw_b))
+                    rows.append(_csv_row(cfg_str, phi_type, "bwd", dtype_name, t_tri_b, t_ea_b, t_cmp_b, bw_b))
 
-            logger.info("")  # blank line between (N,B,D) groups
+            print()   # blank line between (N,B,D) groups
 
-        logger.info(_SPSEP)
+        print(_SPSEP)
 
-    logger.info("")
+    print()
     return rows
 
 
@@ -657,12 +704,7 @@ def main():
         "--csv", type=Path, default=None, metavar="PATH",
         help="Write performance results to this CSV file (appends if file exists).",
     )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", default=False,
-        help="Print per-row correctness/perf tables (quiet by default)",
-    )
     args = parser.parse_args()
-    setup_logging(args.verbose)
 
     # --fwd and --bwd are independent; default (neither given) → fwd only
     run_fwd = args.fwd or not args.bwd
@@ -673,28 +715,18 @@ def main():
         sys.exit(1)
 
     dev = torch.cuda.get_device_name(0)
-    logger.info(f"\nDevice     : {dev}\nN vals     : {args.n}\nm vals     : {args.m}\nB vals     : {args.b}\nembed_dims : {args.embed_dim}\ndtypes     : {args.dtype}\nbench fwd  : {run_fwd}\nbench bwd  : {run_bwd}")
+    print(f"\nDevice     : {dev}")
+    print(f"N vals     : {args.n}")
+    print(f"m vals     : {args.m}")
+    print(f"B vals     : {args.b}")
+    print(f"embed_dims : {args.embed_dim}")
+    print(f"dtypes     : {args.dtype}")
+    print(f"bench fwd  : {run_fwd}")
+    print(f"bench bwd  : {run_bwd}")
 
     passed = True
-    corr_rows: list[dict] = []
     if args.mode in ("correctness", "all"):
-        passed, corr_rows = run_correctness(args.n, args.m, args.embed_dim, args.b, args.dtype)
-
-        ### Write a correctness report alongside the perf CSV (mirrors expm_bench.py).
-        ### Path is derived from --csv by swapping 'perf'→'correctness' (or appending
-        ### '_correctness'), so the dispatch script needs no change.
-        if args.csv is not None and corr_rows:
-            stem = args.csv.stem
-            corr_stem = stem.replace("perf", "correctness") if "perf" in stem else f"{stem}_correctness"
-            corr_path = args.csv.with_name(corr_stem + args.csv.suffix)
-            _CORR_FIELDS = ["config", "variant", "check", "max_err", "atol", "passed"]
-            write_header = not corr_path.exists()
-            with corr_path.open("a", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=_CORR_FIELDS)
-                if write_header:
-                    writer.writeheader()
-                writer.writerows(corr_rows)
-            print(f"Correctness CSV written to {corr_path}")
+        passed = run_correctness(args.n, args.m, args.embed_dim, args.b, args.dtype)
 
     if args.mode in ("perf", "all"):
         perf_rows = run_perf(args.n, args.m, args.embed_dim, args.b, args.dtype,
@@ -706,9 +738,7 @@ def main():
             all_rows = perf_rows + struct_rows
             _CSV_FIELDS = [
                 "config", "phi_type", "variant", "dtype",
-                "triton_median_ms", "triton_p99_ms", "triton_var", "triton_mean_ms",
-                "eager_median_ms", "eager_p99_ms", "eager_var", "eager_mean_ms",
-                "compiled_median_ms", "compiled_p99_ms", "compiled_var", "compiled_mean_ms",
+                "triton_ms", "eager_ms", "compiled_ms",
                 "speedup_vs_eager", "speedup_vs_compiled", "bw_gbs",
             ]
             write_header = not args.csv.exists()
@@ -719,8 +749,8 @@ def main():
                 writer.writerows(all_rows)
             print(f"CSV written to {args.csv}")
 
-    # if args.mode in ("correctness", "all") and not passed:
-    #     sys.exit(1)
+    if args.mode in ("correctness", "all") and not passed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
