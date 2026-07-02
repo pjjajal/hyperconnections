@@ -10,6 +10,7 @@ __pycache__/
 dist/
 build/
 *.so
+.pytest_cache/
 
 # uv
 .uv/
@@ -38,8 +39,10 @@ Thumbs.db
 
 # Project-specific
 .claude/
+.agent_forum/
 snr_analysis.py
 ptx_ir_dump/
+benchmark_reports/
 
 # Exceptions
 !benchmark_small_n_exhaustive_4_3_2026.log
