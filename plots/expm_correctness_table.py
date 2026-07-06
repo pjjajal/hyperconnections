@@ -55,7 +55,7 @@ ROWS = {
     },
     # --- expm_force (block) kernel: forward E, forward Psi, backward grad ---
     "ef_E": {
-        "source": "expm_force", "variant": "triton", "check": "E vs exp",
+        "source": "expm_force", "variant": "triton", "check": "vs linalg.matrix_exp",
         "kernel_tex": r"\texttt{expm\_t18\_block\_triton} $E$",
         "ref_tex":    r"\texttt{matrix\_exp}",
     },
@@ -65,7 +65,7 @@ ROWS = {
         "ref_tex":    r"compiled T18",
     },
     "ef_psi": {
-        "source": "expm_force", "variant": "triton", "check": "psi vs quad",
+        "source": "expm_force", "variant": "triton", "check": "vs Gauss-Legendre",
         "kernel_tex": r"\texttt{expm\_t18\_block\_triton} $\Psi$",
         "ref_tex":    r"GL quadrature (fp64)",
     },
@@ -75,7 +75,7 @@ ROWS = {
         "ref_tex":    r"compiled T18",
     },
     "ef_grad": {
-        "source": "expm_force", "variant": "triton", "check": "grad vs aug",
+        "source": "expm_force", "variant": "triton", "check": "vs autograd",
         "kernel_tex": r"backward grad",
         "ref_tex":    r"autograd through $2N$ exp",
     },
