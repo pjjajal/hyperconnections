@@ -34,6 +34,7 @@ import pandas as pd
 SOURCES = {
     "expm":       "**/benchmark_expm_correctness_*.CSV",
     "expm_force": "**/benchmark_expm_force_correctness_*.CSV",
+    "stream_mix": "**/stream_mix_correctness.csv",
 }
 
 # Catalogue of selectable table rows. ``--rows`` picks a subset (and order);
@@ -84,6 +85,29 @@ ROWS = {
         "kernel_tex": r"backward grad",
         "ref_tex":    r"compiled T18",
     },
+    # --- stream_mix kernel: forward + backward, no-proj and proj variants ------
+    # (variant/check strings match benchmarks/stream_mix_bench.py:_corr_block;
+    #  the batch-max absolute error already aggregates over D=1024/1536.)
+    "sm_fwd": {
+        "source": "stream_mix", "variant": "no-proj", "check": "fwd",
+        "kernel_tex": r"\texttt{stream\_mix\_add}",
+        "ref_tex":    r"einsum $\Phi x + Y$",
+    },
+    "sm_bwd": {
+        "source": "stream_mix", "variant": "no-proj", "check": "grad_x",
+        "kernel_tex": r"\texttt{stream\_mix\_add} grad$_x$",
+        "ref_tex":    r"autograd einsum",
+    },
+    "sm_proj_fwd": {
+        "source": "stream_mix", "variant": "proj", "check": "fwd",
+        "kernel_tex": r"\texttt{stream\_mix\_add} (proj)",
+        "ref_tex":    r"einsum $\Phi x + Y$, proj",
+    },
+    "sm_proj_bwd": {
+        "source": "stream_mix", "variant": "proj", "check": "grad_x",
+        "kernel_tex": r"\texttt{stream\_mix\_add} (proj) grad$_x$",
+        "ref_tex":    r"autograd einsum (proj)",
+    },
 }
 DEFAULT_ROWS = ["expm_fwd", "ef_E", "ef_psi", "ef_grad"]
 
@@ -101,24 +125,31 @@ DEFAULT_CAPTION = (
     r"types and dtypes, per $N$. Lower is better."
 )
 
-# config cells look like "[diag] B=1024 N=16 bf16" (matrix-type prefix optional
-# -> "rand"; dtype suffix). Note: one stray report has a "B=32678" typo, which
-# the max aggregation simply absorbs.
-_CFG_RE = re.compile(
-    r"(?:\[(?P<mt>[^\]]+)\]\s*)?B=(?P<b>\d+)\s+N=(?P<n>\d+)\s+(?P<dtype>\w+)"
-)
+# config cells look like "[diag] B=1024 N=16 bf16" (expm/expm_force) or
+# "[skew_sym] B=2048 N=16 D=1024 bf16" (stream_mix). Parse each field on its own
+# — a single positional regex would grab the stream_mix "D=..." token as the
+# dtype. Matrix-type prefix optional -> "rand"; the dtype is the fp/bf token.
+_MT_RE    = re.compile(r"^\s*\[(?P<mt>[^\]]+)\]")
+_B_RE     = re.compile(r"\bB=(\d+)")
+_N_RE     = re.compile(r"\bN=(\d+)")
+_D_RE     = re.compile(r"\bD=(\d+)")
+_DTYPE_RE = re.compile(r"\b(fp32|bf16|fp16)\b")
 
 
 def parse_corr_config(cfg: str) -> dict:
-    m = _CFG_RE.search(cfg)
-    if not m:
+    b, n, dt = _B_RE.search(cfg), _N_RE.search(cfg), _DTYPE_RE.search(cfg)
+    if not (b and n and dt):
         raise ValueError(f"unparseable config: {cfg!r}")
-    return {
-        "matrix_type": (m.group("mt") or "rand").strip(),
-        "batch":       int(m.group("b")),
-        "n":           int(m.group("n")),
-        "dtype":       m.group("dtype"),
+    mt, d = _MT_RE.search(cfg), _D_RE.search(cfg)
+    out = {
+        "matrix_type": mt.group("mt").strip() if mt else "rand",
+        "batch":       int(b.group(1)),
+        "n":           int(n.group(1)),
+        "dtype":       dt.group(1),
     }
+    if d:
+        out["d"] = int(d.group(1))
+    return out
 
 
 def load_source(reports_dir: Path, glob: str) -> pd.DataFrame:

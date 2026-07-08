@@ -128,39 +128,39 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     gt_psi = ref_phi1_quadrature(A)
 
     ### triton E vs exp ground truth (torch.linalg.matrix_exp)
-    passed, err = _check(got_E, gt_E, atol_f)
+    passed, err, rel = _check(got_E, gt_E, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "vs linalg.matrix_exp", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "vs linalg.matrix_exp",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### triton E vs same-algorithm pure-torch reference
-    passed, err = _check(got_E, ref_E, atol_f)
+    passed, err, rel = _check(got_E, ref_E, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "E vs T18", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "E vs T18",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### triton psi vs same-algorithm pure-torch reference
-    passed, err = _check(got_psi, ref_psi, atol_f)
+    passed, err, rel = _check(got_psi, ref_psi, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "psi vs T18", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "psi vs T18",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### triton psi vs quadrature ground truth — independent of T18
-    passed, err = _check(got_psi, gt_psi, atol_f)
+    passed, err, rel = _check(got_psi, gt_psi, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "vs Gauss-Legendre", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "vs Gauss-Legendre",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### pytorch-T18 psi vs quadrature ground truth — isolates algorithm error
-    passed, err = _check(ref_psi, gt_psi, atol_f)
+    passed, err, rel = _check(ref_psi, gt_psi, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "torch", "vs Gauss-Legendre", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "torch", "check": "vs Gauss-Legendre",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### --- Backward: dL/dA for L = E.sum() + psi.sum() ---
     A_t = A.detach().clone().requires_grad_(True)
@@ -176,25 +176,25 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     g_aug = ref_grad_matrix_exp_aug(A).to(A.dtype)
 
     ### triton grad vs same-algorithm pure-torch reference
-    passed, err = _check(g_tri, g_torch, atol_b)
+    passed, err, rel = _check(g_tri, g_torch, atol_b)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "grad vs T18", err, atol_b, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad vs T18",
-                     "max_err": err, "atol": atol_b, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_b, "passed": passed})
 
     ### triton grad vs augmented-matrix ground truth — independent of T18
-    passed, err = _check(g_tri, g_aug, atol_b)
+    passed, err, rel = _check(g_tri, g_aug, atol_b)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "vs autograd", err, atol_b, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "vs autograd",
-                     "max_err": err, "atol": atol_b, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_b, "passed": passed})
 
     ### pytorch-T18 grad vs augmented-matrix ground truth — isolates algorithm error
-    passed, err = _check(g_torch, g_aug, atol_b)
+    passed, err, rel = _check(g_torch, g_aug, atol_b)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "torch", "vs autograd", err, atol_b, passed))
     csv_rows.append({"config": cfg_str, "variant": "torch", "check": "vs autograd",
-                     "max_err": err, "atol": atol_b, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_b, "passed": passed})
 
     return all_passed
 

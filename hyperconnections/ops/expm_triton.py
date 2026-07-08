@@ -490,7 +490,7 @@ def expm_t18_triton(A: torch.Tensor, S: int = _MAX_S) -> torch.Tensor:
         S: number of scaling-and-squaring steps (constexpr in-kernel). A is
            scaled by 2^(-S) and squared exactly S times, so the result is
            accurate for ||A||_1 <= theta_18 * 2^S (~3.01*2^S); smaller norms are
-           over-scaled. Default _MAX_S=8.
+           over-scaled. Default _MAX_S=2.
 
     Returns:
         exp(A) with the same shape and dtype as A.
@@ -790,7 +790,7 @@ def expm_t18_block_triton(A: torch.Tensor, S: int = _MAX_S) -> tuple[torch.Tenso
            scaled by 2^(-S) and squared exactly S times, so the result is
            accurate for ||A||_1 <= theta_18 * 2^S (~3.01*2^S); smaller norms are
            over-scaled. S also drives the backward (its augmented matrices must
-           likewise satisfy the bound). Default _MAX_S=8.
+           likewise satisfy the bound). Default _MAX_S=2.
 
     Returns:
         E:   [B, N, N], approximation to exp(A).
