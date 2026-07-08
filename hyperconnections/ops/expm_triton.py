@@ -73,9 +73,10 @@ _b11 = tl.constexpr(_b11); _b21 = tl.constexpr(_b21); _b31 = tl.constexpr(_b31);
 _b02 = tl.constexpr(_b02); _b12 = tl.constexpr(_b12); _b22 = tl.constexpr(_b22); _b32 = tl.constexpr(_b32); _b62 = tl.constexpr(_b62)
 _b03 = tl.constexpr(_b03); _b13 = tl.constexpr(_b13); _b23 = tl.constexpr(_b23); _b33 = tl.constexpr(_b33); _b63 = tl.constexpr(_b63)
 _b24 = tl.constexpr(_b24); _b34 = tl.constexpr(_b34); _b64 = tl.constexpr(_b64)
+
 ### Default number of scaling-and-squaring steps S (not a cap: the public fns
 ### accept any S >= 0, driving both inv_scale = 2^(-S) and the squaring count).
-_MAX_S = 8
+_MAX_S = 2
 
 _TORCH_TO_TL = {
     torch.float16:  tl.float16,
