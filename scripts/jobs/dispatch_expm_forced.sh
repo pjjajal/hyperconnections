@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH -A davisjam
 #SBATCH -N 1
-#SBATCH -n 16
+#SBATCH -n 32
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=a100-80gb
-#SBATCH --time=2:59:00
+#SBATCH --time=11:59:00
 #SBATCH --job-name=expm_forced_bench
 
 set -euo pipefail
@@ -15,7 +15,7 @@ set -euo pipefail
 cd /scratch/gilbreth/neliopou/pj-hyperconnections
 
 BENCH_DIR="benchmarks"
-SINGLES_DIR="benchmark_reports/singles"
+SINGLES_DIR="benchmark_reports/expm_forced_arxiv_final_7_8_2026"
 
 mkdir -p "benchmark_reports/logs"
 
@@ -24,10 +24,10 @@ unset TORCH_LOGS
 export TRITON_ALWAYS_COMPILE=1
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
-EXPM_FORCE_N=(8 16 32)
-EXPM_FORCE_B=(8192 16384 32768 65536)
-EXPM_FORCE_DTYPE=(bf16)
-EXPM_FORCE_PASS=(bwd)
+EXPM_FORCE_N=(4 8 16 32)
+EXPM_FORCE_B=(2048 4096 8192 16384 32768 65536)
+EXPM_FORCE_DTYPE=(fp32 bf16)
+EXPM_FORCE_PASS=(fwd bwd)
 
 MODE=all
 WARMUP=16

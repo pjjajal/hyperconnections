@@ -48,8 +48,8 @@ def _parse_cfg(cfg):
         return None
 
 
-def load_corr(reports_dir, glob, variant, check):
-    paths = sorted(reports_dir.glob(glob))
+def load_corr(reports_dirs, glob, variant, check):
+    paths = ect.glob_many(reports_dirs, glob)
     if not paths:
         return pd.DataFrame()
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
@@ -68,8 +68,8 @@ def load_corr(reports_dir, glob, variant, check):
     return df
 
 
-def load_perf(reports_dir, glob):
-    paths = sorted(reports_dir.glob(glob))
+def load_perf(reports_dirs, glob):
+    paths = ect.glob_many(reports_dirs, glob)
     if not paths:
         return pd.DataFrame()
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
@@ -81,14 +81,14 @@ def _fmt_speedup(v):
     return "---" if v is None or v != v else rf"${v:.1f}{{\times}}$"
 
 
-def build_rows(reports_dir, dtypes):
+def build_rows(reports_dirs, dtypes):
     """Return (dtype, method_tex, med, p95, mx, speedup) tuples for the table."""
     perf_cache = {}
     out = []
     for method, cglob, variant, check, pglob, direction in _ROWS:
-        corr = load_corr(reports_dir, cglob, variant, check)
+        corr = load_corr(reports_dirs, cglob, variant, check)
         if pglob not in perf_cache:
-            perf_cache[pglob] = load_perf(reports_dir, pglob)
+            perf_cache[pglob] = load_perf(reports_dirs, pglob)
         perf = perf_cache[pglob]
         for dt in dtypes:
             ce = corr[corr["dtype"] == dt]["err"].astype(float) if not corr.empty else pd.Series(dtype=float)
@@ -129,8 +129,10 @@ def build_table(rows, dtypes, caption, label) -> str:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Emit the small aggregate accuracy/runtime table.")
-    p.add_argument("--reports-dir", type=Path, default=Path("benchmark_reports"),
-                   help="Root to glob correctness + perf CSVs from.")
+    p.add_argument("--reports-dir", nargs="+", type=Path, default=[Path("benchmark_reports")],
+                   metavar="DIR",
+                   help="One or more roots to glob correctness + perf CSVs from "
+                        "(e.g. the expm and expm_force arxiv_final dirs).")
     p.add_argument("--dtype", choices=["fp32", "bf16", "all"], default="all",
                    help="One dtype, or 'all' for a dtype column (default: all).")
     p.add_argument("--caption", default=_DEFAULT_CAPTION)
@@ -138,14 +140,16 @@ def main(argv=None) -> None:
     p.add_argument("--out", type=Path, default=None, help="Write .tex here (default: stdout).")
     args = p.parse_args(argv)
 
-    if not args.reports_dir.exists():
-        print(f"reports dir not found: {args.reports_dir}", file=sys.stderr)
+    missing = [str(d) for d in args.reports_dir if not d.exists()]
+    if missing:
+        print(f"reports dir(s) not found: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     dtypes = ["fp32", "bf16"] if args.dtype == "all" else [args.dtype]
     rows = build_rows(args.reports_dir, dtypes)
     if all(med is None and sp is None for _dt, _m, med, _p, _mx, sp in rows):
-        print(f"[warn] no data under {args.reports_dir}; table will be all '---'.", file=sys.stderr)
+        roots = ", ".join(str(d) for d in args.reports_dir)
+        print(f"[warn] no data under {roots}; table will be all '---'.", file=sys.stderr)
     table = build_table(rows, dtypes, args.caption, args.label)
 
     if args.out:

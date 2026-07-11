@@ -1,0 +1,19 @@
+\begin{table}[h]
+\centering
+\caption{Aggregate numerical accuracy and runtime of the Triton matrix-exponential kernels. Relative error is pooled over $N$ and matrix type; speedup is the median over the swept batch sizes vs.\ \texttt{torch.linalg.matrix\_exp}.}
+\label{tab:accuracy_summary}
+\begin{tabular}{llcccc}
+\toprule
+Method & Dtype & Median & p95 & Max & Speedup \\
+\midrule
+Triton \texttt{expm} $\exp(A)$ & fp32 & $6.9{\times}10^{-7}$ & $4.9{\times}10^{-6}$ & $6.4{\times}10^{-6}$ & $21.7{\times}$ \\
+Triton \texttt{expm} $\exp(A)$ & bf16 & $6.0{\times}10^{-3}$ & $2.6{\times}10^{-2}$ & $3.7{\times}10^{-2}$ & $24.2{\times}$ \\
+Triton \texttt{expm\_force} $E$ & fp32 & $6.3{\times}10^{-7}$ & $1.3{\times}10^{-6}$ & $1.4{\times}10^{-6}$ & $16.5{\times}$ \\
+Triton \texttt{expm\_force} $E$ & bf16 & $2.0{\times}10^{-3}$ & $1.7{\times}10^{-2}$ & $1.7{\times}10^{-2}$ & $18.0{\times}$ \\
+Triton \texttt{expm\_force} $\Psi$ & fp32 & $3.3{\times}10^{-7}$ & $5.5{\times}10^{-7}$ & $6.0{\times}10^{-7}$ & $16.5{\times}$ \\
+Triton \texttt{expm\_force} $\Psi$ & bf16 & $2.0{\times}10^{-3}$ & $9.8{\times}10^{-3}$ & $1.0{\times}10^{-2}$ & $18.0{\times}$ \\
+Triton \texttt{expm\_force} grad & fp32 & $8.0{\times}10^{-7}$ & $1.8{\times}10^{-6}$ & $2.0{\times}10^{-6}$ & $4.5{\times}$ \\
+Triton \texttt{expm\_force} grad & bf16 & $4.7{\times}10^{-3}$ & $1.1{\times}10^{-2}$ & $1.2{\times}10^{-2}$ & $6.8{\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

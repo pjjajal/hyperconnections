@@ -1,33 +1,18 @@
 #!/bin/bash
 #SBATCH -A davisjam
 #SBATCH -N 1
-#SBATCH -n 16
+#SBATCH -n 32
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=a100-80gb
-#SBATCH --time=24:00:00
+#SBATCH --time=03:00:00
 #SBATCH --job-name=full_eval
-#
-# Big paper sweep for the three Triton kernels (expm, expm_force, stream_mix),
-# matching the two experimental-setup tables, plus the correctness + expm_norm
-# data feeding the accuracy table/plots. Launch manually:  sbatch scripts/jobs/full_eval.sh
-#
-# The a100-80gb partition is uncapped (MaxTime=UNLIMITED); one long job is fine.
-# The sweep is resumable (skips configs whose output CSV already exists) and
-# OOM-tolerant (a config that OOMs/errors is logged and skipped, never aborts).
-#
-# Phases run PERF (the big grid) then CORRECTNESS then NORM then PLOT. Override
-# via env, e.g.:
-#     PHASES="perf" KERNELS="stream_mix" sbatch scripts/jobs/full_eval.sh
-#     SMOKE=1 bash scripts/jobs/full_eval.sh        # fast wiring test on an interactive node
 
-# NOT `set -e`: a single OOM / correctness FAIL must be reported and skipped,
-# never abort the multi-hour sweep (cf. scripts/jobs/dispatch_research.sh).
 set -uo pipefail
 
-cd /scratch/gilbreth/neliopou/pj-hyperconnections || exit 1
+cd /scratch/gilbreth/neliopou/pj-hyperconnections
 
 # Absolute venv python so the job runs unattended regardless of the submitting
 # shell's PATH (the stock dispatchers assume an already-activated venv).
@@ -205,7 +190,11 @@ fi
 
 if want_phase plot; then
     echo ""; echo "=== PLOT ==="
-    bash scripts/generate_plots.sh "$RESULTS_ROOT" "$PLOTS_OUT" \
+    # full_eval writes every kernel under one root, so the three per-kernel input
+    # roots collapse to $RESULTS_ROOT (generate_plots de-duplicates them).
+    EXPM_DIR="$RESULTS_ROOT" FORCE_DIR="$RESULTS_ROOT" STREAM_DIR="$RESULTS_ROOT" \
+    NORM_FP32_DIR="$RESULTS_ROOT/expm_norm_fp32" NORM_BF16_DIR="$RESULTS_ROOT/expm_norm_bf16" \
+    bash scripts/generate_plots.sh "$PLOTS_OUT" \
         || echo "[warn] plotting failed (non-fatal); re-run scripts/generate_plots.sh manually"
 fi
 

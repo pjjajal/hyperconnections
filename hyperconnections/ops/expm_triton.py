@@ -763,8 +763,11 @@ class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
         eye = torch.eye(N, dtype=torch.float32, device=A_T.device)
         M[:, N:2*N, 2*N:3*N] = eye
 
-        ### NOTE: Revisit this at some point... Debug it!
-        # expM = torch.linalg.matrix_exp(M).to(out_dtype)
+        ### The (1,3) block of exp(M) equals L_phi_1(A^T, G_psi); validated against
+        ### torch.linalg.matrix_exp(M) and autograd (benchmarks/expm_force_bench.py
+        ### "vs autograd"). Reuses the fixed-S forward routine, so it needs
+        ### ||M||_1 <= theta_18 * 2^S — note M carries G_psi, not just A^T.
+        # expM = torch.linalg.matrix_exp(M).to(out_dtype)   # reference fallback
         expM = _expm_t18_no_grad(M, out_dtype=out_dtype, S=S)
         dA_psi = expM[:, :N, 2*N:3*N]
 

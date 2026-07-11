@@ -152,10 +152,21 @@ def parse_corr_config(cfg: str) -> dict:
     return out
 
 
-def load_source(reports_dir: Path, glob: str) -> pd.DataFrame:
+def glob_many(reports_dirs, glob: str) -> list:
+    """Unique, sorted paths matching ``glob`` under any of the report roots.
+
+    The kernels are dispatched as separate jobs, so their reports live in
+    separate roots (``benchmark_reports/<kernel>_arxiv_final_*``). De-duplicating
+    on the resolved path means passing the same root twice (e.g. a single
+    full_eval results tree for every kernel) never double-counts rows.
+    """
+    return sorted({p.resolve() for d in reports_dirs for p in Path(d).glob(glob)})
+
+
+def load_source(reports_dirs, glob: str) -> pd.DataFrame:
     """Read + concat every correctness CSV for one family, adding parsed
     ``matrix_type`` / ``batch`` / ``n`` / ``dtype`` columns. Empty if none."""
-    paths = sorted(reports_dir.glob(glob))
+    paths = glob_many(reports_dirs, glob)
     if not paths:
         return pd.DataFrame()
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
@@ -236,8 +247,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--reports-dir", type=Path, default=Path("benchmark_reports"),
-        help="Root to glob correctness CSVs from (default: benchmark_reports).",
+        "--reports-dir", nargs="+", type=Path, default=[Path("benchmark_reports")],
+        metavar="DIR",
+        help="One or more roots to glob correctness CSVs from — e.g. the three "
+             "per-kernel benchmark_reports/*_arxiv_final_* dirs, or a single "
+             "full_eval results tree (default: benchmark_reports).",
     )
     parser.add_argument(
         "--rows", nargs="+", choices=list(ROWS), default=DEFAULT_ROWS,
@@ -277,17 +291,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.reports_dir.exists():
-        print(f"reports dir not found: {args.reports_dir}", file=sys.stderr)
+    missing = [str(d) for d in args.reports_dir if not d.exists()]
+    if missing:
+        print(f"reports dir(s) not found: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     dtypes = None if args.dtype == "all" else [args.dtype]
     needed = {ROWS[k]["source"] for k in args.rows}
     caches = {src: load_source(args.reports_dir, SOURCES[src]) for src in needed}
+    roots = ", ".join(str(d) for d in args.reports_dir)
     for src, df in caches.items():
         if df.empty:
             print(f"[warn] no correctness CSVs for source '{src}' under "
-                  f"{args.reports_dir} (matching {SOURCES[src]})", file=sys.stderr)
+                  f"{roots} (matching {SOURCES[src]})", file=sys.stderr)
 
     if args.matrix_types is not None:
         matrix_types = args.matrix_types
