@@ -234,14 +234,18 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self, "laplacian_pred"):
             nn.init.zeros_(self.laplacian_pred.weight)
 
+        # hasattr guards: subclasses may delete unused dt params (cghcn drops the
+        # dissipative pair) and init_weights is re-run post-construction.
         self._init_log_dt(self.log_dt_conserv)
-        self._init_log_dt(self.log_dt_diss)
+        if hasattr(self, "log_dt_diss"):
+            self._init_log_dt(self.log_dt_diss)
 
         # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
         trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
         nn.init.zeros_(self.dt_proj_conserv.bias)
-        trunc_normal_(self.dt_proj_diss.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_diss.bias)
+        if hasattr(self, "dt_proj_diss"):
+            trunc_normal_(self.dt_proj_diss.weight, std=0.01)
+            nn.init.zeros_(self.dt_proj_diss.bias)
 
         # Projections: small random init for weights, zero bias so initial mean behaviour matches static biases
         for proj in (self.proj_read_in, self.proj_write_out):
