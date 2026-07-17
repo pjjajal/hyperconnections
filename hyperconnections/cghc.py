@@ -330,20 +330,28 @@ class ContinuousGenHyperConnections(nn.Module):
 
             A = dt_conserv * S  -  dt_diss * Q
 
-        Assembled in float32 with autocast disabled: A entries are O(dt * weight),
-        near bf16 resolution early in training, and the expm consumes fp32 anyway.
+        Projections run in the ambient (autocast) dtype; assembly is float32:
+        A entries are O(dt * weight), near bf16 resolution early in training,
+        and the expm consumes fp32 anyway.
         """
-        with torch.autocast(device_type=x_norm.device.type, enabled=False):
-            return self._compute_generator(x_norm.float())
+        # PERF EXPERIMENT (2026-07-15): was `autocast(enabled=False)` +
+        # `x_norm.float()`, which forced every generator projection to read the
+        # wide [B, input_dim] activation as fp32 — profiled as the dominant
+        # CGHC inference cost (~13.7ms/step at 124M bs8). Projections now run
+        # in bf16 under autocast; only their small outputs are upcast inside
+        # _compute_generator. TODO: validate numerics long-run, then make final.
+        return self._compute_generator(x_norm)
 
     def _compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
+        # Projection outputs are upcast right after each GEMM (see the perf
+        # note in compute_generator); everything downstream stays fp32.
         B = x_norm.shape[0]
-        A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=x_norm.dtype)
+        A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=torch.float32)
 
         # --- Conservative branch ---
         if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conserv_pred(x_norm).reshape(B, self.n, self.n)
-            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm)  # [B, n]
+            M = self.conserv_A + self.conserv_pred(x_norm).reshape(B, self.n, self.n).float()
+            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm).float()  # [B, n]
             dt_conserv = torch.exp(
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_conserv)
             )
@@ -366,7 +374,7 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "diss_diag")
             or hasattr(self, "laplacian_A")
         ):
-            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm)  # [B, n]
+            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm).float()  # [B, n]
             dt_diss = torch.exp(
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_diss)
             )
@@ -374,8 +382,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
-            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n)
-            K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD
+            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n).float()
+            with torch.autocast(device_type=x_norm.device.type, enabled=False):
+                K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD (fp32 even under autocast)
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 diss_dt = dt_diss.unsqueeze(-1) * K
@@ -387,7 +396,7 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
             d = torch.exp(self.diss_log_scale) * F.softplus(
-                self.diss_diag + self.diss_pred(x_norm)
+                self.diss_diag + self.diss_pred(x_norm).float()
             )  # [B, n], positive
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
@@ -397,7 +406,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- Laplacian dissipative branch ---
         if hasattr(self, "laplacian_A"):
-            scores = self.laplacian_A + self.laplacian_pred(x_norm).reshape(B, self.n, self.n)
+            scores = self.laplacian_A + self.laplacian_pred(x_norm).reshape(B, self.n, self.n).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
