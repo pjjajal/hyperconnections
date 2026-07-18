@@ -51,6 +51,7 @@ class ContinuousGenHyperConnections(nn.Module):
         elementwise_affine: bool = False,
         use_triton: bool = True,
         vec_dt: bool = False,
+        sat_c: float | None = 2.0,
         shortconv_kernel_size: int = 0,
         shortconv_causal: bool = True,
     ):
@@ -103,6 +104,16 @@ class ContinuousGenHyperConnections(nn.Module):
         self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
         self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
+
+        # Saturation threshold for the soft-clip c*tanh(x/c) on the skew entries
+        # and the diagonal dissipation rates. The expm kernels run a *fixed*
+        # S=2 scaling-and-squaring, accurate only for ||A||_1 <= theta_18 * 2^S
+        # (~12) with no adaptive fallback; dt is sigmoid-bounded but the
+        # generator predictors are not, so without a clip a tail token can push
+        # A past the budget and silently corrupt Phi. Slope 1 at 0 leaves init
+        # semantics untouched (worst case ||A||_1 <= dt_max * (n + 1) * sat_c
+        # for conservative_diag_diss). None disables.
+        self.sat_c = sat_c
 
         # Generator parameters — boolean flags drive which components are created
         conserv = generator_type in {
@@ -356,6 +367,9 @@ class ContinuousGenHyperConnections(nn.Module):
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_conserv)
             )
             skew = 0.5 * (M - M.transpose(-1, -2))  # [B, n, n], skew-symmetric
+            if self.sat_c is not None:
+                # tanh is odd, so the elementwise soft-clip preserves skew-symmetry
+                skew = self.sat_c * torch.tanh(skew / self.sat_c)
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 skew_dt = dt_conserv.unsqueeze(-1) * skew
@@ -398,6 +412,14 @@ class ContinuousGenHyperConnections(nn.Module):
             d = torch.exp(self.diss_log_scale) * F.softplus(
                 self.diss_diag + self.diss_pred(x_norm).float()
             )  # [B, n], positive
+            if self.sat_c is not None:
+                # Clip after the exp(log_scale) product — the scale is learnable,
+                # so any bound upstream of it is not a bound. Rational form
+                # rather than tanh: same bound and slope 1 at 0, but the
+                # gradient tail decays polynomially instead of exponentially,
+                # so over-shot entries keep a restoring signal (these params
+                # have no weight decay to pull them back).
+                d = d / (1 + d / self.sat_c)
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
             A = A - torch.diag_embed(
