@@ -16,7 +16,7 @@ from typing import Literal
 import torch
 from einops import einsum
 
-from hyperconnections.cghc import ContinuousGenHyperConnections
+from hyperconnections.cghc import CGHCProjections, ContinuousGenHyperConnections
 from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, expm_t18_block_triton
 
 
@@ -81,23 +81,24 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
             return expm_t18_block_triton(A)
         return expm_t18_augmented_sparse(A)
 
-    def compute_transition_expm_t18(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_transition_expm_t18(self, proj: CGHCProjections) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (exp(A), φ₁(A)), both of shape [B, n, n].
 
         Args:
-            x_norm: Normalized input of shape [B, input_dim]
+            proj: Fused input projection (from self.input_proj).
         """
-        A = self.compute_generator(x_norm)
+        A = self.compute_generator(proj)
         transition_matrix, psi = self._expm_block(A.float())
-        return transition_matrix.to(x_norm.dtype), psi.to(x_norm.dtype)
+        dtype = proj.read_in.dtype
+        return transition_matrix.to(dtype), psi.to(dtype)
 
-    def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
+    def compute_transition(self, proj: CGHCProjections) -> torch.Tensor:
         """Return exp(A) only, shape [B, n, n]. Delegates to compute_transition_expm_t18."""
-        transition, _ = self.compute_transition_expm_t18(x_norm)
+        transition, _ = self.compute_transition_expm_t18(proj)
         return transition
 
     def _transition_and_source(
-        self, x_norm: torch.Tensor, Y: torch.Tensor
+        self, proj: CGHCProjections, Y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        transition, psi = self.compute_transition_expm_t18(x_norm)
+        transition, psi = self.compute_transition_expm_t18(proj)
         return transition, einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")

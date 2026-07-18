@@ -91,7 +91,9 @@ class TestInit:
     def test_conservative_laplacian_creates_conserv_params(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
         assert hasattr(cghc, "conserv_A"), "conserv_A must exist for conservative_laplacian"
-        assert hasattr(cghc, "conserv_pred"), "conserv_pred must exist for conservative_laplacian"
+        assert "conserv" in cghc.input_proj._slices, (
+            "fused projection must have a conserv segment for conservative_laplacian"
+        )
         assert hasattr(cghc, "laplacian_A"), "laplacian_A must exist for conservative_laplacian"
 
     @pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
@@ -158,26 +160,26 @@ class TestGeneratorStructure:
                 cghc.laplacian_log_scale.fill_(0.0)
                 cghc.laplacian_A.add_(torch.randn_like(cghc.laplacian_A) * 0.1)
 
-    def _x_norm(self, cghc, B=3):
-        return torch.randn(B, cghc.input_dim)
+    def _proj(self, cghc, B=3):
+        return cghc.input_proj(torch.randn(B, cghc.input_dim))
 
     def test_conservative_is_skew_symmetric(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative")
         self._perturb(cghc)
-        A = cghc.compute_generator(self._x_norm(cghc))
+        A = cghc.compute_generator(self._proj(cghc))
         assert torch.allclose(A + A.transpose(-1, -2), torch.zeros_like(A), atol=1e-5)
 
     def test_psd_diss_is_negative_semidefinite(self):
         cghc = make_cghc(4, 2, 8, generator_type="psd_diss")
         self._perturb(cghc)
-        A = cghc.compute_generator(self._x_norm(cghc))
+        A = cghc.compute_generator(self._proj(cghc))
         eigvals = torch.linalg.eigvalsh(A)
         assert (eigvals <= 1e-4).all(), "psd_diss generator must be NSD"
 
     def test_diagonal_diss_has_nonpositive_diagonal_and_zero_offdiag(self):
         cghc = make_cghc(4, 2, 8, generator_type="diagonal_diss")
         self._perturb(cghc)
-        A = cghc.compute_generator(self._x_norm(cghc))
+        A = cghc.compute_generator(self._proj(cghc))
         diag = torch.diagonal(A, dim1=-2, dim2=-1)
         off_diag_mask = ~torch.eye(cghc.n, dtype=torch.bool)
         assert (diag <= 0).all(), "diagonal entries must be non-positive"
@@ -188,14 +190,14 @@ class TestGeneratorStructure:
     def test_laplacian_A_small_at_init(self):
         """laplacian_log_scale=log(1e-3) at init gives ~7e-4 adjacency → A near zero but not exact."""
         cghc = make_cghc(4, 2, 8, generator_type="laplacian")
-        A = cghc.compute_generator(self._x_norm(cghc))
+        A = cghc.compute_generator(self._proj(cghc))
         assert torch.allclose(A, torch.zeros_like(A), atol=1e-2), "laplacian A must be near zero at init"
 
     def test_conservative_laplacian_is_neither_symmetric_nor_skew(self):
         """Combined generator should have both conservative and dissipative parts."""
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
         self._perturb(cghc)
-        A = cghc.compute_generator(self._x_norm(cghc))
+        A = cghc.compute_generator(self._proj(cghc))
         # Not purely skew-symmetric (laplacian adds symmetric negative part)
         assert not torch.allclose(A + A.transpose(-1, -2), torch.zeros_like(A), atol=1e-3)
 
@@ -227,7 +229,7 @@ class TestInitialTransition:
         n, m, embed_dim = 4, 2, 8
         cghc = make_cghc(n, m, embed_dim, generator_type=generator_type)
         x = torch.randn(3, (n * embed_dim) // m)
-        Phi = cghc.compute_transition(x)
+        Phi = cghc.compute_transition(cghc.input_proj(x))
         I = torch.eye(n).unsqueeze(0).expand_as(Phi)
         assert torch.allclose(Phi, I, atol=1e-2), (
             f"Transition should be near-I at init for generator_type='{generator_type}'"
@@ -242,7 +244,7 @@ class TestInitialTransition:
         with torch.no_grad():
             cghc.conserv_A.add_(torch.randn_like(cghc.conserv_A) * 0.5)
         x = torch.randn(3, cghc.input_dim)
-        Phi = cghc.compute_transition(x)
+        Phi = cghc.compute_transition(cghc.input_proj(x))
         I = torch.eye(4).unsqueeze(0).expand_as(Phi)
         assert torch.allclose(Phi @ Phi.transpose(-1, -2), I, atol=1e-4)
 
@@ -258,7 +260,7 @@ class TestReadWriteWeights:
         cghc = make_cghc(n, m, embed_dim)
         B = 3
         x = torch.randn(B, (n * embed_dim) // m)
-        write_out, read_in = cghc.compute_read_write_weights(x)
+        write_out, read_in = cghc.compute_read_write_weights(cghc.input_proj(x))
         assert write_out.shape == (B, n, m)
         assert read_in.shape == (B, m, n)
 
@@ -268,7 +270,7 @@ class TestReadWriteWeights:
         cghc = make_cghc(n, m, embed_dim)
         B = 3
         x = torch.randn(B, (n * embed_dim) // m)
-        _, read_in = cghc.compute_read_write_weights(x)  # [B, m, n]
+        _, read_in = cghc.compute_read_write_weights(cghc.input_proj(x))  # [B, m, n]
         if m == 1:
             expected = 1.0 / n
             assert torch.allclose(read_in, torch.full_like(read_in, expected), atol=0.02)
@@ -286,7 +288,7 @@ class TestReadWriteWeights:
         cghc = make_cghc(n, m, embed_dim)
         B = 3
         x = torch.randn(B, (n * embed_dim) // m)
-        write_out, _ = cghc.compute_read_write_weights(x)  # [B, n, m]
+        write_out, _ = cghc.compute_read_write_weights(cghc.input_proj(x))  # [B, n, m]
         for i in range(n):
             on = i % m
             assert write_out[:, i, on].mean().item() == pytest.approx(1.0, abs=0.05)
