@@ -13,7 +13,7 @@
 # optimizer param groups with exactly this split.
 
 import math
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,120 @@ from timm.layers import trunc_normal_
 
 from hyperconnections.ops import HAS_TRITON, expm_t18, expm_t18_triton, stream_mix_add
 from hyperconnections.short_conv import DepthwiseShortConv1d
+
+
+class CGHCProjections(NamedTuple):
+    """Per-map slices of the fused input projection (see FusedInputProjection).
+
+    read_in/write_out are always present. A CGHC has at most one conservative
+    (skew) part and at most one dissipative part — psd/diagonal/laplacian are
+    mutually exclusive — so `diss` carries whichever dissipative predictor is
+    active. Each tensor is [B, seg_dim] in the ambient (autocast) dtype; disabled
+    components are None.
+    """
+
+    read_in: torch.Tensor
+    write_out: torch.Tensor
+    conserv: torch.Tensor | None = None
+    dt_conserv: torch.Tensor | None = None
+    diss: torch.Tensor | None = None
+    dt_diss: torch.Tensor | None = None
+    proj_v: torch.Tensor | None = None
+
+
+class FusedInputProjection(nn.Module):
+    """Every x_norm-consuming linear map concatenated into ONE weight.
+
+    The wide [B, input_dim] activation is read from HBM once and a single GEMM
+    produces all projections, replacing one skinny GEMM per map. The output is
+    sliced into a CGHCProjections bundle.
+
+    The generator predictors come in symmetric (predictor, dt) pairs: a
+    conservative pair when `conserv`, and a dissipative pair when `diss_dim` is
+    set (its width is n·n for psd/laplacian, n for diagonal — the caller picks).
+
+    Init / decay semantics carried over from the per-Linear version:
+      - Predictors (conserv/diss/proj_v): bias-free, zero-init, so the generator/
+        projection starts exactly at its static anchor.
+      - Read/write gates and dt segments: small trunc_normal noise + their own
+        1-D bias (zero-init) for input-dependent variation.
+      - The fused weight is 2-D → keeps weight decay, identical to the separate
+        weights it replaces; biases are 1-D → no decay (see split_decay_param_groups).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        n: int,
+        m: int,
+        n_dt: int,
+        bias: bool,
+        conserv: bool,
+        diss_dim: int | None,
+        proj_v: bool,
+    ):
+        super().__init__()
+        # (key, out_dim, has_bias, init) with init ∈ {"noise", "zero"}.
+        # Predictor+dt come as a pair; "noise"/bias go on the gates and dt only.
+        segments: list[tuple[str, int, bool, str]] = [
+            ("read_in", n * m, bias, "noise"),
+            ("write_out", n * m, bias, "noise"),
+        ]
+        if conserv:
+            segments += [("conserv", n * n, False, "zero"), ("dt_conserv", n_dt, True, "noise")]
+        if diss_dim is not None:
+            segments += [("diss", diss_dim, False, "zero"), ("dt_diss", n_dt, True, "noise")]
+        if proj_v:
+            segments += [("proj_v", n, False, "zero")]
+
+        offset = 0
+        self._slices: dict[str, tuple[int, int]] = {}
+        self._init: dict[str, str] = {}
+        for key, dim, _has_bias, init_kind in segments:
+            self._slices[key] = (offset, offset + dim)
+            self._init[key] = init_kind
+            offset += dim
+        self.fused = nn.Linear(input_dim, offset, bias=False)
+        self.biases = nn.ParameterDict(
+            {key: nn.Parameter(torch.zeros(dim)) for key, dim, has_bias, _ in segments if has_bias}
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        with torch.no_grad():
+            W = self.fused.weight  # [total_out, input_dim]
+            for key, (s, e) in self._slices.items():
+                if self._init[key] == "zero":
+                    nn.init.zeros_(W[s:e])
+                else:
+                    trunc_normal_(W[s:e], std=0.01)
+        for b in self.biases.values():
+            nn.init.zeros_(b)
+
+    def forward(self, x_norm: torch.Tensor) -> CGHCProjections:
+        h = self.fused(x_norm)  # [B, total_out] — one GEMM
+
+        def seg(key: str) -> torch.Tensor | None:
+            bounds = self._slices.get(key)
+            if bounds is None:
+                return None
+            out = h[..., bounds[0] : bounds[1]]
+            if key in self.biases:
+                # cast bias to the GEMM output dtype so a bias'd segment stays in
+                # the ambient (autocast) dtype, matching the old fused-Linear op.
+                out = out + self.biases[key].to(out.dtype)
+            return out
+
+        return CGHCProjections(
+            read_in=seg("read_in"),
+            write_out=seg("write_out"),
+            conserv=seg("conserv"),
+            dt_conserv=seg("dt_conserv"),
+            diss=seg("diss"),
+            dt_diss=seg("dt_diss"),
+            proj_v=seg("proj_v"),
+        )
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -77,9 +191,8 @@ class ContinuousGenHyperConnections(nn.Module):
         self.alpha_read_in = nn.Parameter(torch.empty(1))
         self.write_out = nn.Parameter(torch.empty(n, m))
         self.alpha_write_out = nn.Parameter(torch.empty(1))
-
-        self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
-        self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
+        # The read/write dynamic components come from the fused input projection
+        # (self.proj_fused) built below, once all component flags are known.
 
         # dt parameters — log-space sigmoid interpolation:
         #   dt = exp(log dt_min + (log dt_max - log dt_min) * σ(θ))
@@ -102,8 +215,6 @@ class ContinuousGenHyperConnections(nn.Module):
         n_dt = n if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.dt_proj_conserv = nn.Linear(input_dim, n_dt, bias=True)
-        self.dt_proj_diss = nn.Linear(input_dim, n_dt, bias=True)
 
         # Saturation threshold for the soft-clip c*tanh(x/c) on the skew entries
         # and the diagonal dissipation rates. The expm kernels run a *fixed*
@@ -128,10 +239,8 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if conserv:
             self.conserv_A = nn.Parameter(torch.eye(n, n))
-            self.conserv_pred = nn.Linear(input_dim, n * n, bias=False)
         if psd_diss:
             self.diss_A = nn.Parameter(torch.zeros(n, n))
-            self.diss_pred = nn.Linear(input_dim, n * n, bias=False)
         # Dissipation magnitude is factored out of the softplus argument:
         #   d = exp(log_scale) * softplus(anchor + pred(x))
         # The anchor sits at 0 (softplus'(0) = 0.5, responsive) instead of deep in
@@ -141,20 +250,33 @@ class ContinuousGenHyperConnections(nn.Module):
         if diag_diss:
             self.diss_diag = nn.Parameter(torch.zeros(n))
             self.diss_log_scale = nn.Parameter(torch.empty(1))
-            self.diss_pred = nn.Linear(input_dim, n, bias=False)
         if laplacian:
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
             self.laplacian_log_scale = nn.Parameter(torch.empty(1))
-            self.laplacian_pred = nn.Linear(input_dim, n * n, bias=False)
 
         # Projection Direction
         if projection == "mean":
             self.register_buffer("projection_dir", torch.ones(n) / math.sqrt(n))
         elif projection == "v":
             self.register_buffer("base_projection_dir", torch.ones(n) / math.sqrt(n))
-            self.projection_dir = nn.Linear(input_dim, n, bias=False)
         elif projection == "none":
             self.projection_dir = None
+
+        # Fused input projection: one GEMM for every x_norm-consuming linear map
+        # (read/write gates, generator predictors, dt, proj_v). The single active
+        # dissipative predictor is n·n wide for psd/laplacian, n for diagonal. See
+        # FusedInputProjection for init/decay semantics.
+        diss_dim = n if diag_diss else (n * n if (psd_diss or laplacian) else None)
+        self.input_proj = FusedInputProjection(
+            input_dim,
+            n=n,
+            m=m,
+            n_dt=n_dt,
+            bias=bias,
+            conserv=conserv,
+            diss_dim=diss_dim,
+            proj_v=(projection == "v"),
+        )
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
@@ -235,30 +357,12 @@ class ContinuousGenHyperConnections(nn.Module):
             nn.init.zeros_(self.laplacian_A)
             nn.init.constant_(self.laplacian_log_scale, math.log(1e-3))
 
-        # Generator Dynamic Parameters
-        if hasattr(self, "conserv_pred"):
-            nn.init.zeros_(self.conserv_pred.weight)
-
-        if hasattr(self, "diss_pred"):
-            nn.init.zeros_(self.diss_pred.weight)
-
-        if hasattr(self, "laplacian_pred"):
-            nn.init.zeros_(self.laplacian_pred.weight)
-
         self._init_log_dt(self.log_dt_conserv)
         self._init_log_dt(self.log_dt_diss)
 
-        # dt_proj: small random init for weights, zero bias for centered initial dt with input-dependent variation
-        trunc_normal_(self.dt_proj_conserv.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_conserv.bias)
-        trunc_normal_(self.dt_proj_diss.weight, std=0.01)
-        nn.init.zeros_(self.dt_proj_diss.bias)
-
-        # Projections: small random init for weights, zero bias so initial mean behaviour matches static biases
-        for proj in (self.proj_read_in, self.proj_write_out):
-            trunc_normal_(proj.weight, std=0.01)
-            if proj.bias is not None:
-                nn.init.zeros_(proj.bias)
+        # Fused input projection self-initializes in its constructor; re-run here
+        # so init_weights() stays idempotent and fully re-initializes the module.
+        self.input_proj.reset_parameters()
 
         # mean projection: set to mean direction.
         # small noise for asymmetry breaking so projection isn't exactly static at init, but normalised to keep initial scale consistent.
@@ -267,10 +371,11 @@ class ContinuousGenHyperConnections(nn.Module):
             with torch.no_grad():
                 self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01)
                 self.projection_dir.div_(self.projection_dir.norm())
-        # proj_v: zero init for weights to start at base_projection_dir with input-dependent variation
+        # proj_v: base direction static; the proj_v segment of proj_fused is
+        # zero-init (handled above) so it starts at base_projection_dir with
+        # input-dependent variation.
         if self.projection == "v":
             self.base_projection_dir.fill_(1.0 / math.sqrt(self.n))
-            nn.init.zeros_(self.projection_dir.weight)
 
         # RMSNorm weights: must be ones for proper normalization
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
@@ -320,11 +425,13 @@ class ContinuousGenHyperConnections(nn.Module):
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-    def compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
+    def compute_generator(self, proj: CGHCProjections) -> torch.Tensor:
         """Return the effective generator A of shape [B, n, n].
 
         Args:
-            x_norm: Normalized input of shape [B, input_dim]
+            proj: Fused input projection (from self.input_proj). Its per-map
+                slices replace the old per-Linear GEMMs; the generator fields are
+                present exactly when the corresponding component is enabled.
 
         When vec_dt=True, each stream has its own time scale and the generator is
         built via a symmetric congruence sandwich:
@@ -343,26 +450,17 @@ class ContinuousGenHyperConnections(nn.Module):
 
         Projections run in the ambient (autocast) dtype; assembly is float32:
         A entries are O(dt * weight), near bf16 resolution early in training,
-        and the expm consumes fp32 anyway.
+        and the expm consumes fp32 anyway. Projection slices are upcast to fp32
+        as they enter the assembly; everything downstream stays fp32.
         """
-        # PERF EXPERIMENT (2026-07-15): was `autocast(enabled=False)` +
-        # `x_norm.float()`, which forced every generator projection to read the
-        # wide [B, input_dim] activation as fp32 — profiled as the dominant
-        # CGHC inference cost (~13.7ms/step at 124M bs8). Projections now run
-        # in bf16 under autocast; only their small outputs are upcast inside
-        # _compute_generator. TODO: validate numerics long-run, then make final.
-        return self._compute_generator(x_norm)
-
-    def _compute_generator(self, x_norm: torch.Tensor) -> torch.Tensor:
-        # Projection outputs are upcast right after each GEMM (see the perf
-        # note in compute_generator); everything downstream stays fp32.
-        B = x_norm.shape[0]
-        A = torch.zeros(B, self.n, self.n, device=x_norm.device, dtype=torch.float32)
+        B = proj.read_in.shape[0]
+        device = proj.read_in.device
+        A = torch.zeros(B, self.n, self.n, device=device, dtype=torch.float32)
 
         # --- Conservative branch ---
         if hasattr(self, "conserv_A"):
-            M = self.conserv_A + self.conserv_pred(x_norm).reshape(B, self.n, self.n).float()
-            logit_conserv = self.log_dt_conserv + self.dt_proj_conserv(x_norm).float()  # [B, n]
+            M = self.conserv_A + proj.conserv.reshape(B, self.n, self.n).float()
+            logit_conserv = self.log_dt_conserv + proj.dt_conserv.float()  # [B, n]
             dt_conserv = torch.exp(
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_conserv)
             )
@@ -388,7 +486,7 @@ class ContinuousGenHyperConnections(nn.Module):
             or hasattr(self, "diss_diag")
             or hasattr(self, "laplacian_A")
         ):
-            logit_diss = self.log_dt_diss + self.dt_proj_diss(x_norm).float()  # [B, n]
+            logit_diss = self.log_dt_diss + proj.dt_diss.float()  # [B, n]
             dt_diss = torch.exp(
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_diss)
             )
@@ -396,8 +494,8 @@ class ContinuousGenHyperConnections(nn.Module):
 
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
-            R = self.diss_A + self.diss_pred(x_norm).reshape(B, self.n, self.n).float()
-            with torch.autocast(device_type=x_norm.device.type, enabled=False):
+            R = self.diss_A + proj.diss.reshape(B, self.n, self.n).float()
+            with torch.autocast(device_type=device.type, enabled=False):
                 K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD (fp32 even under autocast)
             if not self.vec_dt:
                 # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
@@ -410,7 +508,7 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- Diagonal dissipative branch ---
         if hasattr(self, "diss_diag"):
             d = torch.exp(self.diss_log_scale) * F.softplus(
-                self.diss_diag + self.diss_pred(x_norm).float()
+                self.diss_diag + proj.diss.float()
             )  # [B, n], positive
             if self.sat_c is not None:
                 # Clip after the exp(log_scale) product — the scale is learnable,
@@ -426,9 +524,9 @@ class ContinuousGenHyperConnections(nn.Module):
                 dt_diss * d
             )  # dt_diss [B,1] * d [B,n] broadcasts correctly
 
-        # --- Laplacian dissipative branch ---
+        # --- Laplacian dissipative branch (shares the single "diss" predictor) ---
         if hasattr(self, "laplacian_A"):
-            scores = self.laplacian_A + self.laplacian_pred(x_norm).reshape(B, self.n, self.n).float()
+            scores = self.laplacian_A + proj.diss.reshape(B, self.n, self.n).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
             adjacency = adjacency - torch.diag_embed(
@@ -447,28 +545,28 @@ class ContinuousGenHyperConnections(nn.Module):
 
         return A
 
-    def compute_transition(self, x_norm: torch.Tensor) -> torch.Tensor:
+    def compute_transition(self, proj: CGHCProjections) -> torch.Tensor:
         """Return Phi = exp(A), shape [B, n, n] (dt is folded into A).
 
         Args:
-            x_norm: Normalized input of shape [B, input_dim]
+            proj: Fused input projection (from self.input_proj).
         """
-        A = self.compute_generator(x_norm)  # fp32
-        return self._matrix_exp(A).to(x_norm.dtype)
+        A = self.compute_generator(proj)  # fp32
+        return self._matrix_exp(A).to(proj.read_in.dtype)
 
     def _matrix_exp_eager(self, A: torch.Tensor) -> torch.Tensor:
         return expm_t18(A.float()).to(A.dtype)
 
-    def compute_read_write_weights(self, x_norm: torch.Tensor):
-        """Compute dynamic read/write weights from the current stream state.
+    def compute_read_write_weights(self, proj: CGHCProjections):
+        """Compute dynamic read/write weights from the fused input projection.
 
         Args:
-            x_norm: Normalized input of shape [B, input_dim]
+            proj: Fused input projection (from self.input_proj).
         """
-        B = x_norm.shape[0]
+        B = proj.read_in.shape[0]
 
-        h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
-        h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
+        h_read_in = proj.read_in.reshape(B, self.n, self.m)
+        h_write_out = proj.write_out.reshape(B, self.n, self.m)
 
         read_in = torch.sigmoid(
             self.alpha_read_in * h_read_in + self.read_in
@@ -479,16 +577,17 @@ class ContinuousGenHyperConnections(nn.Module):
 
         return write_out, read_in
 
-    def compute_projection(self, x_norm: torch.Tensor):
+    def compute_projection(self, proj: CGHCProjections):
         """Compute projection direction.
 
         Args:
-            x_norm: Normalized input of shape [B, input_dim]
+            proj: Fused input projection (from self.input_proj). Only proj.proj_v
+                is used, and only in "v" mode.
         """
         if self.projection == "mean":
             return self.projection_dir.unsqueeze(0)  # [1, n]
         elif self.projection == "v":
-            v = self.projection_dir(x_norm) + self.base_projection_dir  # [B, n]
+            v = proj.proj_v + self.base_projection_dir  # [B, n]
             return F.normalize(v, dim=-1)  # [B, n], unit norm
         else:
             return None
@@ -531,13 +630,13 @@ class ContinuousGenHyperConnections(nn.Module):
         return x_mixed + Y
 
     def _transition_and_source(
-        self, x_norm: torch.Tensor, Y: torch.Tensor
+        self, proj: CGHCProjections, Y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (transition_matrix, Y) for stream mixing.
 
         Subclasses override this to apply φ₁(A) to Y (forced/exact integration).
         """
-        return self.compute_transition(x_norm), Y
+        return self.compute_transition(proj), Y
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -559,7 +658,10 @@ class ContinuousGenHyperConnections(nn.Module):
             src = x
         x_norm = self.norm(src.view(B, -1))  ### [B*, input_dim]
 
-        write_out, read_in = self.compute_read_write_weights(x_norm)
+        ### One fused GEMM for every x_norm-derived projection; sliced downstream.
+        proj = self.input_proj(x_norm)
+
+        write_out, read_in = self.compute_read_write_weights(proj)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
         ### Read in from over-width space to backbone width
@@ -573,9 +675,9 @@ class ContinuousGenHyperConnections(nn.Module):
         Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
 
         ### Compute transition matrix and (optionally) apply φ₁ to Y
-        transition_matrix, Y = self._transition_and_source(x_norm, Y)
+        transition_matrix, Y = self._transition_and_source(proj, Y)
 
-        projection_dir = self.compute_projection(x_norm)  ### [B, n] or None
+        projection_dir = self.compute_projection(proj)  ### [B, n] or None
 
         return (
             self._stream_mix(

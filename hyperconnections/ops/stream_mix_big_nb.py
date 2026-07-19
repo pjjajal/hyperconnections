@@ -409,15 +409,21 @@ class _StreamMixBigNBFn(torch.autograd.Function):
         B, N, D   = x.shape
         use_proj  = v is not None
 
-        G = grad_out.float().contiguous()
+        # G keeps grad_out's native dtype: the kernels upcast on load and grad_out
+        # already arrives in the input dtype, so .float() recovers no precision —
+        # it only doubles the [B, N, D] tensor every backward kernel/einsum streams.
+        G = grad_out.contiguous()
 
         ### Shared intermediates (proj only)
         alpha = beta = phi_v = c = None
         if use_proj:
-            alpha = torch.einsum("bn,bnd->bd", v.float(), x.float())             # [B, D]
+            # Read x/G natively (matched operands cast to their dtype); einsum/bmm
+            # accumulate in fp32 on CUDA anyway, so upcast only the small [B, D]/[B, N]
+            # outputs rather than materializing a 268 MB fp32 copy of a [B, N, D] input.
+            alpha = torch.einsum("bn,bnd->bd", v, x).float()                     # [B, D]
             phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1)  # [B, N]
             c     = v.float() - phi_v                                             # [B, N]
-            beta  = torch.einsum("bnd,bn->bd", G, c)                             # [B, D]
+            beta  = torch.einsum("bnd,bn->bd", G, c.to(G.dtype)).float()         # [B, D]
 
         ### grad_x (Triton)
         grad_x = torch.empty_like(x)
@@ -433,9 +439,11 @@ class _StreamMixBigNBFn(torch.autograd.Function):
         ### grad_v (PyTorch)
         grad_v = None
         if use_proj and ctx.needs_input_grad[3]:
-            rho       = (G * alpha.unsqueeze(1)).sum(dim=2)
+            # einsum reads G natively; the elementwise (G * alpha).sum(dim=2) form
+            # instead materialized a 268 MB fp32 [B, N, D] temp on every backward.
+            rho       = torch.einsum("bnd,bd->bn", G, alpha.to(G.dtype)).float()
             rho_part  = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)
-            beta_part = torch.einsum("bd,bnd->bn", beta, x.float())
+            beta_part = torch.einsum("bd,bnd->bn", beta.to(x.dtype), x).float()
             grad_v    = (rho_part + beta_part).to(v.dtype)
 
         return (
