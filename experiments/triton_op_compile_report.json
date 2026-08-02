@@ -1,0 +1,633 @@
+{
+  "experiment": "triton_op_compile",
+  "torch": "2.12.1+cu130",
+  "triton": "3.7.1",
+  "device": "NVIDIA A100 80GB PCIe",
+  "config": {
+    "ops": [
+      "stream_mix",
+      "expm",
+      "expm_block"
+    ],
+    "modes": [
+      "default",
+      "max-autotune"
+    ],
+    "batch": 4096,
+    "streams": 4,
+    "dim": 768,
+    "dtype": "fp32",
+    "no_proj": false,
+    "warmup": 10,
+    "iters": 50,
+    "seed": 0,
+    "tolerance": 0.005,
+    "output": "experiments/triton_op_compile_report.json"
+  },
+  "results": [
+    {
+      "op": "stream_mix",
+      "variant": "eager_ref",
+      "correctness": {
+        "out_max_abs_err": 0.0,
+        "grad_max_abs_err": 0.0
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.9282577317208052,
+            "median_ms": 0.9254852775484324,
+            "min_ms": 0.9202202782034874
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.889638263732195,
+            "median_ms": 2.885746071115136,
+            "min_ms": 2.879414241760969
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.5137945432215929,
+            "median_ms": 0.5139410495758057,
+            "min_ms": 0.5059516988694668
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.6551857255399227,
+            "median_ms": 1.6535250470042229,
+            "min_ms": 1.6456041485071182
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.5145717319101095,
+            "median_ms": 0.5140616558492184,
+            "min_ms": 0.5035260692238808
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.5632071904838085,
+            "median_ms": 1.5621175989508629,
+            "min_ms": 1.553911715745926
+          }
+        }
+      }
+    },
+    {
+      "op": "stream_mix",
+      "variant": "autograd_fn",
+      "correctness": {
+        "out_max_abs_err": 1.430511474609375e-06,
+        "grad_max_abs_err": 7.433982318616472e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.5143412668257952,
+            "median_ms": 0.5141114816069603,
+            "min_ms": 0.5066827870905399
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.072875313460827,
+            "median_ms": 2.071846043691039,
+            "min_ms": 2.064481843262911
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.38981860503554344,
+            "median_ms": 0.3883854951709509,
+            "min_ms": 0.38191815838217735
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.4516601152718067,
+            "median_ms": 1.4510529581457376,
+            "min_ms": 1.4423523098230362
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.5195219162851572,
+            "median_ms": 0.5181743763387203,
+            "min_ms": 0.5126441828906536
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.667151264846325,
+            "median_ms": 1.667144475504756,
+            "min_ms": 1.6579166986048222
+          }
+        }
+      }
+    },
+    {
+      "op": "stream_mix",
+      "variant": "triton_op",
+      "correctness": {
+        "out_max_abs_err": 1.430511474609375e-06,
+        "grad_max_abs_err": 7.433982318616472e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.5116756819188595,
+            "median_ms": 0.5114215891808271,
+            "min_ms": 0.5069943144917488
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.076719058677554,
+            "median_ms": 2.071134513244033,
+            "min_ms": 2.0587509498000145
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.38578564301133156,
+            "median_ms": 0.3842820879071951,
+            "min_ms": 0.3798939287662506
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.4420791901648045,
+            "median_ms": 1.4384097885340452,
+            "min_ms": 1.4300192706286907
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.513715660199523,
+            "median_ms": 0.5132700316607952,
+            "min_ms": 0.5062120035290718
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.5991051588207483,
+            "median_ms": 1.5970279928296804,
+            "min_ms": 1.5820651315152645
+          }
+        }
+      }
+    },
+    {
+      "op": "stream_mix",
+      "variant": "custom_op",
+      "correctness": {
+        "out_max_abs_err": 1.430511474609375e-06,
+        "grad_max_abs_err": 7.433982318616472e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.511961430311203,
+            "median_ms": 0.5116877146065235,
+            "min_ms": 0.5069831386208534
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.0729085337370634,
+            "median_ms": 2.0707291550934315,
+            "min_ms": 2.063330262899399
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.39226096123456955,
+            "median_ms": 0.3916863352060318,
+            "min_ms": 0.3833109512925148
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.4412671234458685,
+            "median_ms": 1.439867541193962,
+            "min_ms": 1.4301487244665623
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.5175547488033772,
+            "median_ms": 0.5167212802916765,
+            "min_ms": 0.5087470635771751
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.5973431896418333,
+            "median_ms": 1.5901150181889534,
+            "min_ms": 1.576433889567852
+          }
+        }
+      }
+    },
+    {
+      "op": "expm",
+      "variant": "eager_ref",
+      "correctness": {
+        "out_max_abs_err": 0.0,
+        "grad_max_abs_err": 0.0
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.8502815105021,
+            "median_ms": 0.8480595424771309,
+            "min_ms": 0.8326461538672447
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.3328824061900377,
+            "median_ms": 2.3260083980858326,
+            "min_ms": 2.2824620828032494
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.9191430639475584,
+            "median_ms": 0.912380637601018,
+            "min_ms": 0.8979388512670994
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.4224651884287596,
+            "median_ms": 2.3878500796854496,
+            "min_ms": 2.353886142373085
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "error": "RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. Please use tensor.pin_memory() or allocate the tensor with pin_memory=True."
+          },
+          "fwd_bwd": {
+            "error": "RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. Please use tensor.pin_memory() or allocate the tensor with pin_memory=True."
+          }
+        }
+      }
+    },
+    {
+      "op": "expm",
+      "variant": "autograd_fn",
+      "correctness": {
+        "out_max_abs_err": 7.62939453125e-06,
+        "grad_max_abs_err": 8.87666828930378e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.40078679099678993,
+            "median_ms": 0.39880513213574886,
+            "min_ms": 0.39457110688090324
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.2545390892773867,
+            "median_ms": 1.2496339622884989,
+            "min_ms": 1.244029961526394
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.37011774256825447,
+            "median_ms": 0.3683681134134531,
+            "min_ms": 0.36477623507380486
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.2367141712456942,
+            "median_ms": 1.2345514260232449,
+            "min_ms": 1.229862216860056
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.2652145270258188,
+            "median_ms": 0.2630248200148344,
+            "min_ms": 0.2596988342702389
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.0359265003353357,
+            "median_ms": 1.0354667901992798,
+            "min_ms": 1.0250876657664776
+          }
+        }
+      }
+    },
+    {
+      "op": "expm",
+      "variant": "triton_op",
+      "correctness": {
+        "out_max_abs_err": 7.62939453125e-06,
+        "grad_max_abs_err": 8.87666828930378e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.42152058333158493,
+            "median_ms": 0.4193228669464588,
+            "min_ms": 0.41425880044698715
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.298839384689927,
+            "median_ms": 1.293927663937211,
+            "min_ms": 1.2869900092482567
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.3676576539874077,
+            "median_ms": 0.3657273482531309,
+            "min_ms": 0.36111893132328987
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.229597171768546,
+            "median_ms": 1.2238712515681982,
+            "min_ms": 1.217719167470932
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.26243475265800953,
+            "median_ms": 0.2615621779114008,
+            "min_ms": 0.25830604135990143
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.0275679919868708,
+            "median_ms": 1.0239500552415848,
+            "min_ms": 1.0172128677368164
+          }
+        }
+      }
+    },
+    {
+      "op": "expm",
+      "variant": "custom_op",
+      "correctness": {
+        "out_max_abs_err": 7.62939453125e-06,
+        "grad_max_abs_err": 8.87666828930378e-10
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.4172545950859785,
+            "median_ms": 0.41616265662014484,
+            "min_ms": 0.41037192568182945
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.29935204051435,
+            "median_ms": 1.2947344221174717,
+            "min_ms": 1.2853271327912807
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.4696497693657875,
+            "median_ms": 0.46628271229565144,
+            "min_ms": 0.46041468158364296
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.3299831002950668,
+            "median_ms": 1.3250259216874838,
+            "min_ms": 1.3182791881263256
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.2612592652440071,
+            "median_ms": 0.2600837033241987,
+            "min_ms": 0.25641173124313354
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.0227795504033566,
+            "median_ms": 1.022442476823926,
+            "min_ms": 1.013526227325201
+          }
+        }
+      }
+    },
+    {
+      "op": "expm_block",
+      "variant": "eager_ref",
+      "correctness": {
+        "out_max_abs_err": 0.0,
+        "grad_max_abs_err": 0.0
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 1.3056078646332026,
+            "median_ms": 1.3009856920689344,
+            "min_ms": 1.28865335136652
+          },
+          "fwd_bwd": {
+            "mean_ms": 3.5204603523015976,
+            "median_ms": 3.5105959977954626,
+            "min_ms": 3.4736921079456806
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 1.2437323667109013,
+            "median_ms": 1.237201038748026,
+            "min_ms": 1.227939035743475
+          },
+          "fwd_bwd": {
+            "mean_ms": 3.3739590272307396,
+            "median_ms": 3.376731649041176,
+            "min_ms": 3.330615349113941
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "error": "RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. Please use tensor.pin_memory() or allocate the tensor with pin_memory=True."
+          },
+          "fwd_bwd": {
+            "error": "RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned. Please use tensor.pin_memory() or allocate the tensor with pin_memory=True."
+          }
+        }
+      }
+    },
+    {
+      "op": "expm_block",
+      "variant": "autograd_fn",
+      "correctness": {
+        "out_max_abs_err": 7.152557373046875e-06,
+        "grad_max_abs_err": 1.3096723705530167e-09
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.728698717430234,
+            "median_ms": 0.7262809667736292,
+            "min_ms": 0.7184012793004513
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.9739705231040716,
+            "median_ms": 1.9688783213496208,
+            "min_ms": 1.9588549621403217
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.6068016868084669,
+            "median_ms": 0.6053841207176447,
+            "min_ms": 0.5988860502839088
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.8666618131101131,
+            "median_ms": 1.8656142055988312,
+            "min_ms": 1.8592970445752144
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.42048923671245575,
+            "median_ms": 0.4193184431642294,
+            "min_ms": 0.41428906843066216
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.3715976849198341,
+            "median_ms": 1.3679128605872393,
+            "min_ms": 1.3517830520868301
+          }
+        }
+      }
+    },
+    {
+      "op": "expm_block",
+      "variant": "triton_op",
+      "correctness": {
+        "out_max_abs_err": 7.152557373046875e-06,
+        "grad_max_abs_err": 1.3096723705530167e-09
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.7232851907610893,
+            "median_ms": 0.7203149143606424,
+            "min_ms": 0.7146941497921944
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.0410162024199963,
+            "median_ms": 2.0155366510152817,
+            "min_ms": 2.006513997912407
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.6022787466645241,
+            "median_ms": 0.5999591667205095,
+            "min_ms": 0.5963821895420551
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.859139883890748,
+            "median_ms": 1.8560660537332296,
+            "min_ms": 1.8494091928005219
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.41915908455848694,
+            "median_ms": 0.4188781604170799,
+            "min_ms": 0.41333772242069244
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.363084316253662,
+            "median_ms": 1.3628029264509678,
+            "min_ms": 1.349367666989565
+          }
+        }
+      }
+    },
+    {
+      "op": "expm_block",
+      "variant": "custom_op",
+      "correctness": {
+        "out_max_abs_err": 7.152557373046875e-06,
+        "grad_max_abs_err": 1.3096723705530167e-09
+      },
+      "dynamo": {
+        "graphs": 1,
+        "graph_breaks": 0,
+        "break_reasons": []
+      },
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 0.7204187288880348,
+            "median_ms": 0.7145283743739128,
+            "min_ms": 0.7067485712468624
+          },
+          "fwd_bwd": {
+            "mean_ms": 2.0061649940907955,
+            "median_ms": 2.0045798737555742,
+            "min_ms": 1.9969758577644825
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 0.7252341974526644,
+            "median_ms": 0.7113330066204071,
+            "min_ms": 0.7028221152722836
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.9759970251470804,
+            "median_ms": 1.9731963984668255,
+            "min_ms": 1.9608787260949612
+          }
+        },
+        "compile:max-autotune": {
+          "fwd": {
+            "mean_ms": 0.4145151562988758,
+            "median_ms": 0.41310209780931473,
+            "min_ms": 0.40738610550761223
+          },
+          "fwd_bwd": {
+            "mean_ms": 1.3624480552971363,
+            "median_ms": 1.3564520049840212,
+            "min_ms": 1.3484456576406956
+          }
+        }
+      }
+    }
+  ]
+}

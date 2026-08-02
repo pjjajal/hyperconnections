@@ -1,0 +1,191 @@
+{
+  "experiment": "hc_stage_breakdown",
+  "torch": "2.12.1+cu130",
+  "device": "NVIDIA A100 80GB PCIe",
+  "config": {
+    "tokens": 8192,
+    "warmup": 10,
+    "iters": 50,
+    "autocast": true,
+    "sublayer": "mlp",
+    "module_only": true,
+    "seed": 0,
+    "output": "experiments/hc_stage_breakdown_mlp_report.json"
+  },
+  "results": [
+    {
+      "name": "mhc",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 2.4529555905610323,
+            "median_ms": 2.45049805380404,
+            "min_ms": 2.4418109096586704
+          },
+          "fwd_bwd": {
+            "mean_ms": 9.191013500094414,
+            "median_ms": 9.180822409689426,
+            "min_ms": 9.165843948721886
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 1.6823592223227024,
+            "median_ms": 1.6821729950606823,
+            "min_ms": 1.674898900091648
+          },
+          "fwd_bwd": {
+            "mean_ms": 5.186689896509051,
+            "median_ms": 5.183987086638808,
+            "min_ms": 5.163447931408882
+          }
+        }
+      }
+    },
+    {
+      "name": "cghc",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 2.0196694880723953,
+            "median_ms": 2.0171976648271084,
+            "min_ms": 2.0076949149370193
+          },
+          "fwd_bwd": {
+            "mean_ms": 9.192617861554027,
+            "median_ms": 9.191532153636217,
+            "min_ms": 9.17219603434205
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 1.6598851140588522,
+            "median_ms": 1.6593693289905787,
+            "min_ms": 1.6511538997292519
+          },
+          "fwd_bwd": {
+            "mean_ms": 5.458803018555045,
+            "median_ms": 5.453959573060274,
+            "min_ms": 5.435360129922628
+          }
+        }
+      }
+    },
+    {
+      "name": "cghc_eagerops",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 3.927878439426422,
+            "median_ms": 3.9160328451544046,
+            "min_ms": 3.9073070511221886
+          },
+          "fwd_bwd": {
+            "mean_ms": 13.289208402857184,
+            "median_ms": 13.250403804704547,
+            "min_ms": 13.190530706197023
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 2.91420447640121,
+            "median_ms": 2.9089143499732018,
+            "min_ms": 2.9018069617450237
+          },
+          "fwd_bwd": {
+            "mean_ms": 7.7952854335308075,
+            "median_ms": 7.79428007081151,
+            "min_ms": 7.779647130519152
+          }
+        }
+      }
+    },
+    {
+      "name": "cghc_linphi",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 2.007482573390007,
+            "median_ms": 2.0065177232027054,
+            "min_ms": 2.0000110380351543
+          },
+          "fwd_bwd": {
+            "mean_ms": 9.164960635825992,
+            "median_ms": 9.16507258079946,
+            "min_ms": 9.147520177066326
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 1.6525646671652794,
+            "median_ms": 1.6487648244947195,
+            "min_ms": 1.6419170424342155
+          },
+          "fwd_bwd": {
+            "mean_ms": 5.400938931852579,
+            "median_ms": 5.399968009442091,
+            "min_ms": 5.3693559020757675
+          }
+        }
+      }
+    },
+    {
+      "name": "cghc_einsum_mix",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 3.368069874122739,
+            "median_ms": 3.360578790307045,
+            "min_ms": 3.3555589616298676
+          },
+          "fwd_bwd": {
+            "mean_ms": 11.793914046138525,
+            "median_ms": 11.725091142579913,
+            "min_ms": 11.711700819432735
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 2.655562637373805,
+            "median_ms": 2.6541107799857855,
+            "min_ms": 2.645675092935562
+          },
+          "fwd_bwd": {
+            "mean_ms": 7.210804540663958,
+            "median_ms": 7.207708200439811,
+            "min_ms": 7.196611724793911
+          }
+        }
+      }
+    },
+    {
+      "name": "cghc_linphi_einsum",
+      "timings": {
+        "eager": {
+          "fwd": {
+            "mean_ms": 3.358226278796792,
+            "median_ms": 3.348416183143854,
+            "min_ms": 3.341283183544874
+          },
+          "fwd_bwd": {
+            "mean_ms": 11.706784525886178,
+            "median_ms": 11.698461370542645,
+            "min_ms": 11.67857926338911
+          }
+        },
+        "compile:default": {
+          "fwd": {
+            "mean_ms": 2.633326184004545,
+            "median_ms": 2.6309669483453035,
+            "min_ms": 2.623793203383684
+          },
+          "fwd_bwd": {
+            "mean_ms": 7.097933441400528,
+            "median_ms": 7.096122484654188,
+            "min_ms": 7.08393007516861
+          }
+        }
+      }
+    }
+  ]
+}
