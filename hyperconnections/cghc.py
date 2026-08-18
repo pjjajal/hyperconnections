@@ -215,15 +215,6 @@ class ContinuousGenHyperConnections(nn.Module):
         n_dt = n if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-
-        # Saturation threshold for the soft-clip c*tanh(x/c) on the skew entries
-        # and the diagonal dissipation rates. The expm kernels run a *fixed*
-        # S=2 scaling-and-squaring, accurate only for ||A||_1 <= theta_18 * 2^S
-        # (~12) with no adaptive fallback; dt is sigmoid-bounded but the
-        # generator predictors are not, so without a clip a tail token can push
-        # A past the budget and silently corrupt Phi. Slope 1 at 0 leaves init
-        # semantics untouched (worst case ||A||_1 <= dt_max * (n + 1) * sat_c
-        # for conservative_diag_diss). None disables.
         self.sat_c = sat_c
 
         # Generator parameters — boolean flags drive which components are created
@@ -241,12 +232,6 @@ class ContinuousGenHyperConnections(nn.Module):
             self.conserv_A = nn.Parameter(torch.eye(n, n))
         if psd_diss:
             self.diss_A = nn.Parameter(torch.zeros(n, n))
-        # Dissipation magnitude is factored out of the softplus argument:
-        #   d = exp(log_scale) * softplus(anchor + pred(x))
-        # The anchor sits at 0 (softplus'(0) = 0.5, responsive) instead of deep in
-        # the saturated tail; the shared log-scale carries the "starts tiny"
-        # magnitude and learns multiplicatively, with its gradient pooled across
-        # streams and tokens.
         if diag_diss:
             self.diss_diag = nn.Parameter(torch.zeros(n))
             self.diss_log_scale = nn.Parameter(torch.empty(1))
@@ -262,10 +247,6 @@ class ContinuousGenHyperConnections(nn.Module):
         elif projection == "none":
             self.projection_dir = None
 
-        # Fused input projection: one GEMM for every x_norm-consuming linear map
-        # (read/write gates, generator predictors, dt, proj_v). The single active
-        # dissipative predictor is n·n wide for psd/laplacian, n for diagonal. See
-        # FusedInputProjection for init/decay semantics.
         diss_dim = n if diag_diss else (n * n if (psd_diss or laplacian) else None)
         self.input_proj = FusedInputProjection(
             input_dim,
@@ -495,6 +476,10 @@ class ContinuousGenHyperConnections(nn.Module):
         # --- PSD dissipative (Gram matrix) branch ---
         if hasattr(self, "diss_A"):
             R = self.diss_A + proj.diss.reshape(B, self.n, self.n).float()
+            if self.sat_c is not None:
+                # Same soft-clip as the skew branch. R@R^T is PSD for any R,
+                # so clipping R first bounds K without breaking that property.
+                R = self.sat_c * torch.tanh(R / self.sat_c)
             with torch.autocast(device_type=device.type, enabled=False):
                 K = R @ R.transpose(-1, -2) / (self.n**0.5)  # [B, n, n], PSD (fp32 even under autocast)
             if not self.vec_dt:
@@ -511,12 +496,11 @@ class ContinuousGenHyperConnections(nn.Module):
                 self.diss_diag + proj.diss.float()
             )  # [B, n], positive
             if self.sat_c is not None:
-                # Clip after the exp(log_scale) product — the scale is learnable,
-                # so any bound upstream of it is not a bound. Rational form
-                # rather than tanh: same bound and slope 1 at 0, but the
-                # gradient tail decays polynomially instead of exponentially,
-                # so over-shot entries keep a restoring signal (these params
-                # have no weight decay to pull them back).
+                # Clipped after exp(log_scale) since that scale is learnable
+                # and unbounded. Rational form, not tanh: same bound and
+                # slope 1 at 0, but its gradient tail decays polynomially
+                # instead of exponentially, so over-shot entries (which get
+                # no weight decay) still see a restoring signal.
                 d = d / (1 + d / self.sat_c)
             # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
             # = diag(dt_diss * d)
@@ -529,6 +513,10 @@ class ContinuousGenHyperConnections(nn.Module):
             scores = self.laplacian_A + proj.diss.reshape(B, self.n, self.n).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
+            if self.sat_c is not None:
+                # Same rational clip as diag_diss, after the learnable scale.
+                # Stays nonnegative, so adjacency/degree/laplacian PSD-ness holds.
+                adjacency = adjacency / (1 + adjacency / self.sat_c)
             adjacency = adjacency - torch.diag_embed(
                 torch.diagonal(adjacency, dim1=-2, dim2=-1)
             )
