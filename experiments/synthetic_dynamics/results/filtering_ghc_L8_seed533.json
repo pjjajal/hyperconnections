@@ -1,0 +1,159 @@
+{
+  "task": "filtering",
+  "model": "ghc",
+  "depth": 8,
+  "steps": 2500,
+  "seed": 533,
+  "history": [
+    {
+      "step": 1,
+      "train_loss": 2.151393413543701,
+      "val_loss": 2.1094552260041235,
+      "val_signal_error": 0.00035003466946363914,
+      "val_nuisance_error": 0.9888671718537807
+    },
+    {
+      "step": 125,
+      "train_loss": 1.0765897626838377,
+      "val_loss": 0.595585112452507,
+      "val_signal_error": 8.923221662189462e-05,
+      "val_nuisance_error": 0.2792151982933283
+    },
+    {
+      "step": 250,
+      "train_loss": 0.44511344480514525,
+      "val_loss": 0.33588455532491207,
+      "val_signal_error": 3.629792127321707e-05,
+      "val_nuisance_error": 0.1574732295796275
+    },
+    {
+      "step": 375,
+      "train_loss": 0.2772397357225418,
+      "val_loss": 0.2291551322862506,
+      "val_signal_error": 1.802739004870091e-05,
+      "val_nuisance_error": 0.10743882239237428
+    },
+    {
+      "step": 500,
+      "train_loss": 0.1972341527938843,
+      "val_loss": 0.16934933398663998,
+      "val_signal_error": 1.1615986875767703e-05,
+      "val_nuisance_error": 0.07940029668807984
+    },
+    {
+      "step": 625,
+      "train_loss": 0.14890617454051971,
+      "val_loss": 0.13036527280882002,
+      "val_signal_error": 8.085646880999775e-06,
+      "val_nuisance_error": 0.06112300509400666
+    },
+    {
+      "step": 750,
+      "train_loss": 0.11620838469266892,
+      "val_loss": 0.10283841318637132,
+      "val_signal_error": 8.601592672675906e-06,
+      "val_nuisance_error": 0.04821587024256587
+    },
+    {
+      "step": 875,
+      "train_loss": 0.09240446841716767,
+      "val_loss": 0.08230437191575765,
+      "val_signal_error": 6.8795731483533014e-06,
+      "val_nuisance_error": 0.03858861493691802
+    },
+    {
+      "step": 1000,
+      "train_loss": 0.07404297095537185,
+      "val_loss": 0.06634696401841939,
+      "val_signal_error": 6.222981850214637e-06,
+      "val_nuisance_error": 0.031106749100610613
+    },
+    {
+      "step": 1125,
+      "train_loss": 0.05986436325311661,
+      "val_loss": 0.0537933513969183,
+      "val_signal_error": 5.103701205598554e-06,
+      "val_nuisance_error": 0.02522111877053976
+    },
+    {
+      "step": 1250,
+      "train_loss": 0.04852282205224037,
+      "val_loss": 0.04350228846259415,
+      "val_signal_error": 6.862258039291192e-06,
+      "val_nuisance_error": 0.020394775142893194
+    },
+    {
+      "step": 1375,
+      "train_loss": 0.03941452690958977,
+      "val_loss": 0.03524450414814055,
+      "val_signal_error": 4.589503121451344e-06,
+      "val_nuisance_error": 0.016523818641901018
+    },
+    {
+      "step": 1500,
+      "train_loss": 0.03177230179309845,
+      "val_loss": 0.0284487969847396,
+      "val_signal_error": 4.31847109643968e-06,
+      "val_nuisance_error": 0.013337486728094518
+    },
+    {
+      "step": 1625,
+      "train_loss": 0.025684489756822585,
+      "val_loss": 0.022952757883816958,
+      "val_signal_error": 3.581929157576269e-06,
+      "val_nuisance_error": 0.01076077270694077
+    },
+    {
+      "step": 1750,
+      "train_loss": 0.020511087492108344,
+      "val_loss": 0.01819936668127775,
+      "val_signal_error": 5.451346383210876e-06,
+      "val_nuisance_error": 0.00853107738820836
+    },
+    {
+      "step": 1875,
+      "train_loss": 0.01631869616359472,
+      "val_loss": 0.014444593433756382,
+      "val_signal_error": 3.3545595200621393e-06,
+      "val_nuisance_error": 0.006771495702443645
+    },
+    {
+      "step": 2000,
+      "train_loss": 0.012857216291129589,
+      "val_loss": 0.011351196028292179,
+      "val_signal_error": 3.27574337131864e-06,
+      "val_nuisance_error": 0.005321058704517782
+    },
+    {
+      "step": 2125,
+      "train_loss": 0.010061934776604175,
+      "val_loss": 0.00879123086296022,
+      "val_signal_error": 3.1792975219104846e-06,
+      "val_nuisance_error": 0.004121046259067953
+    },
+    {
+      "step": 2250,
+      "train_loss": 0.0077800886817276475,
+      "val_loss": 0.006836878388188779,
+      "val_signal_error": 3.2216625186265445e-06,
+      "val_nuisance_error": 0.0032050787198822945
+    },
+    {
+      "step": 2375,
+      "train_loss": 0.005952669844031334,
+      "val_loss": 0.0051357571163680405,
+      "val_signal_error": 3.019628160700449e-06,
+      "val_nuisance_error": 0.0024070658271666615
+    },
+    {
+      "step": 2500,
+      "train_loss": 0.004494356282055378,
+      "val_loss": 0.0039005765517940746,
+      "val_signal_error": 2.969587175016386e-06,
+      "val_nuisance_error": 0.001827705532836262
+    }
+  ],
+  "error": 0.0039005765517940746,
+  "signal_error": 2.969587175016386e-06,
+  "nuisance_error": 0.001827705532836262
+}

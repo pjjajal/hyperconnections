@@ -46,6 +46,7 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
         elementwise_affine: bool = False,
         use_triton: bool = True,
         vec_dt: bool = False,
+        sat_c: float | None = 2.0,
         shortconv_kernel_size: int = 0,
         shortconv_causal: bool = True,
     ):
@@ -65,40 +66,34 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
             elementwise_affine=elementwise_affine,
             use_triton=use_triton,
             vec_dt=vec_dt,
+            sat_c=sat_c,
             shortconv_kernel_size=shortconv_kernel_size,
             shortconv_causal=shortconv_causal,
         )
-        ### Custom-kernel path for the forced exponential (exp(A), φ₁(A)), gated on the
-        ### same use_triton flag as the base class's _matrix_exp / _stream_mix dispatch.
-        self._use_block_triton = bool(use_triton and HAS_TRITON)
+        ### Forced-exp kernel dispatch, bound once here like the base class's
+        ### _matrix_exp / _stream_mix.
+        self._expm_block_fn = (
+            expm_t18_block_triton if use_triton and HAS_TRITON else expm_t18_augmented_sparse
+        )
 
-    # Manual graph break: an outer torch.compile treats the forced exp unit (Triton kernel
-    # or max-autotune eager) as opaque instead of tracing into it.
-    @torch.compiler.disable(recursive=False)
-    def _expm_block(self, A: torch.Tensor):
-        """Return (exp(A), φ₁(A)) via the Triton forced kernel when available, else eager."""
-        if self._use_block_triton:
-            return expm_t18_block_triton(A)
-        return expm_t18_augmented_sparse(A)
-
-    def compute_transition_expm_t18(self, proj: CGHCProjections) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_transition_and_psi(self, proj: CGHCProjections) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (exp(A), φ₁(A)), both of shape [B, n, n].
 
         Args:
             proj: Fused input projection (from self.input_proj).
         """
         A = self.compute_generator(proj)
-        transition_matrix, psi = self._expm_block(A.float())
+        transition_matrix, psi = self._expm_block_fn(A.float())
         dtype = proj.read_in.dtype
         return transition_matrix.to(dtype), psi.to(dtype)
 
     def compute_transition(self, proj: CGHCProjections) -> torch.Tensor:
-        """Return exp(A) only, shape [B, n, n]. Delegates to compute_transition_expm_t18."""
-        transition, _ = self.compute_transition_expm_t18(proj)
+        """Return exp(A) only, shape [B, n, n]. Delegates to compute_transition_and_psi."""
+        transition, _ = self.compute_transition_and_psi(proj)
         return transition
 
     def _transition_and_source(
         self, proj: CGHCProjections, Y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        transition, psi = self.compute_transition_expm_t18(proj)
+        transition, psi = self.compute_transition_and_psi(proj)
         return transition, einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")

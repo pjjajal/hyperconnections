@@ -191,15 +191,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.alpha_read_in = nn.Parameter(torch.empty(1))
         self.write_out = nn.Parameter(torch.empty(n, m))
         self.alpha_write_out = nn.Parameter(torch.empty(1))
-        # The read/write dynamic components come from the fused input projection
-        # (self.proj_fused) built below, once all component flags are known.
 
-        # dt parameters — log-space sigmoid interpolation:
-        #   dt = exp(log dt_min + (log dt_max - log dt_min) * σ(θ))
-        # Hard-bounded like a linear sigmoid, but with uniform *relative*
-        # sensitivity across the range, so a small dt init sits on the responsive
-        # part of the curve instead of the saturated tail (dt=0.01 in (0.001, 1.0)
-        # lands at logit ≈ -0.69 rather than -4.7).
         assert dt_min > 0, (
             f"dt_min must be positive (dt is parameterized in log space), got {dt_min}"
         )
@@ -341,20 +333,13 @@ class ContinuousGenHyperConnections(nn.Module):
         self._init_log_dt(self.log_dt_conserv)
         self._init_log_dt(self.log_dt_diss)
 
-        # Fused input projection self-initializes in its constructor; re-run here
-        # so init_weights() stays idempotent and fully re-initializes the module.
         self.input_proj.reset_parameters()
 
-        # mean projection: set to mean direction.
-        # small noise for asymmetry breaking so projection isn't exactly static at init, but normalised to keep initial scale consistent.
         if self.projection == "mean":
             self.projection_dir.fill_(1.0 / math.sqrt(self.n))
             with torch.no_grad():
                 self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01)
                 self.projection_dir.div_(self.projection_dir.norm())
-        # proj_v: base direction static; the proj_v segment of proj_fused is
-        # zero-init (handled above) so it starts at base_projection_dir with
-        # input-dependent variation.
         if self.projection == "v":
             self.base_projection_dir.fill_(1.0 / math.sqrt(self.n))
 
@@ -362,10 +347,6 @@ class ContinuousGenHyperConnections(nn.Module):
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
 
-    ### Static matrices whose init values are semantic anchors (see module note).
-    ### 1-D anchors (alpha_*, log_dt_*, diss_diag) are caught by the ndim rule in
-    ### split_decay_param_groups instead. Every HC class declares its own set;
-    ### consumers collect them from submodules via hasattr (see the classmethod).
     NO_DECAY_PARAM_NAMES = frozenset(
         {"read_in", "write_out", "conserv_A", "diss_A", "laplacian_A"}
     )
@@ -496,17 +477,10 @@ class ContinuousGenHyperConnections(nn.Module):
                 self.diss_diag + proj.diss.float()
             )  # [B, n], positive
             if self.sat_c is not None:
-                # Clipped after exp(log_scale) since that scale is learnable
-                # and unbounded. Rational form, not tanh: same bound and
-                # slope 1 at 0, but its gradient tail decays polynomially
-                # instead of exponentially, so over-shot entries (which get
-                # no weight decay) still see a restoring signal.
                 d = d / (1 + d / self.sat_c)
-            # Sandwich of a diagonal reduces to elementwise product: diag(sqrt_dt * d * sqrt_dt)
-            # = diag(dt_diss * d)
             A = A - torch.diag_embed(
                 dt_diss * d
-            )  # dt_diss [B,1] * d [B,n] broadcasts correctly
+            )
 
         # --- Laplacian dissipative branch (shares the single "diss" predictor) ---
         if hasattr(self, "laplacian_A"):
@@ -514,8 +488,6 @@ class ContinuousGenHyperConnections(nn.Module):
             scores = 0.5 * (scores + scores.transpose(-1, -2))  # symmetrize
             adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
             if self.sat_c is not None:
-                # Same rational clip as diag_diss, after the learnable scale.
-                # Stays nonnegative, so adjacency/degree/laplacian PSD-ness holds.
                 adjacency = adjacency / (1 + adjacency / self.sat_c)
             adjacency = adjacency - torch.diag_embed(
                 torch.diagonal(adjacency, dim1=-2, dim2=-1)
@@ -523,7 +495,6 @@ class ContinuousGenHyperConnections(nn.Module):
             degree = torch.diag_embed(adjacency.sum(dim=-1))
             laplacian = degree - adjacency  # PSD
             if not self.vec_dt:
-                # Scalar dt: equivalent to the sandwich but avoids unnecessary sqrt
                 laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
             else:
                 laplacian_dt = (
@@ -637,9 +608,6 @@ class ContinuousGenHyperConnections(nn.Module):
         leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
         B = x.shape[0]
-        ### Optional over-width short conv on the read/source path only: it feeds the
-        ### read-in and every x_norm-derived weight (read/write/generator/projection),
-        ### while the carried stream `x` that gets stream-mixed stays un-convolved.
         if self.short_conv is not None:
             src = self.short_conv(x.reshape(*leading, self.input_dim)).reshape(B, self.n, self.block_size)
         else:
