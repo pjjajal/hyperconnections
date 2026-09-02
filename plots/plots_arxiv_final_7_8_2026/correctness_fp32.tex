@@ -1,0 +1,19 @@
+\begin{table}[h]
+\centering
+\caption{Numerical correctness of Triton kernels vs.\ independent references. Worst-case (max) absolute error over the listed batch sizes, matrix types and dtypes, per $N$. Lower is better.}
+\label{tab:expm_corr}
+\begin{tabular}{lccccc}
+\toprule
+Kernel & Reference & $N{=}4$ & $N{=}8$ & $N{=}16$ & $N{=}32$ \\
+\midrule
+\texttt{expm\_t18\_triton}                & \texttt{matrix\_exp}      & $5.7{\times}10^{-6}$ & $5.7{\times}10^{-6}$ & $6.0{\times}10^{-6}$ & $1.1{\times}10^{-5}$ \\
+\texttt{expm\_t18\_block\_triton} $E$     & \texttt{matrix\_exp}      & $4.3{\times}10^{-6}$ & $5.7{\times}10^{-6}$ & $6.0{\times}10^{-6}$ & --- \\
+\texttt{expm\_t18\_block\_triton} $\Psi$  & GL quadrature (fp64)      & $1.4{\times}10^{-6}$ & $1.7{\times}10^{-6}$ & $1.9{\times}10^{-6}$ & --- \\
+backward grad                             & autograd through $2N$ exp & $3.8{\times}10^{-6}$ & $1.3{\times}10^{-5}$ & $2.2{\times}10^{-5}$ & --- \\
+\texttt{stream\_mix\_add}                 & einsum $\Phi x + Y$       & $3.8{\times}10^{-6}$ & $3.8{\times}10^{-6}$ & $7.6{\times}10^{-6}$ & $1.1{\times}10^{-5}$ \\
+\texttt{stream\_mix\_add} grad$_x$        & autograd einsum           & $0$ & $0$ & $0$ & $0$ \\
+\texttt{stream\_mix\_add} (proj)          & einsum $\Phi x + Y$, proj & $3.8{\times}10^{-6}$ & $5.7{\times}10^{-6}$ & $9.5{\times}10^{-6}$ & $1.7{\times}10^{-5}$ \\
+\texttt{stream\_mix\_add} (proj) grad$_x$ & autograd einsum (proj)    & $9.5{\times}10^{-7}$ & $1.9{\times}10^{-6}$ & $5.7{\times}10^{-6}$ & $1.3{\times}10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

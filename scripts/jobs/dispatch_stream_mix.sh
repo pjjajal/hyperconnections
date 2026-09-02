@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=a100-80gb
-#SBATCH --time=3:59:00
+#SBATCH --time=11:59:00
 #SBATCH --job-name=stream_mix_bench
 
 set -euo pipefail
@@ -15,17 +15,17 @@ set -euo pipefail
 cd /scratch/gilbreth/neliopou/pj-hyperconnections
 
 BENCH_DIR="benchmarks"
-SINGLES_DIR="benchmark_reports/singles"
+SINGLES_DIR="benchmark_reports/stream_mix_arxiv_final_7_8_2026"
 
 mkdir -p "benchmark_reports/logs"
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
 STREAM_N=(4 8 16 32)
 STREAM_M=(1)
-STREAM_B=(2048 4096 8192)
+STREAM_B=(1024 2048 4096 8192)
 STREAM_E=(768 1024 1536)
-STREAM_DTYPE=(bf16)
-STREAM_PASS=(bwd)
+STREAM_DTYPE=(fp32 bf16)
+STREAM_PASS=(fwd bwd)
 
 MODE=all
 WARMUP=16

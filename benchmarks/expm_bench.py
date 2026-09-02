@@ -86,30 +86,30 @@ def _corr_block(A: torch.Tensor, cfg_str: str, dtype: torch.dtype,
     ### forward — Triton vs ground-truth (torch.linalg.matrix_exp)
     got = expm_t18_triton(A)
     ref = ref_torch_matrix_exp(A)
-    passed, err = _check(got, ref, atol_f)
+    passed, err, rel = _check(got, ref, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "fwd", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "fwd",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### forward — Triton vs compiled T18 (same algorithm, smaller tolerance)
     ref_t18 = expm_t18(A)
-    passed, err = _check(got, ref_t18, atol_f)
+    passed, err, rel = _check(got, ref_t18, atol_f)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "vs T18", "fwd", err, atol_f, passed))
     csv_rows.append({"config": cfg_str, "variant": "vs T18", "check": "fwd",
-                     "max_err": err, "atol": atol_f, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_f, "passed": passed})
 
     ### backward — grad_A from Triton vs from torch.linalg.matrix_exp
     A_t = A.detach().clone().requires_grad_(True)
     expm_t18_triton(A_t).sum().backward()
     grad_ref = ref_torch_matrix_exp_backward(A)
 
-    passed, err = _check(A_t.grad, grad_ref, atol_b)
+    passed, err, rel = _check(A_t.grad, grad_ref, atol_b)
     all_passed &= passed
     logger.info(_corr_row(cfg_str, "triton", "grad_A", err, atol_b, passed))
     csv_rows.append({"config": cfg_str, "variant": "triton", "check": "grad_A",
-                     "max_err": err, "atol": atol_b, "passed": passed})
+                     "max_err": err, "rel_err": rel, "atol": atol_b, "passed": passed})
 
     return all_passed
 

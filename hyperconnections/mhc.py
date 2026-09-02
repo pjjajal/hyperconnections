@@ -119,7 +119,14 @@ class ManifoldHyperConnections(nn.Module):
     def compute_mixing_weights(self, x: torch.Tensor):
         B = x.shape[0]
         x_flat = x.view(B, -1)   # [B, input_dim] — flatten all streams
-        x_norm = self.norm(x_flat).float()  # float32 for linear layers under torch.compile
+        # PERF EXPERIMENT (2026-07-15): was `self.norm(x_flat).float()`
+        # ("float32 for linear layers under torch.compile") — under autocast the
+        # Linears recast their input to bf16 anyway, so the .float() only
+        # materialized the wide [B, input_dim] activation in fp32 (same waste as
+        # cghc's old generator path). The numerics-sensitive Sinkhorn below now
+        # upcasts its small [B, n, n] input instead. TODO: validate numerics
+        # long-run, then make final.
+        x_norm = self.norm(x_flat)
 
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)         # [B, n, m]
         h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)     # [B, n, m]
@@ -133,7 +140,7 @@ class ManifoldHyperConnections(nn.Module):
         # Apply manifold constraints
         read_in = F.sigmoid(h_read_in).transpose(1, 2)
         write_out = 2 * F.sigmoid(h_write_out)
-        stream_mixing = self._sinkhorn_knopp(h_stream_mixing)
+        stream_mixing = self._sinkhorn_knopp(h_stream_mixing.float())  # small [B,n,n]: keep the 20-iter normalization in fp32
 
         return write_out, read_in, stream_mixing
 

@@ -100,7 +100,7 @@ def ref_torch_matrix_exp(A: torch.Tensor) -> torch.Tensor:
 ###
 ### Correctness check
 ###
-def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, float]:
+def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, float, float]:
     """Magnitude-aware check: passes if max_err <= atol * (1 + ||ref||_inf).
 
     A pure absolute tolerance is misleading for matrix-exp outputs/gradients,
@@ -108,8 +108,13 @@ def _check(got: torch.Tensor, ref: torch.Tensor, atol: float) -> tuple[bool, flo
     ||A||_1; bf16 (~1e-2 relative precision) then incurs an unavoidable few-units
     absolute error from the dtype cast alone.  Folding ref's magnitude in keeps
     the threshold meaningful across norms and dtypes.
+
+    Returns (passed, max_err, rel_err) where rel_err = max_err / (1 + ||ref||_inf)
+    is the same magnitude-normalised quantity the pass test uses — recorded in the
+    correctness CSVs so the accuracy figures/tables can plot relative error.
     """
     diff    = (got.float() - ref.float()).abs()
     max_err = diff.max().item()
     ref_mag = ref.float().abs().max().item()
-    return max_err <= atol * (1.0 + ref_mag), max_err
+    rel_err = max_err / (1.0 + ref_mag)
+    return max_err <= atol * (1.0 + ref_mag), max_err, rel_err

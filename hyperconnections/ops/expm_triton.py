@@ -8,9 +8,10 @@ Forward
 -------
 Single fused kernel.  Grid = (B,).  One CTA per batch element.
 
-  - Loads A[b] and a global scaling factor inv_scale = 2^(-s), where
-    s = ceil(log2(max_b ||A_b||_1 / θ₁₈)) is precomputed *on-device* by the
-    Python wrapper and passed as a 0-d tensor (no host sync).
+  - Loads A[b] and a fixed scaling factor inv_scale = 2^(-S), where S is the
+    (constexpr) number of scaling-and-squaring steps passed by the caller. No
+    per-input norm is computed — S alone sets both the scaling and the squaring
+    count (accurate for ||A||_1 <= θ₁₈·2^S; smaller norms are over-scaled).
   - Computes A^2, A^3, A^6 and the polynomial blocks B1..B5 in registers
     (N is a compile-time constant).  Each matmul is an unrolled
     outer-product accumulation  C = Σ_k col_k(A) · row_k(B)  via a
@@ -21,9 +22,8 @@ Single fused kernel.  Grid = (B,).  One CTA per batch element.
     polynomial.  Going through static_range over k keeps the IR as
     scalar FFMAs and preserves full fp32 precision.  tl.dot is
     intentionally avoided for the same reason and to support N<16.
-  - Applies up to MAX_S=8 squarings, masked on s via tl.where.  Wasted matmul
-    work for the masked-off branch is negligible relative to polynomial cost,
-    and s is uniform across the batch (global scaling).
+  - Applies exactly MAX_S=S squarings, unconditionally (no masking) — the
+    squaring count is the constexpr S, matching inv_scale = 2^(-S).
   - Accumulation is fp32 regardless of input dtype; output is cast to
     A.dtype on store.
 
@@ -65,7 +65,6 @@ from .numbers import (
     _b02, _b12, _b22, _b32, _b62,
     _b03, _b13, _b23, _b33, _b63,
     _b24, _b34, _b64,
-    _THETA_18_F32 as _THETA_18,
 )
 
 ### Convert to tl.constexpr(...)
@@ -74,7 +73,10 @@ _b11 = tl.constexpr(_b11); _b21 = tl.constexpr(_b21); _b31 = tl.constexpr(_b31);
 _b02 = tl.constexpr(_b02); _b12 = tl.constexpr(_b12); _b22 = tl.constexpr(_b22); _b32 = tl.constexpr(_b32); _b62 = tl.constexpr(_b62)
 _b03 = tl.constexpr(_b03); _b13 = tl.constexpr(_b13); _b23 = tl.constexpr(_b23); _b33 = tl.constexpr(_b33); _b63 = tl.constexpr(_b63)
 _b24 = tl.constexpr(_b24); _b34 = tl.constexpr(_b34); _b64 = tl.constexpr(_b64)
-_MAX_S = 8
+
+### Default number of scaling-and-squaring steps S (not a cap: the public fns
+### accept any S >= 0, driving both inv_scale = 2^(-S) and the squaring count).
+_MAX_S = 2
 
 _TORCH_TO_TL = {
     torch.float16:  tl.float16,
@@ -178,7 +180,7 @@ def _pair_mul_alt(D1, U1, D2, U2, R, NP: tl.constexpr, n_idx, LOW_PREC: tl.const
 @triton.jit
 def _expm_t18_structured_fwd(
     X_ptr, G_ptr, out_ptr,
-    s_ptr, inv_scale_ptr,                # 0-d device scalars for M, not just X
+    inv_scale,                           # scalar 2^(-MAX_S); no data-dependent s
     stride_x_b, stride_x_n1, stride_x_n2,
     stride_g_b, stride_g_n1, stride_g_n2,
     stride_o_b, stride_o_n1, stride_o_n2,
@@ -209,10 +211,8 @@ def _expm_t18_structured_fwd(
     X = tl.load(X_ptr + x_off, mask=mask2d, other=0.0).to(tl.float32)
     G = tl.load(G_ptr + g_off, mask=mask2d, other=0.0).to(tl.float32)
 
-    ### Important: this scale should correspond to the full block matrix
+    ### Fixed scaling 2^(-MAX_S) (passed in), applied to the full block matrix
     ### M = [[X, G], [0, X]], not only X.
-    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
-
     D1 = X * inv_scale
     U1 = G * inv_scale
 
@@ -263,14 +263,10 @@ def _expm_t18_structured_fwd(
     DT18 = DB2 + DCA9
     UT18 = UB2 + UCA9
 
-    ### Structured repeated squaring:
-    ### (D, U)^2 = (D @ D, D @ U + U @ D)
-    s_val = tl.load(s_ptr).to(tl.int32)
-
+    ### Structured repeated squaring: (D, U)^2 = (D @ D, D @ U + U @ D).
+    ### Exactly MAX_S squarings (unconditional), matching inv_scale = 2^(-MAX_S).
     for i in tl.static_range(MAX_S):
-        D_sq, U_sq = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
-        DT18 = tl.where(s_val > i, D_sq, DT18)
-        UT18 = tl.where(s_val > i, U_sq, UT18)
+        DT18, UT18 = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
 
     ### Store only the upper-right block, i.e. the Frechet derivative block.
     o_off = (
@@ -289,7 +285,7 @@ def _expm_t18_structured_fwd(
 @triton.jit
 def _expm_t18_fwd(
     A_ptr, out_ptr,
-    s_ptr, inv_scale_ptr,                # 0-d device scalars (no host sync)
+    inv_scale,                           # scalar 2^(-MAX_S); no data-dependent s
     stride_a_b, stride_a_n1, stride_a_n2,
     stride_o_b, stride_o_n1, stride_o_n2,
     N:         tl.constexpr,             # logical matrix size
@@ -303,14 +299,13 @@ def _expm_t18_fwd(
     n_mask = n_idx < N
     mask2d = n_mask[:, None] & n_mask[None, :]
 
-    ### Load A[b], upcast, and apply the scaling 1/2^s
+    ### Load A[b], upcast, and apply the fixed scaling 1/2^MAX_S (passed in).
     a_off = (
         pid_b * stride_a_b
         + n_idx[:, None] * stride_a_n1
         + n_idx[None, :] * stride_a_n2
     )
     A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
-    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
     A = A * inv_scale
 
     ### A^2, A^3, A^6 — see _matmul_nn for why we don't use the naïve
@@ -334,12 +329,9 @@ def _expm_t18_fwd(
     ### T18 = B2 + (B3 + A9) @ A9
     T18 = B2 + _matmul_nn(B3 + A9, A9, NP, n_idx, LOW_PREC)
 
-    ### Repeated squaring, gated by global s. Always evaluates the matmul;
-    ### The wasted work is uniform across the grid and small vs polynomial.
-    s_val = tl.load(s_ptr).to(tl.int32)
+    ### Exactly MAX_S squarings (unconditional), matching inv_scale = 2^(-MAX_S).
     for i in tl.static_range(MAX_S):
-        T18_sq = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
-        T18    = tl.where(s_val > i, T18_sq, T18)
+        T18 = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
 
     ### Store output
     o_off = (
@@ -360,9 +352,13 @@ def _next_pow2(x: int) -> int:
 ###
 ### Forward
 ###
-def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype, S: int = _MAX_S) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
-    Function for both forward and the augmented-matrix backward."""
+    Function for both forward and the augmented-matrix backward.
+
+    Fixed scaling-and-squaring: scale by 2^(-S) and square exactly S times.
+    Correct for ||A||_1 <= theta_18 * 2^S; smaller norms are over-scaled.
+    """
     if not A.is_cuda:
         raise RuntimeError("expm_t18_triton requires CUDA tensors")
     if A.dim() != 3 or A.shape[-1] != A.shape[-2]:
@@ -374,19 +370,17 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
     A_fp32 = A.to(torch.float32).contiguous()
 
-    ### Global scaling factor — all on-device, no host sync.
-    A_norm    = torch.linalg.matrix_norm(A_fp32, ord=1).max().clamp_min(_THETA_18)
-    s         = torch.ceil(torch.log2(A_norm / _THETA_18)).clamp(min=0).to(torch.int32)
-    inv_scale = torch.exp2(-s.float())
+    ### Fixed scaling factor 2^(-S) — no norm reduction, no host sync.
+    inv_scale = 2.0 ** (-S)
 
     out = torch.empty(B, N, N, dtype=out_dtype, device=A.device)
     NP  = _next_pow2(N)
 
     _expm_t18_fwd[(B,)](
         A_fp32, out,
-        s, inv_scale,
+        inv_scale,
         *A_fp32.stride(), *out.stride(),
-        N=N, NP=NP, MAX_S=_MAX_S,
+        N=N, NP=NP, MAX_S=S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
         LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
@@ -396,9 +390,13 @@ def _expm_t18_no_grad(A: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 ###
 ### Forward
 ###
-def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: torch.dtype, S: int = _MAX_S) -> torch.Tensor:
     """Triton T18 forward.  No autograd wrapping; used by the autograd
-    Function for both forward and the augmented-matrix backward."""
+    Function for both forward and the augmented-matrix backward.
+
+    Fixed scaling-and-squaring: scale by 2^(-S) and square exactly S times.
+    Correct for ||M||_1 <= theta_18 * 2^S (M = [[X, G], [0, X]]).
+    """
     if not A_T.is_cuda:
         raise RuntimeError("expm_t18_structure_no_grad requires CUDA tensors")
     if A_T.dim() != 3 or A_T.shape[-1] != A_T.shape[-2]:
@@ -407,27 +405,20 @@ def _expm_t18_structure_no_grad(A_T: torch.Tensor, G: torch.Tensor, out_dtype: t
         raise ValueError(f"unsupported out_dtype {out_dtype}")
 
     B, N, _ = A_T.shape
-    # X = A_T 
+    # X = A_T
     X = A_T.to(torch.float32).contiguous()
 
-    ### Global scaling factor
-    X_colsum = X.abs().sum(dim=-2)
-    G_colsum = G.abs().sum(dim=-2)
-
-    M_norm = (X_colsum + G_colsum).amax()
-    M_norm = M_norm.clamp_min(_THETA_18)
-
-    s = torch.ceil(torch.log2(M_norm / _THETA_18)).clamp(min=0)
-    inv_scale = 2.0 ** (-s)
+    ### Fixed scaling factor 2^(-S) — no norm reduction, no host sync.
+    inv_scale = 2.0 ** (-S)
 
     out = torch.empty_like(G)
     NP  = _next_pow2(N)
 
     _expm_t18_structured_fwd[(B,)](
         X, G, out,
-        s, inv_scale,
+        inv_scale,
         *X.stride(), *G.stride(), *out.stride(),
-        N=N, NP=NP, MAX_S=_MAX_S,
+        N=N, NP=NP, MAX_S=S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
         LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
@@ -455,15 +446,16 @@ class _ExpmT18TritonFn(torch.autograd.Function):
     Functions of Matrices, Sec. 10.6.
     """
     @staticmethod
-    def forward(ctx, A: torch.Tensor) -> torch.Tensor:
-        out = _expm_t18_no_grad(A, out_dtype=A.dtype)
+    def forward(ctx, A: torch.Tensor, S: int) -> torch.Tensor:
+        out = _expm_t18_no_grad(A, out_dtype=A.dtype, S=S)
         ctx.save_for_backward(A)
+        ctx.S = S
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         if not ctx.needs_input_grad[0]:
-            return None
+            return None, None
 
         (A,) = ctx.saved_tensors
         B, N, _ = A.shape
@@ -483,26 +475,32 @@ class _ExpmT18TritonFn(torch.autograd.Function):
         # return dExpM[:, :N, N:]
 
         ### BLOCK-STRUTURE BWD
-        dExpM = _expm_t18_structure_no_grad(A_T, G, out_dtype=A.dtype)
-        return dExpM
+        dExpM = _expm_t18_structure_no_grad(A_T, G, out_dtype=A.dtype, S=ctx.S)
+        return dExpM, None
 
 
 ###
 ### Public API
 ###
-def expm_t18_triton(A: torch.Tensor) -> torch.Tensor:
+def expm_t18_triton(A: torch.Tensor, S: int = _MAX_S) -> torch.Tensor:
     """Triton T18 matrix exponential.
 
     Args:
         A: [B, N, N] fp32 / bf16 / fp16 tensor on CUDA.
+        S: number of scaling-and-squaring steps (constexpr in-kernel). A is
+           scaled by 2^(-S) and squared exactly S times, so the result is
+           accurate for ||A||_1 <= theta_18 * 2^S (~3.01*2^S); smaller norms are
+           over-scaled. Default _MAX_S=2.
 
     Returns:
         exp(A) with the same shape and dtype as A.
     """
     if not A.is_cuda:
         raise RuntimeError("expm_t18_triton requires CUDA tensors")
+    if S < 0:
+        raise ValueError(f"S must be >= 0, got {S}")
 
-    return _ExpmT18TritonFn.apply(A)
+    return _ExpmT18TritonFn.apply(A, S)
 
 
 ###
@@ -543,7 +541,7 @@ def _blk_mul_c(D1, U1, c1, D2, U2, c2, NP: tl.constexpr, n_idx, LOW_PREC: tl.con
 @triton.jit
 def _expm_t18_augmented_fwd(
     A_ptr, E_ptr, psi_ptr,
-    s_ptr, inv_scale_ptr,
+    inv_scale,                           # scalar 2^(-MAX_S); no data-dependent s
     stride_a_b, stride_a_n1, stride_a_n2,
     stride_e_b, stride_e_n1, stride_e_n2,
     stride_p_b, stride_p_n1, stride_p_n2,
@@ -571,7 +569,6 @@ def _expm_t18_augmented_fwd(
         + n_idx[None, :] * stride_a_n2
     )
     A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
-    inv_scale = tl.load(inv_scale_ptr).to(tl.float32)
 
     eye = tl.where(n_idx[:, None] == n_idx[None, :], 1.0, 0.0)
 
@@ -630,12 +627,9 @@ def _expm_t18_augmented_fwd(
     cT18 = cB2 + cCA9
 
     ### Repeated squaring: (D, U, c)^2 = (D@D, D@U + c*U, c^2).
-    s_val = tl.load(s_ptr).to(tl.int32)
+    ### Exactly MAX_S squarings (unconditional), matching inv_scale = 2^(-MAX_S).
     for i in tl.static_range(MAX_S):
-        D_sq, U_sq, c_sq = _blk_mul_c(DT18, UT18, cT18, DT18, UT18, cT18, NP, n_idx, LOW_PREC)
-        DT18 = tl.where(s_val > i, D_sq, DT18)
-        UT18 = tl.where(s_val > i, U_sq, UT18)
-        cT18 = tl.where(s_val > i, c_sq, cT18)
+        DT18, UT18, cT18 = _blk_mul_c(DT18, UT18, cT18, DT18, UT18, cT18, NP, n_idx, LOW_PREC)
 
     ### Store exp(A) and phi_1(A)
     e_off = (
@@ -656,9 +650,13 @@ def _expm_t18_augmented_fwd(
 ### Python launcher (no autograd)
 ###
 def _expm_t18_augmented_no_grad(
-    A: torch.Tensor, out_dtype: torch.dtype
+    A: torch.Tensor, out_dtype: torch.dtype, S: int = _MAX_S
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton T18 augmented forward. Returns (exp(A), phi_1(A)). No autograd."""
+    """Triton T18 augmented forward. Returns (exp(A), phi_1(A)). No autograd.
+
+    Fixed scaling-and-squaring: scale by 2^(-S) and square exactly S times.
+    Correct for ||A||_1 <= theta_18 * 2^S; smaller norms are over-scaled.
+    """
     if not A.is_cuda:
         raise RuntimeError("_expm_t18_augmented_no_grad requires CUDA tensors")
     if A.dim() != 3 or A.shape[-1] != A.shape[-2]:
@@ -669,11 +667,8 @@ def _expm_t18_augmented_no_grad(
     B, N, _ = A.shape
     A_fp32 = A.to(torch.float32).contiguous()
 
-    ### ||Z||_1 = max(||A||_1, 1).  Since theta_18 = 3.01 > 1, scaling on
-    ### ||A||_1 alone is sufficient (same as _expm_t18_no_grad).
-    A_norm    = torch.linalg.matrix_norm(A_fp32, ord=1).max().clamp_min(_THETA_18)
-    s         = torch.ceil(torch.log2(A_norm / _THETA_18)).clamp(min=0).to(torch.int32)
-    inv_scale = torch.exp2(-s.float())
+    ### Fixed scaling factor 2^(-S) — no norm reduction, no host sync.
+    inv_scale = 2.0 ** (-S)
 
     E   = torch.empty(B, N, N, dtype=out_dtype, device=A.device)
     psi = torch.empty(B, N, N, dtype=out_dtype, device=A.device)
@@ -681,9 +676,9 @@ def _expm_t18_augmented_no_grad(
 
     _expm_t18_augmented_fwd[(B,)](
         A_fp32, E, psi,
-        s, inv_scale,
+        inv_scale,
         *A_fp32.stride(), *E.stride(), *psi.stride(),
-        N=N, NP=NP, MAX_S=_MAX_S,
+        N=N, NP=NP, MAX_S=S,
         OUT_DTYPE=_TORCH_TO_TL[out_dtype],
         LOW_PREC=out_dtype in (torch.float16, torch.bfloat16),
     )
@@ -735,25 +730,27 @@ class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
         = L_phi1(A^T, G).
     """
     @staticmethod
-    def forward(ctx, A: torch.Tensor):
-        E, psi = _expm_t18_augmented_no_grad(A, out_dtype=A.dtype)
+    def forward(ctx, A: torch.Tensor, S: int):
+        E, psi = _expm_t18_augmented_no_grad(A, out_dtype=A.dtype, S=S)
         ctx.save_for_backward(A.float().transpose(-1, -2).contiguous())
         ctx.input_dtype = A.dtype
+        ctx.S = S
         return E, psi
 
     @staticmethod
     def backward(ctx, grad_E: torch.Tensor, grad_psi: torch.Tensor):
         if not ctx.needs_input_grad[0]:
-            return None
+            return None, None
 
         (A_T,) = ctx.saved_tensors
         out_dtype = ctx.input_dtype
+        S = ctx.S
         B, N, _ = A_T.shape
         G_E   = grad_E.float().contiguous()
         G_psi = grad_psi.float().contiguous()
 
         ### Part 1: L_exp(A^T, grad_E) via block-structured backward at N.
-        dA_E = _expm_t18_structure_no_grad(A_T, G_E, out_dtype=out_dtype)
+        dA_E = _expm_t18_structure_no_grad(A_T, G_E, out_dtype=out_dtype, S=S)
 
         ### Part 2: L_phi_1(A^T, grad_psi) via 3N x 3N augmented exp.
         ### M = [[A^T, G_psi, 0], [0, A^T, I], [0, 0, 0]] — (1,3) block of
@@ -766,18 +763,21 @@ class _ExpmT18AugmentedTritonFn(torch.autograd.Function):
         eye = torch.eye(N, dtype=torch.float32, device=A_T.device)
         M[:, N:2*N, 2*N:3*N] = eye
 
-        ### NOTE: Revisit this at some point... Debug it!
-        # expM = torch.linalg.matrix_exp(M).to(out_dtype)
-        expM = _expm_t18_no_grad(M, out_dtype=out_dtype)
+        ### The (1,3) block of exp(M) equals L_phi_1(A^T, G_psi); validated against
+        ### torch.linalg.matrix_exp(M) and autograd (benchmarks/expm_force_bench.py
+        ### "vs autograd"). Reuses the fixed-S forward routine, so it needs
+        ### ||M||_1 <= theta_18 * 2^S — note M carries G_psi, not just A^T.
+        # expM = torch.linalg.matrix_exp(M).to(out_dtype)   # reference fallback
+        expM = _expm_t18_no_grad(M, out_dtype=out_dtype, S=S)
         dA_psi = expM[:, :N, 2*N:3*N]
 
-        return dA_E + dA_psi
+        return dA_E + dA_psi, None
 
 
 ###
 ### Public API
 ###
-def expm_t18_block_triton(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def expm_t18_block_triton(A: torch.Tensor, S: int = _MAX_S) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton T18 augmented matrix exponential.
 
     Computes exp([[A, I]; [0, 0]]) via the block-structured T18 polynomial,
@@ -789,6 +789,11 @@ def expm_t18_block_triton(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Args:
         A: [B, N, N] fp32 / bf16 / fp16 tensor on CUDA.
+        S: number of scaling-and-squaring steps (constexpr in-kernel). A is
+           scaled by 2^(-S) and squared exactly S times, so the result is
+           accurate for ||A||_1 <= theta_18 * 2^S (~3.01*2^S); smaller norms are
+           over-scaled. S also drives the backward (its augmented matrices must
+           likewise satisfy the bound). Default _MAX_S=2.
 
     Returns:
         E:   [B, N, N], approximation to exp(A).
@@ -796,4 +801,6 @@ def expm_t18_block_triton(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     if not A.is_cuda:
         raise RuntimeError("expm_t18_block_triton requires CUDA tensors")
-    return _ExpmT18AugmentedTritonFn.apply(A)
+    if S < 0:
+        raise ValueError(f"S must be >= 0, got {S}")
+    return _ExpmT18AugmentedTritonFn.apply(A, S)

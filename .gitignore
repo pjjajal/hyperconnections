@@ -36,6 +36,7 @@ Thumbs.db
 *.CSV
 *.pdf
 *.ncu-rep
+*.out
 
 # Project-specific
 .claude/

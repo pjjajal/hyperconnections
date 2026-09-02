@@ -1,371 +1,186 @@
-"""Training script for synthetic tasks."""
+"""Train one dynamic hyperconnection model on one synthetic task."""
 
 import argparse
+import contextlib
+import json
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from hyperconnections import cghc, mhc, ghc, identity_hc
-from experiments.synthetic_dynamics import (
-    SignalPreservationDataset,
-    SignalRotationDataset,
-    SignalFilteringDataset,
-    StreamDynamicsModel,
-    ZeroModule,
-    mse_loss,
-)
-from einops import einsum
-from experiments.synthetic_dynamics.logger import ExperimentLogger
+from hyperconnections import cghc, ghc, mhc
+
+from .models import StreamDynamics, ZeroModule
+from .tasks import SyntheticTask, relative_error
 
 
-# Mapping from model name to class
-HC_MODELS = {
-    "cghc": cghc.ContinuousGenHyperConnections,
-    "mhc": mhc.ManifoldHyperConnections,
-    "ghc": ghc.GeneralizedHyperConnections,
-    "identity_hc": identity_hc.IdentityHyperConnections,
-}
+# Fixed experiment constants. Change these here, not through a sprawling CLI.
+N_STREAMS = 4
+FEATURE_DIM = 32
+BATCH_SIZE = 256
+LEARNING_RATE = 1e-3
+EVAL_BATCHES = 2000
+LOG_POINTS = 20
+DT = 0.01
+DT_MIN = 0.001
+DT_MAX = 0.40
 
 
-def train_epoch(model, dataloader, optimizer, device, logger=None, epoch=0, retrieval_loss=False):
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0.0
-    step = 0
-
-    for batch in tqdm(dataloader, desc="Training"):
-        inputs = batch["input"].to(device)
-        targets = batch["target"].to(device)
-        noise = batch.get("noise", None)
-        if noise is not None:
-            noise = noise.to(device)
-        signal_keys = batch.get("signal_keys", None)
-        signal_values = batch.get("signal_values", None)
-        if signal_keys is not None:
-            signal_keys = signal_keys.to(device)
-            signal_values = signal_values.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(inputs, noise=noise)
-
-        if retrieval_loss:
-            if signal_keys is None:
-                raise ValueError("retrieval_loss requires signal_keys/signal_values in batch (filtering task only)")
-            retrieved = einsum(signal_keys, outputs, "b m n, b n d -> b m d")
-            loss = mse_loss(retrieved, signal_values)
-        else:
-            loss = mse_loss(outputs, targets)
-
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-        # Log per-batch metrics
-        if logger is not None:
-            metrics = {"loss": loss.item()}
-
-            # Log energy statistics for filtering task
-            if noise is not None:
-                B = inputs.shape[0]
-                signal_basis = batch.get("signal_basis", None)
-                noise_basis = batch.get("noise_basis", None)
-
-                # Input SNR: ||signal|| / ||total_noise||
-                signal_norm = torch.norm(inputs.reshape(B, -1), dim=1).pow(2).mean().item()
-
-                # Total injected noise budget: sum of per-layer squared norms.
-                # noise shape: [B, n_layers, n_streams, d]
-                total_noise_norm = (
-                    noise.reshape(B, noise.shape[1], -1).norm(dim=2).pow(2).sum(dim=1).mean().item()
-                )
-
-                input_snr = signal_norm / (total_noise_norm + 1e-8)
-
-                # Output SNR
-                if retrieval_loss:
-                    # Retrieval SNR: ||values|| / ||retrieved - values||
-                    output_signal_norm = torch.norm(signal_values.reshape(B, -1), dim=1).pow(2).mean().item()
-                    output_error_norm = torch.norm((retrieved - signal_values).reshape(B, -1), dim=1).pow(2).mean().item()
-                else:
-                    # Reconstruction SNR: ||targets|| / ||outputs - targets||
-                    output_signal_norm = torch.norm(targets.reshape(B, -1), dim=1).pow(2).mean().item()
-                    output_error_norm = torch.norm((outputs - targets).reshape(B, -1), dim=1).pow(2).mean().item()
-                output_snr = output_signal_norm / (output_error_norm + 1e-8)
-
-                # Queried Signal Norm:
-                vs = einsum(inputs, signal_basis, "b n d, b k n -> b k d")
-                outputs_vs = einsum(outputs, signal_basis, "b n d, b k n -> b k d")
-
-                vs_energy = vs.norm(dim=-1).pow(2).mean().item()
-                outputs_vs_energy = outputs_vs.norm(dim=-1).pow(2).mean().item()
-                residual_energy = (vs - outputs_vs).norm(dim=-1).pow(2).mean().item()
-
-                snr_queried = vs_energy / (residual_energy + 1e-8)
+def autocast_ctx(device: str) -> contextlib.AbstractContextManager:
+    device_type = device.split(":", maxsplit=1)[0]
+    if device_type in {"cuda", "mps"}:
+        return torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
-                metrics.update({
-                    "signal_norm": signal_norm,
-                    "total_noise_norm": total_noise_norm,
-                    "input_snr": input_snr,
-                    "output_signal_norm": output_signal_norm,
-                    "output_error_norm": output_error_norm,
-                    "output_snr": output_snr,
-                    "vs_energy_queried": vs_energy,
-                    "outputs_vs_energy_queried": outputs_vs_energy,
-                    "residual_energy_queried": residual_energy,
-                    "snr_queried": snr_queried,
-                })
-
-            logger.log_metrics(epoch, step, metrics)
-        step += 1
-
-    return total_loss / len(dataloader)
+def build_model(name: str, depth: int) -> StreamDynamics:
+    common = {
+        "n": N_STREAMS,
+        "m": N_STREAMS,
+        "input_dim": N_STREAMS * FEATURE_DIM,
+        "embed_dim": N_STREAMS * FEATURE_DIM,
+        "module": ZeroModule(),
+    }
+    if name == "cghc":
+        layer = cghc.ContinuousGenHyperConnections(
+            **common,
+            generator_type="conservative_psd_diss",
+            dt=DT,
+            dt_min=DT_MIN,
+            dt_max=DT_MAX,
+            learn_dt=True,
+            vec_dt=True,
+            use_triton=False,
+        )
+    elif name == "mhc":
+        layer = mhc.ManifoldHyperConnections(**common)
+    elif name == "ghc":
+        layer = ghc.GeneralizedHyperConnections(**common)
+    else:
+        raise ValueError(f"unknown model: {name}")
+    return StreamDynamics(layer, N_STREAMS, FEATURE_DIM, depth)
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
-    """Evaluate the model."""
+def evaluate(
+    model: StreamDynamics,
+    task: SyntheticTask,
+    device: torch.device,
+    generator: torch.Generator,
+) -> dict[str, float]:
     model.eval()
-    total_loss = 0.0
-
-    for batch in dataloader:
-        inputs = batch["input"].to(device)
-        targets = batch["target"].to(device)
-        noise = batch.get("noise", None)
-        if noise is not None:
-            noise = noise.to(device)
-
-        outputs = model(inputs, noise=noise)
-        loss = mse_loss(outputs, targets)
-
-        total_loss += loss.item()
-
-    return total_loss / len(dataloader)
+    totals: dict[str, float] = {}
+    for _ in range(EVAL_BATCHES):
+        state, target, noise = task.sample(BATCH_SIZE, generator)
+        state = state.to(device)
+        target = target.to(device)
+        noise = None if noise is None else noise.to(device)
+        with autocast_ctx(str(device)):
+            prediction = model(state, noise)
+        for key, value in task.metrics(
+            prediction.float(), target.float(), noise
+        ).items():
+            totals[key] = totals.get(key, 0.0) + value
+    return {key: value / EVAL_BATCHES for key, value in totals.items()}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train synthetic tasks")
-
-    # Task settings
-    parser.add_argument("--task", type=str, default="preservation",
-                       choices=["preservation", "rotation", "filtering"],
-                       help="Task type")
-    parser.add_argument("--transform-type", type=str, default="permutation",
-                       choices=["permutation", "rotation"],
-                       help="Transformation type for rotation task")
-    parser.add_argument("--permutation-mode", type=str, default="cyclic",
-                       choices=["cyclic", "random", "reverse"],
-                       help="Permutation mode")
-
-    # Data settings
-    parser.add_argument("--n-samples", type=int, default=10000,
-                       help="Number of training samples")
-    parser.add_argument("--n-streams", type=int, default=4,
-                       help="Number of streams (n)")
-    parser.add_argument("--d", type=int, default=64,
-                       help="Dimension of value vectors")
-    parser.add_argument("--n-memories", type=int, default=None,
-                       help="Number of key-value pairs (default: n_streams)")
-
-    # Filtering task settings
-    parser.add_argument("--n-signal-basis", type=int, default=2,
-                       help="Number of signal basis vectors")
-    parser.add_argument("--n-signal-memories", type=int, default=2,
-                       help="Number of signal key-value pairs")
-    parser.add_argument("--n-noise-basis", type=int, default=2,
-                       help="Number of noise basis vectors")
-    parser.add_argument("--n-noise-memories", type=int, default=2,
-                       help="Number of noise key-value pairs per layer")
-    parser.add_argument("--noise-scale", type=float, default=1.0,
-                       help="Noise scale for filtering task")
-    parser.add_argument("--retrieval-loss", action="store_true",
-                       help="Filtering task only: train on retrieval loss "
-                            "(MSE between keys@outputs and signal_values) instead of "
-                            "reconstructing H_0")
-
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-
-    # Model settings
-    parser.add_argument("--model", type=str, default="cghc",
-                       choices=["cghc", "mhc", "ghc", "identity_hc"],
-                       help="Hyperconnection model type")
-    parser.add_argument("--n-layers", type=int, default=1,
-                       help="Number of hyperconnection layers")
-
-    # CGHC-specific settings
-    parser.add_argument("--generator-type", type=str, default="conservative_diag_diss",
-                       help="Generator type for CGHC")
-    parser.add_argument("--dt", type=float, default=0.01,
-                       help="Time step for CGHC")
-    parser.add_argument("--projection", type=str, default="none",
-                       choices=["none", "mean", "v"],
-                       help="Projection type for CGHC")
-
-    # MHC-specific settings
-    parser.add_argument("--sinkhorn-iters", type=int, default=20,
-                       help="Sinkhorn iterations for MHC")
-
-    # Training settings
-    parser.add_argument("--batch-size", type=int, default=128,
-                       help="Batch size")
-    parser.add_argument("--epochs", type=int, default=100,
-                       help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                       help="Learning rate")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                       help="Device")
-
-    # Logging settings
-    parser.add_argument("--log-dir", type=str, default="experiments/synthetic/runs",
-                       help="Directory for experiment logs")
-    parser.add_argument("--run-name", type=str, default=None,
-                       help="Run name (default: timestamp)")
-
-    args = parser.parse_args()
-
-    if args.retrieval_loss and args.task != "filtering":
-        parser.error("--retrieval-loss is only supported with --task filtering")
-
-    # Set seed
-    torch.manual_seed(args.seed)
-
-    # Initialize logger
-    logger = ExperimentLogger(args.log_dir, args.run_name)
-
-    # Save configuration
-    config = vars(args)
-    logger.save_config(config)
-
-    # Validate and set device
-    if args.device == "cuda":
-        if not torch.cuda.is_available():
-            print("Warning: CUDA requested but not available. Falling back to CPU.")
-            args.device = "cpu"
-    elif args.device == "mps":
-        if not torch.backends.mps.is_available():
-            print("Warning: MPS requested but not available. Falling back to CPU.")
-            args.device = "cpu"
-
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
-    if args.device == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    elif args.device == "mps":
-        print("  Apple Silicon GPU (Metal)")
-    print()
-
-    # Create dataset
-    if args.task == "preservation":
-        dataset = SignalPreservationDataset(
-            n_samples=args.n_samples,
-            n_streams=args.n_streams,
-            d=args.d,
-            n_memories=args.n_memories,
-            seed=args.seed,
-        )
-    elif args.task == "rotation":
-        dataset = SignalRotationDataset(
-            n_samples=args.n_samples,
-            n_streams=args.n_streams,
-            d=args.d,
-            n_memories=args.n_memories,
-            transform_type=args.transform_type,
-            permutation_mode=args.permutation_mode,
-            seed=args.seed,
-        )
-    elif args.task == "filtering":
-        dataset = SignalFilteringDataset(
-            n_samples=args.n_samples,
-            n_streams=args.n_streams,
-            d=args.d,
-            n_layers=args.n_layers,
-            n_signal_basis=args.n_signal_basis,
-            n_signal_memories=args.n_signal_memories,
-            n_noise_basis=args.n_noise_basis,
-            n_noise_memories=args.n_noise_memories,
-            noise_scale=args.noise_scale,
-            seed=args.seed,
-        )
-
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=8,
-        persistent_workers=True,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "task", choices=["preservation", "rotation", "permutation", "filtering"]
     )
+    parser.add_argument("model", choices=["cghc", "mhc", "ghc"])
+    parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=1_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--output", type=Path)
+    return parser.parse_args()
 
-    # Create model
-    hc_class = HC_MODELS[args.model]
 
-    # Build model-specific kwargs
-    hc_kwargs = {}
-    if args.model == "cghc":
-        hc_kwargs = {
-            "dt": args.dt,
-            "generator_type": args.generator_type,
-            "projection": args.projection,
-            "use_triton": False,
-            "vec_dt": True,
-            "elementwise_affine": True,
-            "learn_dt": True,
-            "dt_min": 0.0001,
-            "dt_max": 1.0,
-        }
-    elif args.model == "mhc":
-        hc_kwargs = {
-            "sinkhorn_iters": args.sinkhorn_iters,
-        }
-    elif args.model == "ghc":
-        hc_kwargs = {}
-    elif args.model == "identity_hc":
-        hc_kwargs = {}
+def main() -> None:
+    args = parse_args()
+    if args.steps < 1:
+        raise ValueError("steps must be positive")
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    task = SyntheticTask.create(
+        args.task, N_STREAMS, FEATURE_DIM, args.depth, args.seed
+    )
+    model = build_model(args.model, args.depth).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    train_generator = torch.Generator().manual_seed(args.seed + 1)
 
-    model = StreamDynamicsModel(
-        n_streams=args.n_streams,
-        d=args.d,
-        n_layers=args.n_layers,
-        hc_class=hc_class,
-        hc_kwargs=hc_kwargs,
-        module_class=ZeroModule,
-    ).to(args.device)
+    log_every = max(1, args.steps // LOG_POINTS)
+    history = []
+    running_loss = 0.0
+    running_steps = 0
+    model.train()
+    for step in range(1, args.steps + 1):
+        state, target, noise = task.sample(BATCH_SIZE, train_generator)
+        state = state.to(device)
+        target = target.to(device)
+        noise = None if noise is None else noise.to(device)
 
-    model.compile()
+        with autocast_ctx(str(device)):
+            prediction = model(state, noise)
+        loss = relative_error(prediction.float(), target.float())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        running_loss += loss.item()
+        running_steps += 1
+        if step == 1 or step % log_every == 0 or step == args.steps:
+            evaluation = evaluate(
+                model,
+                task,
+                device,
+                torch.Generator().manual_seed(args.seed + 2),
+            )
+            entry = {
+                "step": step,
+                "train_loss": running_loss / running_steps,
+                "val_loss": evaluation["error"],
+                **{
+                    f"val_{key}": value
+                    for key, value in evaluation.items()
+                    if key != "error"
+                },
+            }
+            history.append(entry)
+            values = " ".join(
+                f"{key}={value:.6f}"
+                for key, value in entry.items()
+                if key != "step"
+            )
+            print(f"step={step} {values}")
+            running_loss = 0.0
+            running_steps = 0
+            model.train()
 
-    print(f"Task: {args.task}")
-    print(f"Model: {args.model}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Batch size: {args.batch_size}")
-    print()
-
-    # Training loop
-    best_loss = float('inf')
-    for epoch in range(args.epochs):
-        train_loss = train_epoch(
-            model, dataloader, optimizer, args.device, logger, epoch,
-            retrieval_loss=args.retrieval_loss,
+    output = args.output or Path(
+        f"experiments/synthetic_dynamics/results/"
+        f"{args.task}_{args.model}_L{args.depth}_seed{args.seed}.json"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(
+            {
+                "task": args.task,
+                "model": args.model,
+                "depth": args.depth,
+                "steps": args.steps,
+                "seed": args.seed,
+                "history": history,
+                **evaluation,
+            },
+            indent=2,
         )
-
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {train_loss:.6f}")
-
-        if train_loss < best_loss:
-            best_loss = train_loss
-            print(f"  New best loss: {best_loss:.6f}")
-
-    print(f"\nFinal loss: {best_loss:.6f}")
-
-    # Save final metrics
-    logger.save_metrics()
-    print(f"\nExperiment logged to: {logger.run_dir}")
+    )
+    print(f"saved={output}")
 
 
 if __name__ == "__main__":
