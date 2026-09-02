@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops import einsum
 from timm.layers import trunc_normal_
 
-from hyperconnections.short_conv import DepthwiseShortConv1d
+from hyperconnections.temporal_writeback import TemporalWriteback
 
 
 class IdentityHyperConnections(nn.Module):
@@ -29,14 +29,15 @@ class IdentityHyperConnections(nn.Module):
         module: nn.Module,
         bias: bool = False,
         elementwise_affine: bool = False,
-        shortconv_kernel_size: int = 0,
-        shortconv_causal: bool = True,
-    ):
+        writeback_kernel_sizes: tuple[int, ...] = (),
+        writeback_orthogonalize: bool = True,
+    ) -> None:
         super().__init__()
         self.n = n
         self.m = m
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.writeback_components = len(writeback_kernel_sizes) + 1
 
         assert embed_dim % m == 0, (
             f"embed_dim ({embed_dim}) must be divisible by m ({m})"
@@ -50,18 +51,30 @@ class IdentityHyperConnections(nn.Module):
         # Read/write parameters following mHC convention
         self.read_in = nn.Parameter(torch.empty(n, m))
         self.alpha_read_in = nn.Parameter(torch.empty(1))
-        self.write_out = nn.Parameter(torch.empty(n, m))
+        write_out_shape = (
+            (n, m)
+            if self.writeback_components == 1
+            else (n, self.writeback_components, m)
+        )
+        self.write_out = nn.Parameter(torch.empty(write_out_shape))
         self.alpha_write_out = nn.Parameter(torch.empty(1))
 
         self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
-        self.proj_write_out = nn.Linear(input_dim, n * m, bias=bias)
+        self.proj_write_out = nn.Linear(
+            input_dim,
+            n * m * self.writeback_components,
+            bias=bias,
+        )
 
         self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
         self.module = module
-        # Optional over-width short conv on the read/source path (see forward).
-        self.short_conv = (
-            DepthwiseShortConv1d(input_dim, shortconv_kernel_size, causal=shortconv_causal)
-            if shortconv_kernel_size > 0
+        self.writeback = (
+            TemporalWriteback(
+                embed_dim,
+                writeback_kernel_sizes,
+                orthogonalize=writeback_orthogonalize,
+            )
+            if writeback_kernel_sizes
             else None
         )
 
@@ -105,14 +118,24 @@ class IdentityHyperConnections(nn.Module):
         B = x_norm.shape[0]
 
         h_read_in = self.proj_read_in(x_norm).reshape(B, self.n, self.m)
-        h_write_out = self.proj_write_out(x_norm).reshape(B, self.n, self.m)
+        h_write_out = self.proj_write_out(x_norm).reshape(
+            B,
+            self.n,
+            self.writeback_components,
+            self.m,
+        )
 
         read_in = torch.sigmoid(
             self.alpha_read_in * h_read_in + self.read_in
         ).transpose(1, 2)  # [B, m, n]
+        write_out_bias = self.write_out
+        if self.writeback_components == 1:
+            write_out_bias = write_out_bias.unsqueeze(1)
         write_out = 2 * torch.sigmoid(
-            self.alpha_write_out * h_write_out + self.write_out
-        )  # [B, n, m]
+            self.alpha_write_out * h_write_out + write_out_bias
+        )
+        if self.writeback_components == 1:
+            write_out = write_out.squeeze(2)
 
         return write_out, read_in
 
@@ -127,30 +150,44 @@ class IdentityHyperConnections(nn.Module):
         leading = x.shape[:-1]
         x = x.reshape(-1, self.n, self.block_size)  ### [B*, n, block_size]
         B = x.shape[0]
-        ### Optional over-width short conv on the read/source path only: it feeds the
-        ### read-in and the x_norm-derived read/write weights, while the carried stream
-        ### `x` that gets added back stays un-convolved.
-        if self.short_conv is not None:
-            src = self.short_conv(x.reshape(*leading, self.input_dim)).reshape(B, self.n, self.block_size)
-        else:
-            src = x
-        x_norm = self.norm(src.view(B, -1))  ### [B*, input_dim]
+        x_norm = self.norm(x.view(B, -1))  ### [B*, input_dim]
 
         write_out, read_in = self.compute_read_write_weights(x_norm)
 
         ### Source term Y = H^post F(H^pre X)  (read → compute → write)
         ### Read in from over-width space to backbone width
-        x_read = einsum(read_in, src, "b m n, b n d -> b m d")  ### [B*, m, block_size]
+        x_read = einsum(read_in, x, "b m n, b n d -> b m d")
 
         ### Process through the backbone module
-        out = self.module(x_read.reshape(*leading, self.embed_dim), **kwargs)
+        module_output = self.module(
+            x_read.reshape(*leading, self.embed_dim),
+            **kwargs,
+        )
 
-        ### Write out from backbone width back to the over-width space
-        out = out.reshape(B, self.m, self.block_size)  ### [B*, m, block_size]
-        Y = einsum(write_out, out, "b n m, b m d -> b n d")  ### [B*, n, block_size]
+        if self.writeback is None:
+            write_out = write_out.unsqueeze(2)
+            writeback_components = module_output.reshape(
+                B,
+                1,
+                self.m,
+                self.block_size,
+            )
+        else:
+            writeback_components = self.writeback(module_output).reshape(
+                B,
+                self.writeback_components,
+                self.m,
+                self.block_size,
+            )
+
+        source_update = einsum(
+            write_out,
+            writeback_components,
+            "b n k m, b k m d -> b n d",
+        )
 
         ### Identity stream mixing: X_new = I @ X + Y = X + Y
         # Simply add the residual (identity matrix multiplication is a no-op)
-        x_out = x + Y  ### [B*, n, block_size]
+        x_out = x + source_update  ### [B*, n, block_size]
 
         return x_out.unflatten(0, leading).flatten(-2)

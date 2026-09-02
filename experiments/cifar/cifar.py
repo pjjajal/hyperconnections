@@ -88,7 +88,9 @@ class HyperConnectedMixerBlock(nn.Module):
         B, seq_len = x.shape[:2]
         x_blocks = x.reshape(-1, hc.n, hc.block_size)
         if hasattr(hc, "compute_transition"):  # CGHC: Phi = exp(dt * A)
-            sm = hc.compute_transition(x_blocks)
+            x_norm = hc.norm(x_blocks.flatten(1))
+            projections = hc.input_proj(x_norm)
+            sm = hc.compute_transition(projections)
         else:  # GHC / MHC
             _, _, sm = hc.compute_mixing_weights(x_blocks)
         return sm.reshape(B, seq_len, hc.n, hc.n)

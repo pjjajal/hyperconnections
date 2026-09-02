@@ -87,6 +87,14 @@ class TestInit:
                 n=4, m=2, input_dim=99, embed_dim=8, module=IdentityModule()
             )
 
+    def test_invalid_generator_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown generator type"):
+            make_cghc(4, 2, 8, generator_type="typo")
+
+    def test_invalid_projection_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown projection type"):
+            make_cghc(4, 2, 8, projection="typo")
+
     # Regression test for the conservative_laplacian bug fix
     def test_conservative_laplacian_creates_conserv_params(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
@@ -288,13 +296,17 @@ class TestReadWriteWeights:
         cghc = make_cghc(n, m, embed_dim)
         B = 3
         x = torch.randn(B, (n * embed_dim) // m)
-        write_out, _ = cghc.compute_read_write_weights(cghc.input_proj(x))  # [B, n, m]
+        write_out, _ = cghc.compute_read_write_weights(cghc.input_proj(x))
         for i in range(n):
             on = i % m
-            assert write_out[:, i, on].mean().item() == pytest.approx(1.0, abs=0.05)
+            assert write_out[:, i, on].mean().item() == pytest.approx(
+                1.0, abs=0.05
+            )
             for j in range(m):
                 if j != on:
-                    assert write_out[:, i, j].mean().item() == pytest.approx(2 * torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05)
+                    assert write_out[:, i, j].mean().item() == pytest.approx(
+                        2 * torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05
+                    )
 
 
 # ---------------------------------------------------------------------------

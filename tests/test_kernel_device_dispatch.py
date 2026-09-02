@@ -1,8 +1,7 @@
 """
 Tests for device-driven custom-kernel (Triton) dispatch.
 
-Triton kernels require CUDA tensors. The model classes bind their kernel
-dispatch at construction time, so a CPU model must fall back to the eager
+Triton kernels require CUDA tensors. A CPU model must fall back to the eager
 PyTorch path while a CUDA model uses Triton (when importable). These tests
 pin that contract:
 
@@ -68,14 +67,7 @@ class TestCGHCDispatch:
     @pytest.mark.parametrize("device", DEVICES)
     def test_dispatch_matches_device(self, device):
         model = make_cghc(N, M, EMBED_DIM, device=device)
-        triton = should_use_triton(device)
-        # _stream_mix / _matrix_exp are rebound by use_triton; compare by name.
-        assert model._stream_mix.__name__ == (
-            "_stream_mix_triton" if triton else "_stream_mix_eager"
-        )
-        assert model._matrix_exp.__name__ == (
-            "expm_t18_triton" if triton else "_matrix_exp_eager"
-        )
+        assert model._use_triton == should_use_triton(device)
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_forward_backward_runs_on_device(self, device):
@@ -91,8 +83,7 @@ class TestCGHCDispatch:
     def test_cpu_model_is_eager_regardless_of_triton_install(self):
         """The whole point: a CPU model never picks Triton, even where it's importable."""
         model = make_cghc(N, M, EMBED_DIM, device="cpu")
-        assert model._stream_mix.__name__ == "_stream_mix_eager"
-        assert model._matrix_exp.__name__ == "_matrix_exp_eager"
+        assert model._use_triton is False
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +94,7 @@ class TestCGHCFDispatch:
     @pytest.mark.parametrize("device", DEVICES)
     def test_block_kernel_matches_device(self, device):
         model = make_cghcf(N, M, EMBED_DIM, device=device)
-        assert model._use_block_triton == should_use_triton(device)
+        assert model._use_triton == should_use_triton(device)
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_forward_runs_on_device(self, device):
@@ -129,7 +120,6 @@ def test_forcing_triton_on_cpu_raises():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_model_uses_triton_when_available():
     model = make_cghc(N, M, EMBED_DIM, device="cuda")
-    expected_triton = HAS_TRITON
-    assert (model._matrix_exp.__name__ == "expm_t18_triton") == expected_triton
+    assert model._use_triton == HAS_TRITON
     out = model(_input(model, "cuda"))
     assert out.is_cuda and out.isfinite().all()
