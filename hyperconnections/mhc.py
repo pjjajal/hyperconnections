@@ -1,10 +1,7 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
-from timm.layers import trunc_normal_
 
 from hyperconnections.temporal_writeback import TemporalWriteback
 
@@ -15,9 +12,11 @@ from hyperconnections.temporal_writeback import TemporalWriteback
 # when m = n, we get the regular connections, where the input dimension is embed_dim.
 # when n > m > 1, we get generalized hyperconnections.
 
-# Sinkhorn-Knopp bias init: exp(1 · I_n) is strongly diagonally dominant so
-# Sinkhorn(exp(1 · I_n)) ≈ I_n, matching the identity-mapping starting point.
-_SINKHORN_BIAS_INIT = 5.0
+# The paper initializes the residual logits as 6 I - 3.  Sinkhorn is invariant
+# to the uniform -3 offset, so storing 6 I is equivalent and a little simpler.
+_SINKHORN_BIAS_INIT = 6.0
+_READ_BIAS_INIT = 3.0
+_SINKHORN_EPS = 1e-6
 
 
 class ManifoldHyperConnections(nn.Module):
@@ -37,6 +36,9 @@ class ManifoldHyperConnections(nn.Module):
         elementwise_affine: bool = False,
         sinkhorn_iters: int = 20,
         sinkhorn_bias_init: float = _SINKHORN_BIAS_INIT,
+        layer_id: int = 0,
+        norm_eps: float = 1e-20,
+        sinkhorn_eps: float = _SINKHORN_EPS,
         writeback_kernel_sizes: tuple[int, ...] = (),
         writeback_orthogonalize: bool = True,
     ) -> None:
@@ -47,16 +49,18 @@ class ManifoldHyperConnections(nn.Module):
         self.embed_dim = embed_dim
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_bias_init = sinkhorn_bias_init
+        self.layer_id = layer_id
+        self.sinkhorn_eps = sinkhorn_eps
         self.writeback_components = len(writeback_kernel_sizes) + 1
 
+        assert n > 0 and m > 0, f"n and m must be positive, got n={n}, m={m}"
         assert embed_dim % m == 0, (
             f"embed_dim ({embed_dim}) must be divisible by m ({m})"
         )
-        assert input_dim == int(
-            (n / m) * embed_dim
-        ), (
+        expected_input_dim = n * (embed_dim // m)
+        assert input_dim == expected_input_dim, (
             "Input dimension must be (n / m) * embed_dim, "
-            f"but got {input_dim} and {(n / m) * embed_dim}"
+            f"but got {input_dim} and {expected_input_dim}"
         )
 
         self.block_size = embed_dim // m  # block size = embed_dim / m = input_dim / n
@@ -86,7 +90,11 @@ class ManifoldHyperConnections(nn.Module):
         )
         self.proj_stream_mixing = nn.Linear(input_dim, n * n, bias=bias)
 
-        self.norm = nn.RMSNorm(input_dim, elementwise_affine=elementwise_affine)
+        self.norm = nn.RMSNorm(
+            input_dim,
+            eps=norm_eps,
+            elementwise_affine=elementwise_affine,
+        )
 
         self.module = module
         self.writeback = (
@@ -101,19 +109,31 @@ class ManifoldHyperConnections(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # read_in: initialise so σ(read_in) = 1/n (uniform read across all streams).
-        # σ(b) = 1/n  →  b = logit(1/n) = log(1 / (n-1))  for n > 1.
-        logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
-        nn.init.constant_(self.read_in, logit_1_over_n)
+        # Paper initialization: each module fraction reads primarily from one
+        # residual stream, rotating that choice with depth. For m=1 this is the
+        # +3/-3 layer-dependent H^pre initialization from Appendix A.6.
+        read_in_init = torch.full_like(self.read_in, -_READ_BIAS_INIT)
+        for j in range(self.m):
+            stream = (self.layer_id * self.m + j) % self.n
+            read_in_init[stream, j] = _READ_BIAS_INIT
+        with torch.no_grad():
+            self.read_in.copy_(read_in_init)
 
         # write_out: initialise so 2·σ(write_out) = 1.
         # 2·σ(0) = 1  →  write_out = 0.
         nn.init.zeros_(self.write_out)
 
-        # stream_mixing: initialise so Sinkhorn(exp(stream_mixing)) ≈ I_n.
-        # A large positive diagonal makes exp(stream_mixing) strongly diagonally
-        # dominant, so the doubly stochastic projection starts near identity.
-        self.stream_mixing.data.copy_(self.sinkhorn_bias_init * torch.eye(self.n))
+        # Equivalent to the paper's (6 I - 3): a uniform logit offset is removed
+        # by Sinkhorn, so only the diagonal/off-diagonal gap matters.
+        with torch.no_grad():
+            self.stream_mixing.copy_(
+                self.sinkhorn_bias_init
+                * torch.eye(
+                    self.n,
+                    device=self.stream_mixing.device,
+                    dtype=self.stream_mixing.dtype,
+                )
+            )
 
         # Alpha gating factors: 0.01 per the mHC paper (Table 5).
         nn.init.constant_(self.alpha_read_in, 0.01)
@@ -128,10 +148,13 @@ class ManifoldHyperConnections(nn.Module):
                 nn.init.zeros_(proj.bias)
 
     def _sinkhorn_knopp(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.exp()
-        for _ in range(self.sinkhorn_iters):
-            x = x / x.sum(dim=-1, keepdim=True)
-            x = x / x.sum(dim=-2, keepdim=True)
+        # Follow the paper's stable softmax-first formulation. A direct exp of
+        # learned logits can overflow in a long training run.
+        x = x.float().softmax(dim=-1) + self.sinkhorn_eps
+        x = x / (x.sum(dim=-2, keepdim=True) + self.sinkhorn_eps)
+        for _ in range(max(0, self.sinkhorn_iters - 1)):
+            x = x / (x.sum(dim=-1, keepdim=True) + self.sinkhorn_eps)
+            x = x / (x.sum(dim=-2, keepdim=True) + self.sinkhorn_eps)
         return x
 
     def compute_mixing_weights(self, x: torch.Tensor):
@@ -166,7 +189,7 @@ class ManifoldHyperConnections(nn.Module):
         )
 
         # Apply manifold constraints
-        read_in = F.sigmoid(h_read_in).transpose(1, 2)
+        read_in = (F.sigmoid(h_read_in) + self.sinkhorn_eps).transpose(1, 2)
         write_out = 2 * F.sigmoid(h_write_out)
         if self.writeback_components == 1:
             write_out = write_out.squeeze(2)
