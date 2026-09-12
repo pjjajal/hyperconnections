@@ -95,6 +95,10 @@ class TestInit:
         with pytest.raises(ValueError, match="Unknown projection type"):
             make_cghc(4, 2, 8, projection="typo")
 
+    def test_invalid_projection_variant_raises(self):
+        with pytest.raises(ValueError, match="Unknown projection variant"):
+            make_cghc(4, 2, 8, projection_variant="typo")
+
     # Regression test for the conservative_laplacian bug fix
     def test_conservative_laplacian_creates_conserv_params(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
@@ -453,3 +457,32 @@ class TestGradientFlow:
         x = torch.randn(3, (n * embed_dim) // m, requires_grad=True)
         cghc(x).sum().backward()
         assert x.grad is not None
+
+
+@pytest.mark.parametrize("variant", ["one_sided", "two_sided"])
+@pytest.mark.parametrize("projection", ["mean", "v", "none"])
+def test_projection_variant_matches_dense_formula_and_gradients(variant, projection, device):
+    torch.manual_seed(42)
+    cghc = make_cghc(4, 2, 8, projection=projection,
+                     projection_variant=variant, device=device)
+    x = torch.randn(3, 4, 4, device=device, requires_grad=True)
+    transition = torch.randn(3, 4, 4, device=device, requires_grad=True)
+    source = torch.randn_like(x, requires_grad=True)
+    direction = torch.randn(1 if projection == "mean" else 3, 4,
+                            device=device, requires_grad=True)
+    v = torch.nn.functional.normalize(direction, dim=-1) if projection != "none" else None
+    actual = cghc._stream_mix(x, transition, source, v)
+    identity = torch.eye(4, device=device)
+    P = v.unsqueeze(-1) * v.unsqueeze(-2) if v is not None else torch.zeros_like(identity)
+    Q = identity - P
+    mixed = transition @ Q @ x
+    expected = P @ x + (Q @ mixed if variant == "two_sided" else mixed) + source
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    if variant == "two_sided":
+        torch.testing.assert_close(P @ (actual - source), P @ x, atol=2e-5, rtol=2e-5)
+    inputs = (x, transition, source) + ((direction,) if v is not None else ())
+    weight = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad((actual * weight).sum(), inputs, retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * weight).sum(), inputs)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=3e-5, rtol=3e-5)
