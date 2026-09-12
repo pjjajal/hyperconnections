@@ -486,3 +486,38 @@ def test_projection_variant_matches_dense_formula_and_gradients(variant, project
     expected_grads = torch.autograd.grad((expected * weight).sum(), inputs)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
+@pytest.mark.parametrize("projection", ["mean", "v", "none"])
+def test_projected_generator_transition(generator_type, projection, device):
+    torch.manual_seed(42)
+    cghc = make_cghc(4, 2, 8, generator_type=generator_type,
+                     projection=projection, device=device, module=ZeroModule())
+    with torch.no_grad():
+        cghc.input_proj.fused.weight.normal_(std=0.2)
+    x = torch.randn(3, cghc.input_dim, device=device, requires_grad=True)
+    projections = cghc.input_proj(cghc.norm(x))
+    A = cghc.compute_generator(projections)
+    v = cghc.compute_projection(projections)
+    identity = torch.eye(4, device=device)
+    P = v.unsqueeze(-1) * v.unsqueeze(-2) if v is not None else torch.zeros_like(identity)
+    Q = identity - P
+    expected_generator = Q @ A @ Q
+    cghc.projection_variant = "generator"
+    actual_generator = cghc.compute_generator(projections)
+    torch.testing.assert_close(actual_generator, expected_generator)
+    transition = cghc.compute_transition(projections)
+    expected_transition = torch.matrix_exp(expected_generator)
+    torch.testing.assert_close(transition, expected_transition, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(transition @ P, P.expand_as(transition), atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(P @ transition, P.expand_as(transition), atol=2e-5, rtol=2e-5)
+    expected = (expected_transition @ x.reshape(3, 4, 4)).flatten(1)
+    actual = cghc(x)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    inputs = (x, cghc.input_proj.fused.weight)
+    weight = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad((actual * weight).sum(), inputs, retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * weight).sum(), inputs)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=3e-5, rtol=3e-5)

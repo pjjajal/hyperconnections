@@ -21,7 +21,7 @@ GeneratorType = Literal[
     "conservative_laplacian",
 ]
 ProjectionType = Literal["mean", "v", "none"]
-ProjectionVariant = Literal["one_sided", "two_sided"]
+ProjectionVariant = Literal["one_sided", "two_sided", "generator"]
 
 GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative": (True, None),
@@ -163,7 +163,7 @@ class ContinuousGenHyperConnections(nn.Module):
             raise ValueError(f"Unknown generator type: {generator_type!r}")
         if projection not in {"mean", "v", "none"}:
             raise ValueError(f"Unknown projection type: {projection!r}")
-        if projection_variant not in {"one_sided", "two_sided"}:
+        if projection_variant not in {"one_sided", "two_sided", "generator"}:
             raise ValueError(f"Unknown projection variant: {projection_variant!r}")
 
         self.n = n
@@ -464,6 +464,20 @@ class ContinuousGenHyperConnections(nn.Module):
                 )
             A = A - laplacian_dt
 
+        if self.projection_variant == "generator":
+            direction = self.compute_projection(projections)
+            if direction is not None:
+                # Project the fully assembled, time-scaled generator before
+                # exponentiation. Disable autocast to preserve float32 assembly.
+                with torch.autocast(device_type=device.type, enabled=False):
+                    v = direction.float()
+                    # Apply the rank-one complements in O(n^2), without
+                    # materializing P/Q or performing dense matrix products.
+                    Av = einsum(A, v, "b i j, b j -> b i")
+                    A = A - Av.unsqueeze(-1) * v.unsqueeze(-2)
+                    vA = einsum(v, A, "b i, b i j -> b j")
+                    A = A - v.unsqueeze(-1) * vA.unsqueeze(-2)
+
         return A
 
     def compute_transition(self, projections: CGHCProjections) -> torch.Tensor:
@@ -520,6 +534,9 @@ class ContinuousGenHyperConnections(nn.Module):
         Y: torch.Tensor,
         projection_dir: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.projection_variant == "generator":
+            # exp(QAQ) already preserves P and maps its complement to itself.
+            projection_dir = None
         # With P = vv^T, the existing mixer applies Px + T(I-P)x + Y.
         # Left-project T first to obtain Px + (I-P)T(I-P)x + Y on
         # both the eager and Triton paths, leaving write-back unchanged.
@@ -608,7 +625,11 @@ class ContinuousGenHyperConnections(nn.Module):
             projections,
             source_update,
         )
-        projection_dir = self.compute_projection(projections)
+        projection_dir = (
+            None
+            if self.projection_variant == "generator"
+            else self.compute_projection(projections)
+        )
 
         updated_streams = self._stream_mix(
             x=streams,
