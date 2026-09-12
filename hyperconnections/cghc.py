@@ -21,6 +21,7 @@ GeneratorType = Literal[
     "conservative_laplacian",
 ]
 ProjectionType = Literal["mean", "v", "none"]
+ProjectionVariant = Literal["one_sided", "two_sided"]
 
 GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative": (True, None),
@@ -154,6 +155,7 @@ class ContinuousGenHyperConnections(nn.Module):
         sat_c: float | None = 2.0,
         writeback_kernel_sizes: tuple[int, ...] = (),
         writeback_orthogonalize: bool = True,
+        projection_variant: ProjectionVariant = "one_sided",
     ) -> None:
         super().__init__()
 
@@ -161,6 +163,8 @@ class ContinuousGenHyperConnections(nn.Module):
             raise ValueError(f"Unknown generator type: {generator_type!r}")
         if projection not in {"mean", "v", "none"}:
             raise ValueError(f"Unknown projection type: {projection!r}")
+        if projection_variant not in {"one_sided", "two_sided"}:
+            raise ValueError(f"Unknown projection variant: {projection_variant!r}")
 
         self.n = n
         self.m = m
@@ -168,6 +172,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.embed_dim = embed_dim
         self.generator_type = generator_type
         self.projection = projection
+        self.projection_variant = projection_variant
         self.has_conservative, self.dissipation_type = GENERATOR_COMPONENTS[
             generator_type
         ]
@@ -515,6 +520,14 @@ class ContinuousGenHyperConnections(nn.Module):
         Y: torch.Tensor,
         projection_dir: torch.Tensor | None,
     ) -> torch.Tensor:
+        # With P = vv^T, the existing mixer applies Px + T(I-P)x + Y.
+        # Left-project T first to obtain Px + (I-P)T(I-P)x + Y on
+        # both the eager and Triton paths, leaving write-back unchanged.
+        if projection_dir is not None and self.projection_variant == "two_sided":
+            v = projection_dir.to(transition_matrix.dtype)
+            vt_transition = einsum(v, transition_matrix, "b i, b i j -> b j")
+            transition_matrix = transition_matrix - v.unsqueeze(-1) * vt_transition.unsqueeze(-2)
+
         if self._use_triton:
             if projection_dir is not None:
                 projection_dir = projection_dir.expand(x.shape[0], -1)
