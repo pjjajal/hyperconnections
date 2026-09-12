@@ -468,15 +468,14 @@ class ContinuousGenHyperConnections(nn.Module):
             direction = self.compute_projection(projections)
             if direction is not None:
                 # Project the fully assembled, time-scaled generator before
-                # exponentiation. Disable autocast to preserve float32 assembly.
-                with torch.autocast(device_type=device.type, enabled=False):
-                    v = direction.float()
-                    # Apply the rank-one complements in O(n^2), without
-                    # materializing P/Q or performing dense matrix products.
-                    Av = einsum(A, v, "b i j, b j -> b i")
-                    A = A - Av.unsqueeze(-1) * v.unsqueeze(-2)
-                    vA = einsum(v, A, "b i, b i j -> b j")
-                    A = A - v.unsqueeze(-1) * vA.unsqueeze(-2)
+                # exponentiation using explicit multiply/reduce operations.
+                v = direction.float()
+                # Apply the rank-one complements in O(n^2), without
+                # materializing P/Q or performing dense matrix products.
+                Av = (A * v.unsqueeze(-2)).sum(dim=-1)
+                A = A - Av.unsqueeze(-1) * v.unsqueeze(-2)
+                vA = (A * v.unsqueeze(-1)).sum(dim=-2)
+                A = A - v.unsqueeze(-1) * vA.unsqueeze(-2)
 
         return A
 
