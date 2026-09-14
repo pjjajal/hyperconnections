@@ -156,6 +156,9 @@ class ContinuousGenHyperConnections(nn.Module):
         writeback_kernel_sizes: tuple[int, ...] = (),
         writeback_orthogonalize: bool = True,
         projection_variant: ProjectionVariant = "one_sided",
+        init_transition_contraction: float | None = None,
+        projection_decay: float = 1.0,
+        dt_max_diss: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -173,6 +176,11 @@ class ContinuousGenHyperConnections(nn.Module):
         self.generator_type = generator_type
         self.projection = projection
         self.projection_variant = projection_variant
+        if not 0.0 <= projection_decay <= 1.0:
+            raise ValueError("projection_decay must lie in [0, 1]")
+        if projection_decay != 1.0 and (projection == "none" or projection_variant == "generator"):
+            raise ValueError("projection_decay requires one_sided or two_sided projection")
+        self.projection_decay = projection_decay
         self.has_conservative, self.dissipation_type = GENERATOR_COMPONENTS[
             generator_type
         ]
@@ -208,12 +216,43 @@ class ContinuousGenHyperConnections(nn.Module):
         self.dt_max = dt_max
         self.log_dt_min = math.log(dt_min)
         self.log_dt_range = math.log(dt_max) - math.log(dt_min)
+        # Independent dissipative ceiling; omission preserves the shared range.
+        self.dt_max_diss = dt_max if dt_max_diss is None else dt_max_diss
+        if not math.isfinite(self.dt_max_diss) or not dt_min < dt < self.dt_max_diss:
+            raise ValueError("dt_max_diss must be finite and greater than the initial dt")
+        self.log_dt_diss_range = math.log(self.dt_max_diss) - math.log(dt_min)
         self.log_dt_init = math.log(dt)
         self.vec_dt = vec_dt
         n_dt = n if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.sat_c = sat_c
+        # Nominal contraction with zero predictor outputs; initialization only.
+        # Generator projection retains a unit mode, contracting its complement.
+        self.init_transition_contraction = init_transition_contraction
+        self._diss_diag_init = 0.0
+        if init_transition_contraction is not None:
+            if not 0.0 < init_transition_contraction < 1.0:
+                raise ValueError("init_transition_contraction must lie strictly in (0, 1)")
+            if self.dissipation_type != "diagonal":
+                raise ValueError("init_transition_contraction requires diagonal dissipation")
+            # Match the clamped timestep initialization used by _init_log_dt.
+            fraction = (self.log_dt_init - self.log_dt_min) / self.log_dt_diss_range
+            initial_dt = math.exp(self.log_dt_min + self.log_dt_diss_range *
+                                  min(max(fraction, 1e-4), 1 - 1e-4))
+            damping = -math.log(init_transition_contraction) / initial_dt
+            if sat_c is not None:
+                if not damping < sat_c:
+                    lower_bound = math.exp(-initial_dt * sat_c)
+                    raise ValueError(
+                        f"init_transition_contraction={init_transition_contraction} is unreachable "
+                        f"with initial dt={initial_dt:.6g}, sat_c={sat_c}. "
+                        f"The target must be strictly greater than {lower_bound:.8g}; "
+                        f"alternatively set sat_c=None or greater than {damping:.8g}."
+                    )
+                damping = damping / (1 - damping / sat_c)
+            # Stable inverse softplus, including large requested damping.
+            self._diss_diag_init = damping + math.log(-math.expm1(-damping))
 
         if self.has_conservative:
             self.conserv_A = nn.Parameter(torch.eye(n, n))
@@ -221,10 +260,8 @@ class ContinuousGenHyperConnections(nn.Module):
             self.diss_A = nn.Parameter(torch.zeros(n, n))
         if self.dissipation_type == "diagonal":
             self.diss_diag = nn.Parameter(torch.zeros(n))
-            self.diss_log_scale = nn.Parameter(torch.empty(1))
         if self.dissipation_type == "laplacian":
             self.laplacian_A = nn.Parameter(torch.zeros(n, n))
-            self.laplacian_log_scale = nn.Parameter(torch.empty(1))
 
         # Projection Direction
         if projection == "mean":
@@ -266,8 +303,9 @@ class ContinuousGenHyperConnections(nn.Module):
         self._use_triton = use_triton and HAS_TRITON
         self.init_weights()
 
-    def _init_log_dt(self, param: nn.Parameter) -> None:
-        target = (self.log_dt_init - self.log_dt_min) / self.log_dt_range
+    def _init_log_dt(self, param: nn.Parameter, log_range: float | None = None) -> None:
+        log_range = self.log_dt_range if log_range is None else log_range
+        target = (self.log_dt_init - self.log_dt_min) / log_range
         target = min(max(target, 1e-4), 1 - 1e-4)
         nn.init.constant_(param, math.log(target / (1 - target)))
 
@@ -309,15 +347,13 @@ class ContinuousGenHyperConnections(nn.Module):
             trunc_normal_(self.diss_A, std=0.01)
 
         if self.dissipation_type == "diagonal":
-            nn.init.zeros_(self.diss_diag)
-            nn.init.constant_(self.diss_log_scale, math.log(1e-3))
+            nn.init.constant_(self.diss_diag, self._diss_diag_init)
 
         if self.dissipation_type == "laplacian":
             nn.init.zeros_(self.laplacian_A)
-            nn.init.constant_(self.laplacian_log_scale, math.log(1e-3))
 
         self._init_log_dt(self.log_dt_conserv)
-        self._init_log_dt(self.log_dt_diss)
+        self._init_log_dt(self.log_dt_diss, self.log_dt_diss_range)
 
         self.input_proj.reset_parameters()
 
@@ -417,7 +453,7 @@ class ContinuousGenHyperConnections(nn.Module):
         if self.dissipation_type is not None:
             logit_diss = self.log_dt_diss + projections.dt_diss.float()
             dt_diss = torch.exp(
-                self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_diss)
+                self.log_dt_min + self.log_dt_diss_range * torch.sigmoid(logit_diss)
             )
             sqrt_dt_diss = dt_diss.sqrt()
 
@@ -436,7 +472,7 @@ class ContinuousGenHyperConnections(nn.Module):
             A = A - diss_dt
 
         if self.dissipation_type == "diagonal":
-            d = torch.exp(self.diss_log_scale) * F.softplus(
+            d = F.softplus(
                 self.diss_diag + projections.diss.float()
             )
             if self.sat_c is not None:
@@ -448,7 +484,7 @@ class ContinuousGenHyperConnections(nn.Module):
                 batch_size, self.n, self.n
             ).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))
-            adjacency = torch.exp(self.laplacian_log_scale) * F.softplus(scores)
+            adjacency = F.softplus(scores)
             if self.sat_c is not None:
                 adjacency = adjacency / (1 + adjacency / self.sat_c)
             adjacency = adjacency - torch.diag_embed(
@@ -536,7 +572,7 @@ class ContinuousGenHyperConnections(nn.Module):
         if self.projection_variant == "generator":
             # exp(QAQ) already preserves P and maps its complement to itself.
             projection_dir = None
-        # With P = vv^T, the existing mixer applies Px + T(I-P)x + Y.
+        # With P = vv^T, apply projection_decay*Px + T(I-P)x + Y.
         # Left-project T first to obtain Px + (I-P)T(I-P)x + Y on
         # both the eager and Triton paths, leaving write-back unchanged.
         if projection_dir is not None and self.projection_variant == "two_sided":
@@ -547,7 +583,7 @@ class ContinuousGenHyperConnections(nn.Module):
         if self._use_triton:
             if projection_dir is not None:
                 projection_dir = projection_dir.expand(x.shape[0], -1)
-            return stream_mix_add(transition_matrix, x, Y, projection_dir)
+            return stream_mix_add(transition_matrix, x, Y, projection_dir, self.projection_decay)
 
         if projection_dir is None:
             x_mixed = einsum(
@@ -561,7 +597,7 @@ class ContinuousGenHyperConnections(nn.Module):
                 "b n1, b n2, b n2 d -> b n1 d",
             )
             x_orth = x - x_proj
-            x_mixed = x_proj + einsum(
+            x_mixed = self.projection_decay * x_proj + einsum(
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
             )
         return x_mixed + Y

@@ -15,23 +15,33 @@ from .numbers import (
 )
 
 
-def expm_t18(A: torch.Tensor, S: int = 8) -> torch.Tensor:
+def expm_t18(A: torch.Tensor, S: int | None = None) -> torch.Tensor:
     """Compute the matrix exponential of A using the T_18 Taylor approximation.
 
     Args:
-        A: (..., n, n) float32 tensor.
+        A: (..., n, n) floating tensor; arithmetic uses float32.
+        S: Optional squaring budget. Raises if insufficient; never under-squares.
+           None chooses the needed count. This eager path synchronizes to the
+           host to determine the loop bound; use Triton for fused GPU execution.
 
     Returns:
         exp(A) with the same shape and dtype as A.
     """
+    if S is not None and (not isinstance(S, int) or S < 0):
+        raise ValueError("S must be a nonnegative integer or None")
     original_dtype = A.dtype
     A = A.to(torch.float32)
 
     ### Scaling: s = ceil(log2(||A||_1 / theta_18)), clamped to 0 if no scaling needed.
     ### Kept as float32 so the comparison (s > i) and division stay on-device.
     with torch.no_grad():
-        A_norm = torch.linalg.matrix_norm(A, ord=1).max().clamp_min(_THETA_18_F32)
+        A_norm = torch.linalg.matrix_norm(A, ord=1, keepdim=True).clamp_min(_THETA_18_F32)
         s = torch.ceil(torch.log2(A_norm / _THETA_18_F32)).clamp(min=0)
+        if not torch.isfinite(s).all():
+            raise ValueError("expm_t18 requires finite matrix norms")
+        needed = int(s.max().item())
+        if S is not None and needed > S:
+            raise ValueError(f"expm_t18 needs {needed} squarings, but S={S}")
         scale = 2.0**s
     A = A / scale
 
@@ -49,9 +59,11 @@ def expm_t18(A: torch.Tensor, S: int = 8) -> torch.Tensor:
     A_9 = B_1 @ B_5 + B_4
     T_18 = B_2 + (B_3 + A_9) @ A_9
 
-    ### Unrolled repeated squaring (max 8 doublings covers ||A||_1 up to ~386).
-    ### Gated by torch.where to keep a static graph for torch.compile.
-    for i in range(S):
-        T_18 = torch.where(s > i, T_18 @ T_18, T_18)
+    # Mask BEFORE multiplying: completed members must not overflow in unused
+    # branches and contaminate their backward pass.
+    for i in range(needed):
+        active = s > i
+        work = torch.where(active, T_18, eye)
+        T_18 = torch.where(active, work @ work, T_18)
 
     return T_18.to(original_dtype)

@@ -2,7 +2,7 @@
 Public interface for fused stream mixing.
 
 Computes  out = Phi @ x + Y                               [no-proj]
-or        out = Phi @ x + (v - Phi@v)(v^T x) + Y         [proj]
+or        out = Phi @ x + (projection_decay*v - Phi@v)(v^T x) + Y         [proj]
 
 Dispatches to one of two Triton implementations based on a memory-footprint
 heuristic:
@@ -54,6 +54,7 @@ def stream_mix_add(
     x: torch.Tensor,
     Y: torch.Tensor,
     v: torch.Tensor | None = None,
+    projection_decay: float = 1.0,
 ) -> torch.Tensor:
     """Fused  out = Phi @ x + Y  (or projected variant).
 
@@ -77,5 +78,5 @@ def stream_mix_add(
         assert v.shape == (B, N)
 
     if _use_big_nb(x):
-        return _big_nb(Phi, x, Y, v)
-    return _small_nb(Phi, x, Y, v)
+        return _big_nb(Phi, x, Y, v, projection_decay)
+    return _small_nb(Phi, x, Y, v, projection_decay)

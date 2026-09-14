@@ -92,6 +92,7 @@ def _stream_mix_fwd_big_nb(
     stride_v_b,   stride_v_n,
     N_STREAMS: tl.constexpr,
     USE_PROJ:  tl.constexpr,
+    PROJECTION_DECAY: tl.constexpr,
     DTYPE:     tl.constexpr,
     BLOCK_D:   tl.constexpr,
 ):
@@ -136,7 +137,7 @@ def _stream_mix_fwd_big_nb(
         phi_v = tl.sum(Phi_tile * v_tile[None, :], axis=1) # [N]
 
         ### correction = (v - phi_v) * alpha  [N, BLOCK_D]
-        acc = acc + (v_tile - phi_v)[:, None] * alpha[None, :]
+        acc = acc + (PROJECTION_DECAY * v_tile - phi_v)[:, None] * alpha[None, :]
 
     ### Add Y[b, :, d_tile]
     Y_ptrs = (
@@ -337,7 +338,7 @@ _TORCH_TO_TL_DTYPE = {
 }
 
 
-def _launch_fwd(Phi, x, Y, v, out):
+def _launch_fwd(Phi, x, Y, v, out, projection_decay):
     B, N, D  = x.shape
     use_proj = v is not None
     v_arg    = _make_v_arg(v, B, N, x.device, x.dtype)
@@ -347,7 +348,7 @@ def _launch_fwd(Phi, x, Y, v, out):
         Phi, x, Y, out, v_arg,
         D,
         *Phi.stride(), *x.stride(), *Y.stride(), *out.stride(), *v_arg.stride(),
-        N_STREAMS=N, USE_PROJ=use_proj, DTYPE=tl_dtype,
+        N_STREAMS=N, USE_PROJ=use_proj, PROJECTION_DECAY=projection_decay, DTYPE=tl_dtype,
     )
 
 
@@ -391,14 +392,15 @@ def _launch_bwd_dPhi(G, x, v, alpha, grad_Phi, N):
 ###
 class _StreamMixBigNBFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Phi, x, Y, v):
+    def forward(ctx, Phi, x, Y, v, projection_decay):
+        ctx.projection_decay = projection_decay
         Phi_c = Phi.contiguous()
         x_c   = x.contiguous()
         Y_c   = Y.contiguous()
         v_c   = v.contiguous() if v is not None else None
 
         out = torch.empty_like(x_c)
-        _launch_fwd(Phi_c, x_c, Y_c, v_c, out)
+        _launch_fwd(Phi_c, x_c, Y_c, v_c, out, projection_decay)
 
         ctx.save_for_backward(Phi_c, x_c, v_c)
         return out
@@ -422,7 +424,7 @@ class _StreamMixBigNBFn(torch.autograd.Function):
             # outputs rather than materializing a 268 MB fp32 copy of a [B, N, D] input.
             alpha = torch.einsum("bn,bnd->bd", v, x).float()                     # [B, D]
             phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1)  # [B, N]
-            c     = v.float() - phi_v                                             # [B, N]
+            c     = ctx.projection_decay * v.float() - phi_v                                             # [B, N]
             beta  = torch.einsum("bnd,bn->bd", G, c.to(G.dtype)).float()         # [B, D]
 
         ### grad_x (Triton)
@@ -442,7 +444,7 @@ class _StreamMixBigNBFn(torch.autograd.Function):
             # einsum reads G natively; the elementwise (G * alpha).sum(dim=2) form
             # instead materialized a 268 MB fp32 [B, N, D] temp on every backward.
             rho       = torch.einsum("bnd,bd->bn", G, alpha.to(G.dtype)).float()
-            rho_part  = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)
+            rho_part  = ctx.projection_decay * rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)
             beta_part = torch.einsum("bd,bnd->bn", beta.to(x.dtype), x).float()
             grad_v    = (rho_part + beta_part).to(v.dtype)
 
@@ -451,6 +453,7 @@ class _StreamMixBigNBFn(torch.autograd.Function):
             grad_x if ctx.needs_input_grad[1] else None,
             grad_Y if ctx.needs_input_grad[2] else None,
             grad_v,
+            None,
         )
 
 
@@ -462,6 +465,7 @@ def stream_mix_add_big_nb(
     x: torch.Tensor,
     Y: torch.Tensor,
     v: torch.Tensor | None = None,
+    projection_decay: float = 1.0,
 ) -> torch.Tensor:
     """Big-N×B variant of stream_mix_add.
 
@@ -475,4 +479,4 @@ def stream_mix_add_big_nb(
       - B * N * D * elem_bytes > 0.75 * 40 MB
     """
     B, N, D = x.shape
-    return _StreamMixBigNBFn.apply(Phi, x, Y, v)
+    return _StreamMixBigNBFn.apply(Phi, x, Y, v, projection_decay)
