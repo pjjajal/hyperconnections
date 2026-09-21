@@ -68,15 +68,18 @@ class FusedInputProjection(nn.Module):
         diss_dim: int | None,
         proj_v: bool,
         writeback_components: int = 1,
+        read_dim: int | None = None,
+        num_mixing_streams: int | None = None,
     ) -> None:
         super().__init__()
+        num_mixing_streams = n if num_mixing_streams is None else num_mixing_streams
         segments: list[tuple[str, int, bool, str]] = [
-            ("read_in", n * m, bias, "noise"),
+            ("read_in", n * m if read_dim is None else read_dim, bias, "noise"),
             ("write_out", n * m * writeback_components, bias, "noise"),
         ]
         if conserv:
             segments += [
-                ("conserv", n * n, False, "zero"),
+                ("conserv", num_mixing_streams * num_mixing_streams, False, "zero"),
                 ("dt_conserv", n_dt, True, "noise"),
             ]
         if diss_dim is not None:
@@ -85,7 +88,7 @@ class FusedInputProjection(nn.Module):
                 ("dt_diss", n_dt, True, "noise"),
             ]
         if proj_v:
-            segments += [("proj_v", n, False, "zero")]
+            segments += [("proj_v", num_mixing_streams, False, "zero")]
 
         offset = 0
         self._slices: dict[str, tuple[int, int]] = {}
@@ -159,6 +162,8 @@ class ContinuousGenHyperConnections(nn.Module):
         init_transition_contraction: float | None = None,
         projection_decay: float = 1.0,
         dt_max_diss: float | None = None,
+        stream_subdivisions: int = 1,
+        num_readouts: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -194,9 +199,16 @@ class ContinuousGenHyperConnections(nn.Module):
         )
 
         self.block_size = embed_dim // m
+        if not isinstance(stream_subdivisions, int) or stream_subdivisions < 1 or self.block_size % stream_subdivisions:
+            raise ValueError("stream_subdivisions must be a positive integer dividing block_size")
+        if num_readouts is not None and (not isinstance(num_readouts, int) or num_readouts < 1):
+            raise ValueError("num_readouts must be a positive integer or None")
+        self.stream_subdivisions = stream_subdivisions
+        self.num_mixing_streams = n * stream_subdivisions
+        self.num_readouts = num_readouts
 
         # Read/write parameters following mHC convention
-        self.read_in = nn.Parameter(torch.empty(n, m))
+        self.read_in = nn.Parameter(torch.empty(n, m) if num_readouts is None else torch.empty(num_readouts, n))
         self.alpha_read_in = nn.Parameter(torch.empty(1))
         write_out_shape = (
             (n, m)
@@ -223,7 +235,7 @@ class ContinuousGenHyperConnections(nn.Module):
         self.log_dt_diss_range = math.log(self.dt_max_diss) - math.log(dt_min)
         self.log_dt_init = math.log(dt)
         self.vec_dt = vec_dt
-        n_dt = n if vec_dt else 1
+        n_dt = self.num_mixing_streams if vec_dt else 1
         self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
         self.sat_c = sat_c
@@ -255,31 +267,33 @@ class ContinuousGenHyperConnections(nn.Module):
             self._diss_diag_init = damping + math.log(-math.expm1(-damping))
 
         if self.has_conservative:
-            self.conserv_A = nn.Parameter(torch.eye(n, n))
+            self.conserv_A = nn.Parameter(torch.eye(self.num_mixing_streams, self.num_mixing_streams))
         if self.dissipation_type == "psd":
-            self.diss_A = nn.Parameter(torch.zeros(n, n))
+            self.diss_A = nn.Parameter(torch.zeros(self.num_mixing_streams, self.num_mixing_streams))
         if self.dissipation_type == "diagonal":
-            self.diss_diag = nn.Parameter(torch.zeros(n))
+            self.diss_diag = nn.Parameter(torch.zeros(self.num_mixing_streams))
         if self.dissipation_type == "laplacian":
-            self.laplacian_A = nn.Parameter(torch.zeros(n, n))
+            self.laplacian_A = nn.Parameter(torch.zeros(self.num_mixing_streams, self.num_mixing_streams))
 
         # Projection Direction
         if projection == "mean":
-            self.register_buffer("projection_dir", torch.ones(n) / math.sqrt(n))
+            self.register_buffer("projection_dir", torch.ones(self.num_mixing_streams) / math.sqrt(self.num_mixing_streams))
         elif projection == "v":
-            self.register_buffer("base_projection_dir", torch.ones(n) / math.sqrt(n))
+            self.register_buffer("base_projection_dir", torch.ones(self.num_mixing_streams) / math.sqrt(self.num_mixing_streams))
         elif projection == "none":
             self.projection_dir = None
 
         diss_dim = {
             None: None,
-            "diagonal": n,
-            "psd": n * n,
-            "laplacian": n * n,
+            "diagonal": self.num_mixing_streams,
+            "psd": self.num_mixing_streams * self.num_mixing_streams,
+            "laplacian": self.num_mixing_streams * self.num_mixing_streams,
         }[self.dissipation_type]
         self.input_proj = FusedInputProjection(
             input_dim,
             n=n,
+            read_dim=n * (m if num_readouts is None else num_readouts),
+            num_mixing_streams=self.num_mixing_streams,
             m=m,
             n_dt=n_dt,
             bias=bias,
@@ -310,8 +324,11 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(param, math.log(target / (1 - target)))
 
     def init_weights(self) -> None:
-        # Stored as [n, m], although reads use the transpose [m, n].
-        if self.m == 1:
+        # Legacy reads store [n, m]; explicit readouts store [num_readouts, n].
+        if self.num_readouts is not None:
+            logit = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
+            nn.init.constant_(self.read_in, logit)
+        elif self.m == 1:
             logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
             nn.init.constant_(self.read_in, logit_1_over_n)
         else:
@@ -358,12 +375,12 @@ class ContinuousGenHyperConnections(nn.Module):
         self.input_proj.reset_parameters()
 
         if self.projection == "mean":
-            self.projection_dir.fill_(1.0 / math.sqrt(self.n))
+            self.projection_dir.fill_(1.0 / math.sqrt(self.num_mixing_streams))
             with torch.no_grad():
                 self.projection_dir.add_(torch.randn_like(self.projection_dir) * 0.01)
                 self.projection_dir.div_(self.projection_dir.norm())
         if self.projection == "v":
-            self.base_projection_dir.fill_(1.0 / math.sqrt(self.n))
+            self.base_projection_dir.fill_(1.0 / math.sqrt(self.num_mixing_streams))
 
         if hasattr(self.norm, "weight") and self.norm.weight is not None:
             nn.init.ones_(self.norm.weight)
@@ -423,15 +440,15 @@ class ContinuousGenHyperConnections(nn.Module):
         device = projections.read_in.device
         A = torch.zeros(
             batch_size,
-            self.n,
-            self.n,
+            self.num_mixing_streams,
+            self.num_mixing_streams,
             device=device,
             dtype=torch.float32,
         )
 
         if self.has_conservative:
             M = self.conserv_A + projections.conserv.reshape(
-                batch_size, self.n, self.n
+                batch_size, self.num_mixing_streams, self.num_mixing_streams
             ).float()
             logit_conserv = self.log_dt_conserv + projections.dt_conserv.float()
             dt_conserv = torch.exp(
@@ -459,12 +476,12 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if self.dissipation_type == "psd":
             R = self.diss_A + projections.diss.reshape(
-                batch_size, self.n, self.n
+                batch_size, self.num_mixing_streams, self.num_mixing_streams
             ).float()
             if self.sat_c is not None:
                 R = self.sat_c * torch.tanh(R / self.sat_c)
             with torch.autocast(device_type=device.type, enabled=False):
-                K = R @ R.transpose(-1, -2) / (self.n**0.5)
+                K = R @ R.transpose(-1, -2) / (self.num_mixing_streams**0.5)
             if not self.vec_dt:
                 diss_dt = dt_diss.unsqueeze(-1) * K
             else:
@@ -481,7 +498,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if self.dissipation_type == "laplacian":
             scores = self.laplacian_A + projections.diss.reshape(
-                batch_size, self.n, self.n
+                batch_size, self.num_mixing_streams, self.num_mixing_streams
             ).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))
             adjacency = F.softplus(scores)
@@ -529,7 +546,9 @@ class ContinuousGenHyperConnections(nn.Module):
         """Compute dynamic read/write weights."""
         batch_size = projections.read_in.shape[0]
 
-        h_read_in = projections.read_in.reshape(batch_size, self.n, self.m)
+        h_read_in = projections.read_in.reshape(
+            batch_size, *((self.n, self.m) if self.num_readouts is None else (self.num_readouts, self.n))
+        )
         h_write_out = projections.write_out.reshape(
             batch_size,
             self.n,
@@ -539,7 +558,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
         read_in = torch.sigmoid(
             self.alpha_read_in * h_read_in + self.read_in
-        ).transpose(1, 2)  # [B, m, n]
+        )
+        if self.num_readouts is None:
+            read_in = read_in.transpose(1, 2)  # [B, m, n]
         write_out_bias = self.write_out
         if self.writeback_components == 1:
             write_out_bias = write_out_bias.unsqueeze(1)
@@ -612,6 +633,9 @@ class ContinuousGenHyperConnections(nn.Module):
         """
         Args:
             x: [B, *, input_dim]  (any number of leading dims, last dim = n * block_size)
+        With num_readouts set, the module receives [B, *, num_readouts, block_size]; otherwise
+        it receives [B, *, embed_dim]. It must return [B, *, embed_dim].
+
         Returns:
             [B, *, input_dim]
         """
@@ -630,7 +654,9 @@ class ContinuousGenHyperConnections(nn.Module):
             "b m n, b n d -> b m d",
         )
         module_output = self.module(
-            module_input.reshape(*leading_shape, self.embed_dim),
+            (module_input.reshape(*leading_shape, self.embed_dim)
+             if self.num_readouts is None else
+             module_input.reshape(*leading_shape, self.num_readouts, self.block_size)),
             **kwargs,
         )
 
@@ -655,6 +681,9 @@ class ContinuousGenHyperConnections(nn.Module):
             writeback_components,
             "b n k m, b k m d -> b n d",
         )
+
+        streams = streams.reshape(batch_size, self.num_mixing_streams, self.block_size // self.stream_subdivisions)
+        source_update = source_update.reshape_as(streams)
 
         transition, source_update = self._transition_and_source(
             projections,

@@ -11,7 +11,7 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
     def compute_transition_and_psi(
         self, projections: CGHCProjections
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (exp(A), φ₁(A)), both of shape [B, n, n].
+        """Return (exp(A), φ₁(A)), both of shape [B, num_mixing_streams, num_mixing_streams].
 
         Args:
             projections: Fused input projection (from self.input_proj).
