@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import einsum
-from timm.layers import trunc_normal_
+from hyperconnections.init import trunc_normal_
 
 from hyperconnections.temporal_writeback import TemporalWriteback
 

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
-from timm.layers import trunc_normal_
+from hyperconnections.init import trunc_normal_
 
 from hyperconnections.ops import HAS_TRITON, expm_t18, expm_t18_triton, stream_mix_add
 from hyperconnections.temporal_writeback import TemporalWriteback
@@ -115,26 +115,35 @@ class FusedInputProjection(nn.Module):
             nn.init.zeros_(b)
 
     def forward(self, x_norm: torch.Tensor) -> CGHCProjections:
-        h = self.fused(x_norm)
+        return self._split(self.fused(x_norm))
 
-        def seg(key: str) -> torch.Tensor | None:
-            bounds = self._slices.get(key)
-            if bounds is None:
-                return None
-            out = h[..., bounds[0] : bounds[1]]
+    def forward_rms_normalized(self, x: torch.Tensor, norm: nn.RMSNorm) -> CGHCProjections:
+        """Equivalent to ``forward(norm(x))`` without materializing ``norm(x)``.
+
+        RMSNorm scales each row by one scalar, so Linear(RMSNorm(x)) = rstd * (x @ (W g)^T).
+        Autograd then keeps ``x`` (which the caller already keeps) and a per-row ``rstd``
+        instead of a second [rows, input_dim] activation.
+        """
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        # vector_norm with dtype accumulates in (at least) float32 without saving an upcast copy of x.
+        acc_dtype = torch.promote_types(x.dtype, torch.float32)
+        sq_norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True, dtype=acc_dtype).square()
+        rstd = torch.rsqrt(sq_norm / x.shape[-1] + eps)
+        weight = self.fused.weight
+        if norm.weight is not None:
+            weight = weight * norm.weight
+        h = F.linear(x, weight)
+        return self._split((h * rstd).to(h.dtype))
+
+    def _split(self, h: torch.Tensor) -> CGHCProjections:
+        # Plain loop rather than a closure: torch.compile graph-breaks on the closure.
+        segments: dict[str, torch.Tensor] = {}
+        for key, (start, end) in self._slices.items():
+            out = h[..., start:end]
             if key in self.biases:
                 out = out + self.biases[key].to(out.dtype)
-            return out
-
-        return CGHCProjections(
-            read_in=seg("read_in"),
-            write_out=seg("write_out"),
-            conserv=seg("conserv"),
-            dt_conserv=seg("dt_conserv"),
-            diss=seg("diss"),
-            dt_diss=seg("dt_diss"),
-            proj_v=seg("proj_v"),
-        )
+            segments[key] = out
+        return CGHCProjections(**segments)
 
 
 class ContinuousGenHyperConnections(nn.Module):
@@ -164,6 +173,7 @@ class ContinuousGenHyperConnections(nn.Module):
         dt_max_diss: float | None = None,
         stream_subdivisions: int = 1,
         num_readouts: int | None = None,
+        read_stream: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -206,6 +216,14 @@ class ContinuousGenHyperConnections(nn.Module):
         self.stream_subdivisions = stream_subdivisions
         self.num_mixing_streams = n * stream_subdivisions
         self.num_readouts = num_readouts
+        # With m=1 and no explicit readouts, optionally start by reading one stream
+        # (logit +READ_STREAM_LOGIT vs -READ_STREAM_LOGIT, as in mHC's gap-8 init) instead of 1/n each.
+        if read_stream is not None:
+            if m != 1 or num_readouts is not None:
+                raise ValueError("read_stream requires m=1 and num_readouts=None")
+            if not 0 <= read_stream < n:
+                raise ValueError(f"read_stream must lie in [0, {n}), got {read_stream}")
+        self.read_stream = read_stream
 
         # Read/write parameters following mHC convention
         self.read_in = nn.Parameter(torch.empty(n, m) if num_readouts is None else torch.empty(num_readouts, n))
@@ -323,11 +341,17 @@ class ContinuousGenHyperConnections(nn.Module):
         target = min(max(target, 1e-4), 1 - 1e-4)
         nn.init.constant_(param, math.log(target / (1 - target)))
 
+    READ_STREAM_LOGIT = 8.0
+
     def init_weights(self) -> None:
         # Legacy reads store [n, m]; explicit readouts store [num_readouts, n].
         if self.num_readouts is not None:
             logit = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
             nn.init.constant_(self.read_in, logit)
+        elif self.m == 1 and self.read_stream is not None:
+            nn.init.constant_(self.read_in, -self.READ_STREAM_LOGIT)
+            with torch.no_grad():
+                self.read_in[self.read_stream, 0] = self.READ_STREAM_LOGIT
         elif self.m == 1:
             logit_1_over_n = math.log(1.0 / (self.n - 1)) if self.n > 1 else 10.0
             nn.init.constant_(self.read_in, logit_1_over_n)
@@ -643,8 +667,9 @@ class ContinuousGenHyperConnections(nn.Module):
         streams = x.reshape(-1, self.n, self.block_size)
         batch_size = streams.shape[0]
 
-        x_norm = self.norm(streams.flatten(1))
-        projections: CGHCProjections = self.input_proj(x_norm)
+        projections: CGHCProjections = self.input_proj.forward_rms_normalized(
+            streams.flatten(1), self.norm
+        )
 
         write_weights, read_weights = self.compute_read_write_weights(projections)
 
