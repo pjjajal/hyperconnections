@@ -21,7 +21,7 @@ GeneratorType = Literal[
     "conservative_laplacian",
 ]
 ProjectionType = Literal["mean", "v", "none"]
-ProjectionVariant = Literal["one_sided", "two_sided", "generator"]
+ProjectionVariant = Literal["one_sided", "two_sided", "inflow", "generator"]
 
 GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative": (True, None),
@@ -51,6 +51,7 @@ class CGHCProjections(NamedTuple):
     diss: torch.Tensor | None = None
     dt_diss: torch.Tensor | None = None
     proj_v: torch.Tensor | None = None
+    inflow: torch.Tensor | None = None
 
 
 class FusedInputProjection(nn.Module):
@@ -67,6 +68,7 @@ class FusedInputProjection(nn.Module):
         conserv: bool,
         diss_dim: int | None,
         proj_v: bool,
+        inflow: bool = False,
         writeback_components: int = 1,
         read_dim: int | None = None,
         num_mixing_streams: int | None = None,
@@ -89,6 +91,8 @@ class FusedInputProjection(nn.Module):
             ]
         if proj_v:
             segments += [("proj_v", num_mixing_streams, False, "zero")]
+        if inflow:
+            segments += [("inflow", 1, True, "zero")]
 
         offset = 0
         self._slices: dict[str, tuple[int, int]] = {}
@@ -174,6 +178,8 @@ class ContinuousGenHyperConnections(nn.Module):
         stream_subdivisions: int = 1,
         num_readouts: int | None = None,
         read_stream: int | None = None,
+        projection_inflow: float = 0.0,
+        inflow_max: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -181,7 +187,7 @@ class ContinuousGenHyperConnections(nn.Module):
             raise ValueError(f"Unknown generator type: {generator_type!r}")
         if projection not in {"mean", "v", "none"}:
             raise ValueError(f"Unknown projection type: {projection!r}")
-        if projection_variant not in {"one_sided", "two_sided", "generator"}:
+        if projection_variant not in {"one_sided", "two_sided", "inflow", "generator"}:
             raise ValueError(f"Unknown projection variant: {projection_variant!r}")
 
         self.n = n
@@ -194,8 +200,17 @@ class ContinuousGenHyperConnections(nn.Module):
         if not 0.0 <= projection_decay <= 1.0:
             raise ValueError("projection_decay must lie in [0, 1]")
         if projection_decay != 1.0 and (projection == "none" or projection_variant == "generator"):
-            raise ValueError("projection_decay requires one_sided or two_sided projection")
+            raise ValueError("projection_decay requires one_sided, two_sided or inflow projection")
         self.projection_decay = projection_decay
+        # Inflow mixing: d P + gamma P T Q + Q T Q (two-sided at gamma = 0, one-sided at gamma = 1),
+        # with gamma = inflow_max * tanh(atanh(projection_inflow / inflow_max) + h) input-dependent.
+        if not 0.0 < inflow_max <= 1.0:
+            raise ValueError("inflow_max must lie in (0, 1]")
+        if not -inflow_max < projection_inflow < inflow_max:
+            raise ValueError("projection_inflow must lie strictly in (-inflow_max, inflow_max)")
+        self.projection_inflow = projection_inflow
+        self.inflow_max = inflow_max
+        self.dynamic_inflow = projection_variant == "inflow" and projection != "none"
         self.has_conservative, self.dissipation_type = GENERATOR_COMPONENTS[
             generator_type
         ]
@@ -318,6 +333,7 @@ class ContinuousGenHyperConnections(nn.Module):
             conserv=self.has_conservative,
             diss_dim=diss_dim,
             proj_v=(projection == "v"),
+            inflow=self.dynamic_inflow,
             writeback_components=self.writeback_components,
         )
 
@@ -397,6 +413,9 @@ class ContinuousGenHyperConnections(nn.Module):
         self._init_log_dt(self.log_dt_diss, self.log_dt_diss_range)
 
         self.input_proj.reset_parameters()
+        if self.dynamic_inflow:
+            with torch.no_grad():
+                self.input_proj.biases["inflow"].fill_(math.atanh(self.projection_inflow / self.inflow_max))
 
         if self.projection == "mean":
             self.projection_dir.fill_(1.0 / math.sqrt(self.num_mixing_streams))
@@ -596,6 +615,13 @@ class ContinuousGenHyperConnections(nn.Module):
 
         return write_out, read_in
 
+    def compute_inflow(self, projections: CGHCProjections) -> torch.Tensor | None:
+        """Input-dependent inflow weight gamma in (-inflow_max, inflow_max), shape [B, 1]."""
+        if not self.dynamic_inflow:
+            return None
+        logits = projections.inflow
+        return self.inflow_max * torch.tanh(logits.to(torch.promote_types(logits.dtype, torch.float32)))
+
     def compute_projection(
         self, projections: CGHCProjections
     ) -> torch.Tensor | None:
@@ -613,6 +639,7 @@ class ContinuousGenHyperConnections(nn.Module):
         transition_matrix: torch.Tensor,
         Y: torch.Tensor,
         projection_dir: torch.Tensor | None,
+        inflow: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.projection_variant == "generator":
             # exp(QAQ) already preserves P and maps its complement to itself.
@@ -620,6 +647,9 @@ class ContinuousGenHyperConnections(nn.Module):
         # With P = vv^T, apply projection_decay*Px + T(I-P)x + Y.
         # Left-project T first to obtain Px + (I-P)T(I-P)x + Y on
         # both the eager and Triton paths, leaving write-back unchanged.
+        if projection_dir is not None and self.projection_variant == "inflow":
+            transition_matrix = self._inflow_transition(transition_matrix, projection_dir, inflow)
+            projection_dir = None
         if projection_dir is not None and self.projection_variant == "two_sided":
             v = projection_dir.to(transition_matrix.dtype)
             vt_transition = einsum(v, transition_matrix, "b i, b i j -> b j")
@@ -646,6 +676,34 @@ class ContinuousGenHyperConnections(nn.Module):
                 transition_matrix, x_orth, "b n1 n2, b n2 d -> b n1 d"
             )
         return x_mixed + Y
+
+    def _inflow_transition(
+        self,
+        transition_matrix: torch.Tensor,
+        projection_dir: torch.Tensor,
+        inflow: torch.Tensor | float | None = None,
+    ) -> torch.Tensor:
+        """Return d P + gamma P T Q + Q T Q with P = vv^T and Q = I - P.
+
+        Block upper-triangular in (v, v-perp): only gamma-scaled inflow into v, no outflow, so the
+        per-sublayer gain is at most max(1, sqrt(d^2 + gamma^2)) for either sign of gamma.
+        ``inflow`` is gamma: a [B, 1] tensor (from compute_inflow), a float, or None for
+        projection_inflow.
+        """
+        work_dtype = torch.promote_types(transition_matrix.dtype, torch.float32)
+        T = transition_matrix.to(work_dtype)
+        v = projection_dir.to(work_dtype)
+        Tv = (T * v.unsqueeze(-2)).sum(dim=-1)  # T v
+        vT = (v.unsqueeze(-1) * T).sum(dim=-2)  # v^T T
+        vTv = (vT * v).sum(dim=-1, keepdim=True)
+        P = v.unsqueeze(-1) * v.unsqueeze(-2)
+        QTQ = T - v.unsqueeze(-1) * vT.unsqueeze(-2) - Tv.unsqueeze(-1) * v.unsqueeze(-2) + vTv[..., None] * P
+        inflow_row = vT - vTv * v  # v^T T Q
+        gamma = self.projection_inflow if inflow is None else inflow
+        if isinstance(gamma, torch.Tensor):
+            gamma = gamma.to(work_dtype)[..., None]  # [B, 1, 1]
+        mixed = self.projection_decay * P + gamma * v.unsqueeze(-1) * inflow_row.unsqueeze(-2) + QTQ
+        return mixed.to(transition_matrix.dtype)
 
     def _transition_and_source(
         self, projections: CGHCProjections, source: torch.Tensor
@@ -725,6 +783,7 @@ class ContinuousGenHyperConnections(nn.Module):
             transition_matrix=transition,
             Y=source_update,
             projection_dir=projection_dir,
+            inflow=self.compute_inflow(projections),
         )
 
         return updated_streams.reshape(*leading_shape, self.input_dim)
