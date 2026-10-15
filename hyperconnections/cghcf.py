@@ -1,3 +1,5 @@
+import math
+
 import torch
 from einops import einsum
 
@@ -33,5 +35,28 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
         self, projections: CGHCProjections, source: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         transition, psi = self.compute_transition_and_psi(projections)
+        psi = self._projected_psi(psi, projections)
         source = einsum(psi, source, "b n1 n2, b n2 d -> b n1 d")
         return transition, source
+
+    def _projected_psi(self, psi: torch.Tensor, projections: CGHCProjections) -> torch.Tensor:
+        """Constant-forcing operator for the projected transitions.
+
+        The projected variants replace T = exp(A) by d P + (gamma P + Q) T Q (gamma = 0
+        two-sided, 1 one-sided, input-dependent for inflow). That is the exact flow of a split
+        system: the v part decays as s' = λ s with d = e^λ, the v-perp part evolves under the
+        full A, and (gamma P + Q) is read out at the end. Splitting the source the same way and
+        integrating it exactly gives φ₁(λ) P + gamma P φ₁(A) Q + Q φ₁(A) Q.
+        """
+        if self.projection_variant == "generator":
+            return psi  # φ₁(QAQ) is already the exact operator for exp(QAQ).
+        projection_dir = self.compute_projection(projections)
+        if projection_dir is None:
+            return psi
+        gamma = {"one_sided": 1.0, "two_sided": 0.0}.get(self.projection_variant)
+        if gamma is None:
+            gamma = self.compute_inflow(projections)
+        # The v channel decays by d = e^λ, so its constant-forcing gain is φ₁(λ) = (d - 1) / ln d.
+        d = self.projection_decay
+        source_decay = 1.0 if d == 1.0 else 0.0 if d == 0.0 else (d - 1.0) / math.log(d)
+        return self._inflow_transition(psi, projection_dir, gamma, decay=source_decay)

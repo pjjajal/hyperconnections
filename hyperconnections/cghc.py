@@ -682,13 +682,14 @@ class ContinuousGenHyperConnections(nn.Module):
         transition_matrix: torch.Tensor,
         projection_dir: torch.Tensor,
         inflow: torch.Tensor | float | None = None,
+        decay: float | None = None,
     ) -> torch.Tensor:
         """Return d P + gamma P T Q + Q T Q with P = vv^T and Q = I - P.
 
         Block upper-triangular in (v, v-perp): only gamma-scaled inflow into v, no outflow, so the
         per-sublayer gain is at most max(1, sqrt(d^2 + gamma^2)) for either sign of gamma.
         ``inflow`` is gamma: a [B, 1] tensor (from compute_inflow), a float, or None for
-        projection_inflow.
+        projection_inflow. ``decay`` is d, or None for projection_decay.
         """
         work_dtype = torch.promote_types(transition_matrix.dtype, torch.float32)
         T = transition_matrix.to(work_dtype)
@@ -702,7 +703,8 @@ class ContinuousGenHyperConnections(nn.Module):
         gamma = self.projection_inflow if inflow is None else inflow
         if isinstance(gamma, torch.Tensor):
             gamma = gamma.to(work_dtype)[..., None]  # [B, 1, 1]
-        mixed = self.projection_decay * P + gamma * v.unsqueeze(-1) * inflow_row.unsqueeze(-2) + QTQ
+        decay = self.projection_decay if decay is None else decay
+        mixed = decay * P + gamma * v.unsqueeze(-1) * inflow_row.unsqueeze(-2) + QTQ
         return mixed.to(transition_matrix.dtype)
 
     def _transition_and_source(
