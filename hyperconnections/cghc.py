@@ -22,6 +22,7 @@ GeneratorType = Literal[
 ]
 ProjectionType = Literal["mean", "v", "none"]
 ProjectionVariant = Literal["one_sided", "two_sided", "inflow", "generator"]
+ExpmBackend = Literal["triton", "flash", "eager"]
 
 GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative": (True, None),
@@ -32,6 +33,18 @@ GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative_psd_diss": (True, "psd"),
     "conservative_laplacian": (True, "laplacian"),
 }
+
+
+def expm(A: torch.Tensor, backend: ExpmBackend) -> torch.Tensor:
+    """exp(A) for [B, n, n] generators (FP32 arithmetic) with the chosen backend."""
+    if backend == "flash":
+        import flash_hypercons
+
+        # CUDA kernel for 2 <= n <= 32; other inputs fall back to torch.linalg.matrix_exp.
+        return flash_hypercons.matrix_exp(A.float())
+    if backend == "triton":
+        return expm_t18_triton(A)
+    return expm_t18(A.float())
 
 
 class CGHCProjections(NamedTuple):
@@ -180,6 +193,7 @@ class ContinuousGenHyperConnections(nn.Module):
         read_stream: int | None = None,
         projection_inflow: float = 0.0,
         inflow_max: float = 1.0,
+        expm_backend: ExpmBackend | None = None,
     ) -> None:
         super().__init__()
 
@@ -349,6 +363,13 @@ class ContinuousGenHyperConnections(nn.Module):
             else None
         )
         self._use_triton = use_triton and HAS_TRITON
+        # Matrix exponential: None keeps the default (Triton T18 when use_triton, else eager);
+        # "flash" uses flash-hypercons' CUDA kernel (references/flash-hyperconnections).
+        if expm_backend not in (None, "triton", "flash", "eager"):
+            raise ValueError(f"Unknown expm_backend: {expm_backend!r}")
+        if expm_backend == "flash":
+            import flash_hypercons  # noqa: F401  (fail at construction, not mid-step)
+        self.expm_backend = expm_backend or ("triton" if self._use_triton else "eager")
         self.init_weights()
 
     def _init_log_dt(self, param: nn.Parameter, log_range: float | None = None) -> None:
@@ -578,10 +599,7 @@ class ContinuousGenHyperConnections(nn.Module):
     def compute_transition(self, projections: CGHCProjections) -> torch.Tensor:
         """Return exp(A), where the time step is already folded into A."""
         A = self.compute_generator(projections)
-        transition = (
-            expm_t18_triton(A) if self._use_triton else expm_t18(A.float())
-        )
-        return transition.to(projections.read_in.dtype)
+        return expm(A, self.expm_backend).to(projections.read_in.dtype)
 
     def compute_read_write_weights(
         self, projections: CGHCProjections

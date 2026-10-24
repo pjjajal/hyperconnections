@@ -7,6 +7,18 @@ from hyperconnections.cghc import CGHCProjections, ContinuousGenHyperConnections
 from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton
 
 
+def _flash_transition_and_psi(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(exp(A), phi_1(A)) from one exponential of the augmented [[A, I], [0, 0]] (2n x 2n)."""
+    import flash_hypercons
+
+    n = A.shape[-1]
+    augmented = A.new_zeros(*A.shape[:-2], 2 * n, 2 * n)
+    augmented[..., :n, :n] = A
+    augmented[..., :n, n:] = torch.eye(n, device=A.device, dtype=A.dtype)
+    block = flash_hypercons.matrix_exp(augmented)
+    return block[..., :n, :n], block[..., :n, n:]
+
+
 class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
     """CGHC with exact integration of a constant source over each step."""
 
@@ -19,7 +31,9 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
             projections: Fused input projection (from self.input_proj).
         """
         A = self.compute_generator(projections).float()
-        if self._use_triton:
+        if self.expm_backend == "flash":
+            transition_matrix, psi = _flash_transition_and_psi(A)
+        elif self.expm_backend == "triton":
             transition_matrix, psi = expm_t18_block_triton(A)
         else:
             transition_matrix, psi = expm_t18_augmented_sparse(A)
