@@ -677,6 +677,32 @@ class ContinuousGenHyperConnections(nn.Module):
             )
         return x_mixed + Y
 
+    def mixing_matrix(
+        self,
+        transition_matrix: torch.Tensor,
+        projections: CGHCProjections,
+    ) -> torch.Tensor:
+        """The [B, n, n] matrix M with _stream_mix(x, T, Y, ...) == M @ x + Y.
+
+        Folds the projection variant into one matrix (forward uses _stream_mix and never
+        materializes M; callers that apply the mixing themselves, e.g. a fused kernel, use
+        this). transition_matrix is compute_transition's output.
+        """
+        if self.projection_variant == "generator":
+            return transition_matrix
+        projection_dir = self.compute_projection(projections)
+        if projection_dir is None:
+            return transition_matrix
+        v = projection_dir.to(transition_matrix.dtype).expand(transition_matrix.shape[0], -1)
+        if self.projection_variant == "inflow":
+            return self._inflow_transition(transition_matrix, v, self.compute_inflow(projections))
+        if self.projection_variant == "two_sided":
+            vt_transition = einsum(v, transition_matrix, "b i, b i j -> b j")
+            transition_matrix = transition_matrix - v.unsqueeze(-1) * vt_transition.unsqueeze(-2)
+        # Phi x + (decay v - Phi v)(v^T x), as stream_mix_add.
+        phi_v = einsum(transition_matrix, v, "b i j, b j -> b i")
+        return transition_matrix + (self.projection_decay * v - phi_v).unsqueeze(-1) * v.unsqueeze(-2)
+
     def _inflow_transition(
         self,
         transition_matrix: torch.Tensor,

@@ -177,7 +177,19 @@ class ManifoldHyperConnections(nn.Module):
             self.m,
         )
         h_stream_mixing = self.proj_stream_mixing(x_norm).reshape(B, self.n, self.n) # [B, n, n]
+        return self.weights_from_logits(h_read_in, h_write_out, h_stream_mixing)
 
+    def weights_from_logits(
+        self,
+        h_read_in: torch.Tensor,
+        h_write_out: torch.Tensor,
+        h_stream_mixing: torch.Tensor,
+    ):
+        """Read/write/mixing weights from projection logits [B, n, m], [B, n, K, m], [B, n, n].
+
+        compute_mixing_weights = norm -> projections -> this; callers that compute the logits
+        elsewhere (e.g. a fused kernel) use it directly.
+        """
         # Scale by learnable alpha and add static bias
         h_read_in = self.alpha_read_in * h_read_in + self.read_in
         write_out_bias = self.write_out

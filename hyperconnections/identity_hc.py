@@ -124,7 +124,14 @@ class IdentityHyperConnections(nn.Module):
             self.writeback_components,
             self.m,
         )
+        return self.weights_from_logits(h_read_in, h_write_out)
 
+    def weights_from_logits(self, h_read_in: torch.Tensor, h_write_out: torch.Tensor):
+        """Write/read weights from projection logits [B, n, m] and [B, n, K, m].
+
+        compute_read_write_weights = projections -> this; callers that compute the logits
+        elsewhere (e.g. a fused kernel) use it directly.
+        """
         read_in = torch.sigmoid(
             self.alpha_read_in * h_read_in + self.read_in
         ).transpose(1, 2)  # [B, m, n]
