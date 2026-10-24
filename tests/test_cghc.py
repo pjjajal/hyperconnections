@@ -87,6 +87,18 @@ class TestInit:
                 n=4, m=2, input_dim=99, embed_dim=8, module=IdentityModule()
             )
 
+    def test_invalid_generator_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown generator type"):
+            make_cghc(4, 2, 8, generator_type="typo")
+
+    def test_invalid_projection_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown projection type"):
+            make_cghc(4, 2, 8, projection="typo")
+
+    def test_invalid_projection_variant_raises(self):
+        with pytest.raises(ValueError, match="Unknown projection variant"):
+            make_cghc(4, 2, 8, projection_variant="typo")
+
     # Regression test for the conservative_laplacian bug fix
     def test_conservative_laplacian_creates_conserv_params(self):
         cghc = make_cghc(4, 2, 8, generator_type="conservative_laplacian")
@@ -154,10 +166,6 @@ class TestGeneratorStructure:
             if hasattr(cghc, "diss_diag"):
                 cghc.diss_diag.add_(torch.randn_like(cghc.diss_diag) * 0.5)
             if hasattr(cghc, "laplacian_A"):
-                # log-scale starts at log(1e-3) so the Laplacian is negligible;
-                # crank the scale to 1 so the perturbed generator has a visible
-                # dissipative part (anchor is already 0 → softplus(0)≈0.693 adjacency)
-                cghc.laplacian_log_scale.fill_(0.0)
                 cghc.laplacian_A.add_(torch.randn_like(cghc.laplacian_A) * 0.1)
 
     def _proj(self, cghc, B=3):
@@ -187,11 +195,13 @@ class TestGeneratorStructure:
             A[:, off_diag_mask], torch.zeros(3, cghc.n * cghc.n - cghc.n), atol=1e-6
         ), "off-diagonal entries must be zero"
 
-    def test_laplacian_A_small_at_init(self):
-        """laplacian_log_scale=log(1e-3) at init gives ~7e-4 adjacency → A near zero but not exact."""
+    def test_laplacian_initial_complete_graph(self):
         cghc = make_cghc(4, 2, 8, generator_type="laplacian")
-        A = cghc.compute_generator(self._proj(cghc))
-        assert torch.allclose(A, torch.zeros_like(A), atol=1e-2), "laplacian A must be near zero at init"
+        projections = cghc.input_proj(torch.zeros(3, cghc.input_dim))
+        A = cghc.compute_generator(projections)
+        weight = math.log(2) / (1 + math.log(2) / cghc.sat_c)
+        expected = -.01 * weight * (4 * torch.eye(4) - torch.ones(4, 4))
+        torch.testing.assert_close(A, expected.expand_as(A), atol=1e-6, rtol=1e-5)
 
     def test_conservative_laplacian_is_neither_symmetric_nor_skew(self):
         """Combined generator should have both conservative and dissipative parts."""
@@ -224,16 +234,12 @@ class TestInitialTransition:
     ]
 
     @pytest.mark.parametrize("generator_type", ALL_TYPES)
-    def test_transition_is_near_identity_at_init(self, generator_type):
-        """All types start with small A (noise * dt ≈ 1e-4) so Phi is near I."""
-        n, m, embed_dim = 4, 2, 8
-        cghc = make_cghc(n, m, embed_dim, generator_type=generator_type)
-        x = torch.randn(3, (n * embed_dim) // m)
-        Phi = cghc.compute_transition(cghc.input_proj(x))
-        I = torch.eye(n).unsqueeze(0).expand_as(Phi)
-        assert torch.allclose(Phi, I, atol=1e-2), (
-            f"Transition should be near-I at init for generator_type='{generator_type}'"
-        )
+    def test_initial_transition_matches_reference(self, generator_type):
+        cghc = make_cghc(4, 2, 8, generator_type=generator_type)
+        projections = cghc.input_proj(torch.randn(3, cghc.input_dim))
+        reference = torch.matrix_exp(cghc.compute_generator(projections).double())
+        torch.testing.assert_close(cghc.compute_transition(projections).double(), reference,
+                                   atol=1e-6, rtol=1e-5)
 
     @pytest.mark.parametrize("generator_type", ["conservative", "conservative_psd_diss", "conservative_laplacian"])
     def test_transition_is_orthogonal_after_perturbation(self, generator_type):
@@ -288,13 +294,17 @@ class TestReadWriteWeights:
         cghc = make_cghc(n, m, embed_dim)
         B = 3
         x = torch.randn(B, (n * embed_dim) // m)
-        write_out, _ = cghc.compute_read_write_weights(cghc.input_proj(x))  # [B, n, m]
+        write_out, _ = cghc.compute_read_write_weights(cghc.input_proj(x))
         for i in range(n):
             on = i % m
-            assert write_out[:, i, on].mean().item() == pytest.approx(1.0, abs=0.05)
+            assert write_out[:, i, on].mean().item() == pytest.approx(
+                1.0, abs=0.05
+            )
             for j in range(m):
                 if j != on:
-                    assert write_out[:, i, j].mean().item() == pytest.approx(2 * torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05)
+                    assert write_out[:, i, j].mean().item() == pytest.approx(
+                        2 * torch.sigmoid(torch.tensor(-5.0)).item(), abs=0.05
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -358,15 +368,13 @@ class TestForwardBehavior:
     ]
 
     @pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
-    def test_zero_module_output_near_input_at_init(self, generator_type):
-        """
-        At init, static params have small noise so Phi≈I (A~O(noise*dt)~1e-4).
-        ZeroModule gives Y=0, so output = Phi @ x ≈ x.
-        """
-        n, m, embed_dim = 4, 2, 8
-        cghc = make_cghc(n, m, embed_dim, generator_type=generator_type, module=ZeroModule())
-        x = torch.randn(3, (n * embed_dim) // m)
-        assert torch.allclose(cghc(x), x, atol=1e-2)
+    def test_zero_module_output_matches_reference_mixing(self, generator_type):
+        cghc = make_cghc(4, 2, 8, generator_type=generator_type, module=ZeroModule())
+        x = torch.randn(3, cghc.input_dim)
+        projections = cghc.input_proj(cghc.norm(x))
+        transition = torch.matrix_exp(cghc.compute_generator(projections).double())
+        expected = (transition @ x.double().reshape(3, 4, -1)).reshape_as(x)
+        torch.testing.assert_close(cghc(x).double(), expected, atol=1e-6, rtol=1e-5)
 
     @pytest.mark.parametrize("generator_type", ["diagonal_diss", "conservative_diag_diss"])
     def test_zero_module_output_near_input_at_init_diag_diss(self, generator_type):
@@ -441,3 +449,67 @@ class TestGradientFlow:
         x = torch.randn(3, (n * embed_dim) // m, requires_grad=True)
         cghc(x).sum().backward()
         assert x.grad is not None
+
+
+@pytest.mark.parametrize("variant", ["one_sided", "two_sided"])
+@pytest.mark.parametrize("projection", ["mean", "v", "none"])
+def test_projection_variant_matches_dense_formula_and_gradients(variant, projection, device):
+    torch.manual_seed(42)
+    cghc = make_cghc(4, 2, 8, projection=projection,
+                     projection_variant=variant, device=device)
+    x = torch.randn(3, 4, 4, device=device, requires_grad=True)
+    transition = torch.randn(3, 4, 4, device=device, requires_grad=True)
+    source = torch.randn_like(x, requires_grad=True)
+    direction = torch.randn(1 if projection == "mean" else 3, 4,
+                            device=device, requires_grad=True)
+    v = torch.nn.functional.normalize(direction, dim=-1) if projection != "none" else None
+    actual = cghc._stream_mix(x, transition, source, v)
+    identity = torch.eye(4, device=device)
+    P = v.unsqueeze(-1) * v.unsqueeze(-2) if v is not None else torch.zeros_like(identity)
+    Q = identity - P
+    mixed = transition @ Q @ x
+    expected = P @ x + (Q @ mixed if variant == "two_sided" else mixed) + source
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    if variant == "two_sided":
+        torch.testing.assert_close(P @ (actual - source), P @ x, atol=2e-5, rtol=2e-5)
+    inputs = (x, transition, source) + ((direction,) if v is not None else ())
+    weight = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad((actual * weight).sum(), inputs, retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * weight).sum(), inputs)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.parametrize("generator_type", ALL_GENERATOR_TYPES)
+@pytest.mark.parametrize("projection", ["mean", "v", "none"])
+def test_projected_generator_transition(generator_type, projection, device):
+    torch.manual_seed(42)
+    cghc = make_cghc(4, 2, 8, generator_type=generator_type,
+                     projection=projection, device=device, module=ZeroModule())
+    with torch.no_grad():
+        cghc.input_proj.fused.weight.normal_(std=0.2)
+    x = torch.randn(3, cghc.input_dim, device=device, requires_grad=True)
+    projections = cghc.input_proj(cghc.norm(x))
+    A = cghc.compute_generator(projections)
+    v = cghc.compute_projection(projections)
+    identity = torch.eye(4, device=device)
+    P = v.unsqueeze(-1) * v.unsqueeze(-2) if v is not None else torch.zeros_like(identity)
+    Q = identity - P
+    expected_generator = Q @ A @ Q
+    cghc.projection_variant = "generator"
+    actual_generator = cghc.compute_generator(projections)
+    torch.testing.assert_close(actual_generator, expected_generator)
+    transition = cghc.compute_transition(projections)
+    expected_transition = torch.matrix_exp(expected_generator)
+    torch.testing.assert_close(transition, expected_transition, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(transition @ P, P.expand_as(transition), atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(P @ transition, P.expand_as(transition), atol=2e-5, rtol=2e-5)
+    expected = (expected_transition @ x.reshape(3, 4, 4)).flatten(1)
+    actual = cghc(x)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    inputs = (x, cghc.input_proj.fused.weight)
+    weight = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad((actual * weight).sum(), inputs, retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * weight).sum(), inputs)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=3e-5, rtol=3e-5)

@@ -1,99 +1,62 @@
-# Constant-forcing variant of CGHC.
-#
-# Exact integration of dx/dt = Ax + f over one step gives:
-#   x(1) = exp(A) x(0) + φ₁(A) f
-# where φ₁(A) = ∫₀¹ exp(θA) dθ.
-# Both exp(A) and φ₁(A) are computed together without materializing the 2n×2n
-# augmented system (see expm_t18_augmented_sparse in ops).
-#
-# Weight decay note: this class adds no parameters of its own — the exclusions
-# listed at the top of cghc.py apply unchanged (read_in, write_out, conserv_A,
-# diss_A, laplacian_A, and all 1-D params). The inherited
-# split_decay_param_groups(model, wd) classmethod builds the right groups.
-
-from typing import Literal
+import math
 
 import torch
 from einops import einsum
 
 from hyperconnections.cghc import CGHCProjections, ContinuousGenHyperConnections
-from hyperconnections.ops import HAS_TRITON, expm_t18_augmented_sparse, expm_t18_block_triton
+from hyperconnections.ops import expm_t18_augmented_sparse, expm_t18_block_triton
 
 
 class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
-    def __init__(
-        self,
-        n: int,
-        m: int,
-        input_dim: int,
-        embed_dim: int,
-        module: torch.nn.Module,
-        dt: float = 0.01,
-        generator_type: Literal[
-            "conservative",
-            "psd_diss",
-            "diagonal_diss",
-            "laplacian",
-            "conservative_diag_diss",
-            "conservative_psd_diss",
-            "conservative_laplacian",
-        ] = "conservative_psd_diss",
-        projection: Literal["mean", "v", "none"] = "none",
-        learn_dt: bool = False,
-        dt_min: float = 0.001,
-        dt_max: float = 1.0,
-        bias: bool = False,
-        elementwise_affine: bool = False,
-        use_triton: bool = True,
-        vec_dt: bool = False,
-        sat_c: float | None = 2.0,
-        shortconv_kernel_size: int = 0,
-        shortconv_causal: bool = True,
-    ):
-        super().__init__(
-            n=n,
-            m=m,
-            input_dim=input_dim,
-            embed_dim=embed_dim,
-            module=module,
-            dt=dt,
-            generator_type=generator_type,
-            projection=projection,
-            learn_dt=learn_dt,
-            dt_min=dt_min,
-            dt_max=dt_max,
-            bias=bias,
-            elementwise_affine=elementwise_affine,
-            use_triton=use_triton,
-            vec_dt=vec_dt,
-            sat_c=sat_c,
-            shortconv_kernel_size=shortconv_kernel_size,
-            shortconv_causal=shortconv_causal,
-        )
-        ### Forced-exp kernel dispatch, bound once here like the base class's
-        ### _matrix_exp / _stream_mix.
-        self._expm_block_fn = (
-            expm_t18_block_triton if use_triton and HAS_TRITON else expm_t18_augmented_sparse
-        )
+    """CGHC with exact integration of a constant source over each step."""
 
-    def compute_transition_and_psi(self, proj: CGHCProjections) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (exp(A), φ₁(A)), both of shape [B, n, n].
+    def compute_transition_and_psi(
+        self, projections: CGHCProjections
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (exp(A), φ₁(A)), both of shape [B, num_mixing_streams, num_mixing_streams].
 
         Args:
-            proj: Fused input projection (from self.input_proj).
+            projections: Fused input projection (from self.input_proj).
         """
-        A = self.compute_generator(proj)
-        transition_matrix, psi = self._expm_block_fn(A.float())
-        dtype = proj.read_in.dtype
+        A = self.compute_generator(projections).float()
+        if self._use_triton:
+            transition_matrix, psi = expm_t18_block_triton(A)
+        else:
+            transition_matrix, psi = expm_t18_augmented_sparse(A)
+        dtype = projections.read_in.dtype
         return transition_matrix.to(dtype), psi.to(dtype)
 
-    def compute_transition(self, proj: CGHCProjections) -> torch.Tensor:
-        """Return exp(A) only, shape [B, n, n]. Delegates to compute_transition_and_psi."""
-        transition, _ = self.compute_transition_and_psi(proj)
+    def compute_transition(self, projections: CGHCProjections) -> torch.Tensor:
+        """Return exp(A), delegating to compute_transition_and_psi."""
+        transition, _ = self.compute_transition_and_psi(projections)
         return transition
 
     def _transition_and_source(
-        self, proj: CGHCProjections, Y: torch.Tensor
+        self, projections: CGHCProjections, source: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        transition, psi = self.compute_transition_and_psi(proj)
-        return transition, einsum(psi, Y, "b n1 n2, b n2 d -> b n1 d")
+        transition, psi = self.compute_transition_and_psi(projections)
+        psi = self._projected_psi(psi, projections)
+        source = einsum(psi, source, "b n1 n2, b n2 d -> b n1 d")
+        return transition, source
+
+    def _projected_psi(self, psi: torch.Tensor, projections: CGHCProjections) -> torch.Tensor:
+        """Constant-forcing operator for the projected transitions.
+
+        The projected variants replace T = exp(A) by d P + (gamma P + Q) T Q (gamma = 0
+        two-sided, 1 one-sided, input-dependent for inflow). That is the exact flow of a split
+        system: the v part decays as s' = λ s with d = e^λ, the v-perp part evolves under the
+        full A, and (gamma P + Q) is read out at the end. Splitting the source the same way and
+        integrating it exactly gives φ₁(λ) P + gamma P φ₁(A) Q + Q φ₁(A) Q.
+        """
+        if self.projection_variant == "generator":
+            return psi  # φ₁(QAQ) is already the exact operator for exp(QAQ).
+        projection_dir = self.compute_projection(projections)
+        if projection_dir is None:
+            return psi
+        gamma = {"one_sided": 1.0, "two_sided": 0.0}.get(self.projection_variant)
+        if gamma is None:
+            gamma = self.compute_inflow(projections)
+        # The v channel decays by d = e^λ, so its constant-forcing gain is φ₁(λ) = (d - 1) / ln d.
+        d = self.projection_decay
+        source_decay = 1.0 if d == 1.0 else 0.0 if d == 0.0 else (d - 1.0) / math.log(d)
+        return self._inflow_transition(psi, projection_dir, gamma, decay=source_decay)

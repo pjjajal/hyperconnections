@@ -28,7 +28,9 @@ ALL_GENERATOR_TYPES = [
 ]
 
 
-def make_cghcf(n, m, embed_dim, device="cpu", use_triton=None, **kwargs) -> ContinuousGenHyperConnectionsForced:
+def make_cghcf(
+    n, m, embed_dim, device="cpu", use_triton=None, **kwargs
+) -> ContinuousGenHyperConnectionsForced:
     input_dim = (n * embed_dim) // m
     # Toggle the custom-kernel flag to match the device unless explicitly set:
     # Triton kernels need CUDA tensors, so a CPU model must run the eager path.
@@ -69,12 +71,13 @@ def test_backward_runs(n, m, embed_dim):
     assert x.grad.isfinite().all()
 
 
-@pytest.mark.parametrize("n,m,embed_dim", CONFIGS)
-def test_shortconv_forward(n, m, embed_dim):
-    torch.manual_seed(0)
-    model = make_cghcf(n, m, embed_dim, shortconv_kernel_size=4)
-    input_dim = (n * embed_dim) // m
-    x = torch.randn(2, 4, input_dim)
-    out = model(x)
-    assert out.shape == x.shape
-    assert out.isfinite().all()
+def test_enriched_writeback_forward_and_backward():
+    model = make_cghcf(4, 2, 8, writeback_kernel_sizes=(2, 4))
+    x = torch.randn(2, 5, model.input_dim, requires_grad=True)
+
+    output = model(x)
+    output.sum().backward()
+
+    assert output.shape == x.shape
+    assert output.isfinite().all()
+    assert x.grad is not None and x.grad.isfinite().all()

@@ -1,3 +1,5 @@
+# Plain expm defaults to per-matrix device-side adaptive scaling. Explicit S
+# retains the fixed kernels described below. CGHCF augmented expm is unchanged.
 """
 Triton implementation of the optimised T18 matrix-exponential approximation.
 
@@ -213,6 +215,13 @@ def _expm_t18_structured_fwd(
 
     ### Fixed scaling 2^(-MAX_S) (passed in), applied to the full block matrix
     ### M = [[X, G], [0, X]], not only X.
+    if MAX_S < 0:
+        # Exact induced 1-norm of [[X,G],[0,X]], including upstream magnitude.
+        columns = tl.sum(tl.abs(X), axis=0) + tl.sum(tl.abs(G), axis=0)
+        norm = tl.max(columns, axis=0)
+        steps = tl.ceil(tl.log2(tl.maximum(norm / 3.01, 1.0)))
+        steps = tl.where(norm < float("inf"), steps, 0).to(tl.int32)
+        inv_scale = tl.exp2(-steps.to(tl.float32))
     D1 = X * inv_scale
     U1 = G * inv_scale
 
@@ -265,8 +274,12 @@ def _expm_t18_structured_fwd(
 
     ### Structured repeated squaring: (D, U)^2 = (D @ D, D @ U + U @ D).
     ### Exactly MAX_S squarings (unconditional), matching inv_scale = 2^(-MAX_S).
-    for i in tl.static_range(MAX_S):
-        DT18, UT18 = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
+    if MAX_S < 0:
+        for i in range(steps):
+            DT18, UT18 = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
+    else:
+        for i in tl.static_range(MAX_S):
+            DT18, UT18 = _pair_mul(DT18, UT18, DT18, UT18, NP, n_idx, LOW_PREC)
 
     ### Store only the upper-right block, i.e. the Frechet derivative block.
     o_off = (
@@ -306,6 +319,12 @@ def _expm_t18_fwd(
         + n_idx[None, :] * stride_a_n2
     )
     A = tl.load(A_ptr + a_off, mask=mask2d, other=0.0).to(tl.float32)
+    if MAX_S < 0:
+        norm = tl.max(tl.sum(tl.abs(A), axis=0), axis=0)
+        steps = tl.ceil(tl.log2(tl.maximum(norm / 3.01, 1.0)))
+        # Nonfinite inputs propagate through arithmetic without an unbounded loop.
+        steps = tl.where(norm < float("inf"), steps, 0).to(tl.int32)
+        inv_scale = tl.exp2(-steps.to(tl.float32))
     A = A * inv_scale
 
     ### A^2, A^3, A^6 — see _matmul_nn for why we don't use the naïve
@@ -330,8 +349,12 @@ def _expm_t18_fwd(
     T18 = B2 + _matmul_nn(B3 + A9, A9, NP, n_idx, LOW_PREC)
 
     ### Exactly MAX_S squarings (unconditional), matching inv_scale = 2^(-MAX_S).
-    for i in tl.static_range(MAX_S):
-        T18 = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
+    if MAX_S < 0:
+        for i in range(steps):
+            T18 = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
+    else:
+        for i in tl.static_range(MAX_S):
+            T18 = _matmul_nn(T18, T18, NP, n_idx, LOW_PREC)
 
     ### Store output
     o_off = (
@@ -482,25 +505,25 @@ class _ExpmT18TritonFn(torch.autograd.Function):
 ###
 ### Public API
 ###
-def expm_t18_triton(A: torch.Tensor, S: int = _MAX_S) -> torch.Tensor:
+def expm_t18_triton(A: torch.Tensor, S: int | None = None) -> torch.Tensor:
     """Triton T18 matrix exponential.
 
     Args:
         A: [B, N, N] fp32 / bf16 / fp16 tensor on CUDA.
-        S: number of scaling-and-squaring steps (constexpr in-kernel). A is
-           scaled by 2^(-S) and squared exactly S times, so the result is
-           accurate for ||A||_1 <= theta_18 * 2^S (~3.01*2^S); smaller norms are
-           over-scaled. Default _MAX_S=2.
+        S: None (default) selects per-matrix scaling inside the GPU kernel,
+           independently for forward and the backward block exponential.
+           An explicit nonnegative integer retains fixed scaling for benchmarks.
+           Arithmetic accuracy at extreme norms remains limited by FP32.
 
     Returns:
         exp(A) with the same shape and dtype as A.
     """
     if not A.is_cuda:
         raise RuntimeError("expm_t18_triton requires CUDA tensors")
-    if S < 0:
+    if S is not None and (not isinstance(S, int) or S < 0):
         raise ValueError(f"S must be >= 0, got {S}")
 
-    return _ExpmT18TritonFn.apply(A, S)
+    return _ExpmT18TritonFn.apply(A, -1 if S is None else S)
 
 
 ###

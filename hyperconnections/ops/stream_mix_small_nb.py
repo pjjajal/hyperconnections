@@ -2,7 +2,7 @@
 Fused stream-mixing Triton kernel — small-N×B variant.
 
 Computes  out = Phi @ x + Y                               [no-proj]
-or        out = Phi @ x + (v - Phi@v)(v^T x) + Y         [proj]
+or        out = Phi @ x + (projection_decay*v - Phi@v)(v^T x) + Y         [proj]
 
 where:
   Phi  [B, N, N]   transition matrix
@@ -108,6 +108,7 @@ def _stream_mix_fwd(
     stride_v_b,   stride_v_n,
     N_STREAMS: tl.constexpr,
     USE_PROJ:  tl.constexpr,
+    PROJECTION_DECAY: tl.constexpr,
     BLOCK_D:   tl.constexpr,
 ):
     pid_bn = tl.program_id(0)
@@ -144,7 +145,7 @@ def _stream_mix_fwd(
             phi_v = phi_v + phi_val * v_n2
 
     if USE_PROJ:
-        acc = acc + (v_n1 - phi_v) * alpha
+        acc = acc + (PROJECTION_DECAY * v_n1 - phi_v) * alpha
 
     y_vec = tl.load(
         Y_ptr + b * stride_y_b + n1 * stride_y_n + d_idx * stride_y_d,
@@ -164,7 +165,7 @@ def _stream_mix_fwd(
 ### no-proj:  grad_x[b, n2, d] = (Phi^T @ G)[b, n2, d]
 ### proj:     grad_x[b, n2, d] = (Phi^T @ G)[b, n2, d] + v[b, n2] * beta[b, d]
 ###
-### beta[b, d] = Σ_n1( G[b,n1,d] * c[b,n1] )  where c = v - Phi@v
+### beta[b, d] = Σ_n1( G[b,n1,d] * c[b,n1] )  where c = projection_decay*v - Phi@v
 ### beta is precomputed in Python and passed as beta_ptr.
 ### This removes the O(N²) nested loop from the original implementation.
 ###
@@ -374,7 +375,7 @@ def _make_bd_arg(t: torch.Tensor | None, B: int, D: int, device):
     return torch.zeros(B, D, dtype=torch.float32, device=device)
 
 
-def _launch_fwd(Phi, x, Y, v, out):
+def _launch_fwd(Phi, x, Y, v, out, projection_decay):
     B, N, D = x.shape
     use_proj = v is not None
     v_arg = _make_v_arg(v, B, N, x.device, x.dtype)
@@ -383,7 +384,7 @@ def _launch_fwd(Phi, x, Y, v, out):
         Phi, x, Y, out, v_arg,
         D,
         *Phi.stride(), *x.stride(), *Y.stride(), *out.stride(), *v_arg.stride(),
-        N_STREAMS=N, USE_PROJ=use_proj,
+        N_STREAMS=N, USE_PROJ=use_proj, PROJECTION_DECAY=projection_decay,
     )
 
 
@@ -449,14 +450,15 @@ def _launch_dphi_rho_bp(G, x, v, alpha, beta, N):
 ###
 class _StreamMixFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Phi, x, Y, v):
+    def forward(ctx, Phi, x, Y, v, projection_decay):
+        ctx.projection_decay = projection_decay
         Phi_c = Phi.contiguous()
         x_c   = x.contiguous()
         Y_c   = Y.contiguous()
         v_c   = v.contiguous() if v is not None else None
 
         out = torch.empty_like(x_c)
-        _launch_fwd(Phi_c, x_c, Y_c, v_c, out)
+        _launch_fwd(Phi_c, x_c, Y_c, v_c, out, projection_decay)
 
         ctx.save_for_backward(Phi_c, x_c, v_c)
         return out
@@ -481,7 +483,7 @@ class _StreamMixFn(torch.autograd.Function):
         alpha = beta = phi_v = c = None
         if use_proj:
             phi_v = torch.bmm(Phi.float(), v.float().unsqueeze(-1)).squeeze(-1)  # [B, N]
-            c     = v.float() - phi_v                                            # [B, N]
+            c     = ctx.projection_decay * v.float() - phi_v                                            # [B, N]
             alpha, beta = _launch_alpha_beta(x, G, v, c)                         # [B, D], [B, D]
 
         ### grad_x (Triton)
@@ -501,10 +503,10 @@ class _StreamMixFn(torch.autograd.Function):
         grad_Y = grad_out
 
         ### grad_v (PyTorch): assemble from the fused rho / beta_part
-        #   grad_v = (I - Phi^T) @ rho  +  beta_part
+        #   grad_v = (projection_decay*I - Phi^T) @ rho  +  beta_part
         grad_v = None
         if use_proj and ctx.needs_input_grad[3]:
-            rho_part = rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)  # [B, N]
+            rho_part = ctx.projection_decay * rho - torch.bmm(Phi.float().mT, rho.unsqueeze(-1)).squeeze(-1)  # [B, N]
             grad_v   = (rho_part + beta_part).to(v.dtype)
 
         return (
@@ -512,6 +514,7 @@ class _StreamMixFn(torch.autograd.Function):
             grad_x if ctx.needs_input_grad[1] else None,
             grad_Y if ctx.needs_input_grad[2] else None,
             grad_v,
+            None,
         )
 
 
@@ -523,6 +526,7 @@ def stream_mix_add_small_nb(
     x: torch.Tensor,
     Y: torch.Tensor,
     v: torch.Tensor | None = None,
+    projection_decay: float = 1.0,
 ) -> torch.Tensor:
     """Fused  out = Phi @ x + Y  (or projected variant) — small-NB kernel.
 
@@ -535,4 +539,4 @@ def stream_mix_add_small_nb(
     Returns:
         out: [B, N, D]
     """
-    return _StreamMixFn.apply(Phi, x, Y, v)
+    return _StreamMixFn.apply(Phi, x, Y, v, projection_decay)
