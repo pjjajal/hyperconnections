@@ -1,3 +1,4 @@
+import importlib.util
 import math
 from typing import Literal, NamedTuple
 
@@ -33,6 +34,9 @@ GENERATOR_COMPONENTS: dict[GeneratorType, tuple[bool, str | None]] = {
     "conservative_psd_diss": (True, "psd"),
     "conservative_laplacian": (True, "laplacian"),
 }
+
+
+HAS_FLASH = importlib.util.find_spec("flash_hypercons") is not None
 
 
 def expm(A: torch.Tensor, backend: ExpmBackend) -> torch.Tensor:
@@ -371,13 +375,16 @@ class ContinuousGenHyperConnections(nn.Module):
             else None
         )
         self._use_triton = use_triton and HAS_TRITON
-        # Matrix exponential: None keeps the default (Triton T18 when use_triton, else eager);
-        # "flash" uses flash-hypercons' CUDA kernel (references/flash-hyperconnections).
+        # Matrix exponential: "flash" is flash-hypercons' CUDA kernel (references/flash-hyperconnections).
+        # None picks flash when use_triton and flash-hypercons is installed, else Triton T18 when
+        # use_triton, else eager.
         if expm_backend not in (None, "triton", "flash", "eager"):
             raise ValueError(f"Unknown expm_backend: {expm_backend!r}")
         if expm_backend == "flash":
             import flash_hypercons  # noqa: F401  (fail at construction, not mid-step)
-        self.expm_backend = expm_backend or ("triton" if self._use_triton else "eager")
+        if expm_backend is None:
+            expm_backend = ("flash" if HAS_FLASH else "triton") if self._use_triton else "eager"
+        self.expm_backend = expm_backend
         self.init_weights()
 
     def _init_log_dt(self, param: nn.Parameter, log_range: float | None = None) -> None:

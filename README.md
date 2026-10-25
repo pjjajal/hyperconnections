@@ -19,8 +19,9 @@ CGHC and forced CGHC also accept:
   contiguous chunks, each mixed by its own `[n, n]` transition. The generator, timestep,
   projection direction and inflow are per chunk; read/write routing is shared. `D` must be
   divisible by `C`; `C = 1` is the unchunked model. Not supported by forced CGHC.
-- `expm_backend` (`triton` | `flash` | `eager`; default: `triton` when `use_triton`, else eager):
-  the matrix exponential; `flash` uses flash-hypercons' CUDA kernel.
+- `expm_backend` (`triton` | `flash` | `eager`; default: `flash` when `use_triton` and
+  flash-hypercons is installed, else `triton` when `use_triton`, else eager): the matrix
+  exponential; `flash` uses flash-hypercons' CUDA kernel.
 - `num_readouts=K` (default `None`): use read weights of shape `[K, n]` (plus batch/token
   axes for dynamic weights), passing `[..., K, D]` directly to the module.
   The module selects its own branches and must return `[..., embed_dim]`.

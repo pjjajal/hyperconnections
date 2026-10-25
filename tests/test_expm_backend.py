@@ -1,12 +1,13 @@
-"""expm_backend: flash-hypercons' CUDA matrix exponential against the default Triton T18."""
+"""expm_backend: flash-hypercons' CUDA matrix exponential against Triton T18."""
 import importlib.util
 
 import pytest
 import torch
 from torch import nn
 
-from hyperconnections.cghc import ContinuousGenHyperConnections, expm
+from hyperconnections.cghc import HAS_FLASH, ContinuousGenHyperConnections, expm
 from hyperconnections.cghcf import ContinuousGenHyperConnectionsForced
+from hyperconnections.ops import HAS_TRITON
 
 flash = pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("flash_hypercons") is None,
@@ -23,6 +24,8 @@ def test_default_backend_follows_use_triton():
     model = ContinuousGenHyperConnections(n=4, m=1, input_dim=64, embed_dim=16, module=nn.Identity(),
                                           use_triton=False)
     assert model.expm_backend == "eager"
+    model = ContinuousGenHyperConnections(n=4, m=1, input_dim=64, embed_dim=16, module=nn.Identity())
+    assert model.expm_backend == ("flash" if HAS_FLASH else "triton" if HAS_TRITON else "eager")
 
 
 @flash
@@ -43,7 +46,7 @@ def test_flash_matches_triton_values_and_gradients():
 def test_flash_backend_in_module(cls):
     torch.manual_seed(0)
     kwargs = dict(n=4, m=1, input_dim=64, embed_dim=16, module=nn.Identity(), projection="mean")
-    reference = cls(**kwargs).cuda()
+    reference = cls(**kwargs, expm_backend="triton").cuda()
     flash_model = cls(**kwargs, expm_backend="flash").cuda()
     flash_model.load_state_dict(reference.state_dict())
     with torch.no_grad():
