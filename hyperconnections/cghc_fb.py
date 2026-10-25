@@ -121,7 +121,7 @@ class ContinuousGenHyperConnectionsFeedback(ContinuousGenHyperConnections):
         source_update = einsum(write_weights, writeback_components, "b n k m, b k m d -> b n d")
 
         streams = streams.reshape(
-            batch_size, self.num_mixing_streams, self.block_size // self.stream_subdivisions
+            batch_size, self.num_mixing_streams, self.block_size
         )
         source_update = source_update.reshape_as(streams)
         transition, source_update = self._transition_and_source(projections, source_update)

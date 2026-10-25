@@ -190,7 +190,6 @@ class ContinuousGenHyperConnections(nn.Module):
         init_transition_contraction: float | None = None,
         projection_decay: float = 1.0,
         dt_max_diss: float | None = None,
-        stream_subdivisions: int = 1,
         num_readouts: int | None = None,
         read_stream: int | None = None,
         projection_inflow: float = 0.0,
@@ -241,19 +240,14 @@ class ContinuousGenHyperConnections(nn.Module):
         )
 
         self.block_size = embed_dim // m
-        if not isinstance(stream_subdivisions, int) or stream_subdivisions < 1 or self.block_size % stream_subdivisions:
-            raise ValueError("stream_subdivisions must be a positive integer dividing block_size")
         if num_readouts is not None and (not isinstance(num_readouts, int) or num_readouts < 1):
             raise ValueError("num_readouts must be a positive integer or None")
-        self.stream_subdivisions = stream_subdivisions
-        self.num_mixing_streams = n * stream_subdivisions
+        self.num_mixing_streams = n  # the mixer acts on the n streams
         # mixer_chunks=C: split each stream's block_size features into C contiguous chunks, each
         # mixed by its own transition (generator, dt, projection direction and inflow per chunk;
         # read/write shared). Static anchors gain a leading [C] axis only when C > 1.
         if not isinstance(mixer_chunks, int) or mixer_chunks < 1 or self.block_size % mixer_chunks:
             raise ValueError("mixer_chunks must be a positive integer dividing block_size")
-        if mixer_chunks > 1 and stream_subdivisions > 1:
-            raise ValueError("mixer_chunks and stream_subdivisions cannot be combined")
         self.mixer_chunks = mixer_chunks
         self._chunk_shape = (mixer_chunks,) if mixer_chunks > 1 else ()
         self.num_readouts = num_readouts
@@ -828,7 +822,6 @@ class ContinuousGenHyperConnections(nn.Module):
             "b n k m, b k m d -> b n d",
         )
 
-        streams = streams.reshape(batch_size, self.num_mixing_streams, self.block_size // self.stream_subdivisions)
         source_update = source_update.reshape_as(streams)
 
         transition, source_update = self._transition_and_source(

@@ -97,8 +97,6 @@ def test_parameter_shapes_and_gradients():
 def test_invalid_configurations():
     with pytest.raises(ValueError):
         make(chunks=3)  # does not divide block_size 16
-    with pytest.raises(ValueError):
-        make(chunks=2, stream_subdivisions=2)
     forced = ContinuousGenHyperConnectionsForced(n=4, m=1, input_dim=64, embed_dim=16,
                                                  module=nn.Identity(), use_triton=False, mixer_chunks=2)
     with pytest.raises(NotImplementedError):

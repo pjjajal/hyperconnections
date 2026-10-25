@@ -15,12 +15,12 @@ before module write-back. With `projection="none"`, it uses the original generat
 
 CGHC and forced CGHC also accept:
 
-- `stream_subdivisions=C` (default `1`): reshape residual streams from `[n, D]`
-  to `[n*C, D/C]` and use a full `[n*C, n*C]` transition. Here
-  `D = embed_dim // m` must be divisible by `C`. Read/write routing and
-  total residual width stay unchanged. Projection directions and vector
-  timesteps use the expanded mixer axis. Forced CGHC integrates the source
-  on that same axis.
+- `mixer_chunks=C` (default `1`): split each stream's `D = embed_dim // m` features into `C`
+  contiguous chunks, each mixed by its own `[n, n]` transition. The generator, timestep,
+  projection direction and inflow are per chunk; read/write routing is shared. `D` must be
+  divisible by `C`; `C = 1` is the unchunked model. Not supported by forced CGHC.
+- `expm_backend` (`triton` | `flash` | `eager`; default: `triton` when `use_triton`, else eager):
+  the matrix exponential; `flash` uses flash-hypercons' CUDA kernel.
 - `num_readouts=K` (default `None`): use read weights of shape `[K, n]` (plus batch/token
   axes for dynamic weights), passing `[..., K, D]` directly to the module.
   The module selects its own branches and must return `[..., embed_dim]`.
