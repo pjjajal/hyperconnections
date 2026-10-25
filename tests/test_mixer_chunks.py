@@ -1,4 +1,4 @@
-"""mixer_chunks: per-chunk CGHC mixing (each D/C feature chunk has its own transition)."""
+"""mixer_chunks: per-chunk CGHC / mHC mixing (each D/C feature chunk has its own mixer)."""
 import copy
 
 import pytest
@@ -7,6 +7,7 @@ from torch import nn
 
 from hyperconnections.cghc import ContinuousGenHyperConnections
 from hyperconnections.cghcf import ContinuousGenHyperConnectionsForced
+from hyperconnections.mhc import ManifoldHyperConnections
 
 CHUNKED = {"conserv", "dt_conserv", "diss", "dt_diss", "proj_v", "inflow"}
 
@@ -101,3 +102,61 @@ def test_invalid_configurations():
                                                  module=nn.Identity(), use_triton=False, mixer_chunks=2)
     with pytest.raises(NotImplementedError):
         forced(torch.randn(1, 2, 64))
+
+
+def make_mhc(chunks=1, **kwargs):
+    torch.manual_seed(0)
+    defaults = dict(n=4, m=1, input_dim=64, embed_dim=16, module=nn.Linear(16, 16))
+    return ManifoldHyperConnections(**{**defaults, **kwargs}, mixer_chunks=chunks)
+
+
+def perturbed_mhc(model):
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.2 * torch.randn_like(p))
+    return model
+
+
+def test_mhc_one_chunk_is_the_default_model():
+    a = make_mhc(chunks=1)
+    b = make_mhc()
+    b.load_state_dict(a.state_dict())
+    x = torch.randn(2, 3, 64)
+    assert torch.equal(a(x), b(x))
+    assert a.stream_mixing.shape == (4, 4)
+
+
+@pytest.mark.parametrize("kernels", [(), (2, 4)])
+def test_mhc_identical_chunks_reproduce_unchunked(kernels):
+    single = perturbed_mhc(make_mhc(chunks=1, writeback_kernel_sizes=kernels))
+    chunked = make_mhc(chunks=4, writeback_kernel_sizes=kernels)
+    params = dict(chunked.named_parameters())
+    with torch.no_grad():
+        for name, param in single.named_parameters():
+            if name.startswith("proj_stream_mixing"):
+                params[name].copy_(param.repeat(4, *[1] * (param.dim() - 1)))
+            else:
+                params[name].copy_(param.expand_as(params[name]))
+    x = torch.randn(2, 3, 64)
+    torch.testing.assert_close(chunked(x), single(x), rtol=1e-5, atol=1e-5)
+
+
+def test_mhc_chunks_are_independent():
+    model = perturbed_mhc(make_mhc(chunks=4))
+    assert model.stream_mixing.shape == (4, 4, 4)
+    assert model.proj_stream_mixing.out_features == 64
+    x = torch.randn(2, 3, 64)
+    before = model(x).reshape(2, 3, 4, 4, 4)
+    with torch.no_grad():
+        model.stream_mixing[2].add_(torch.randn(4, 4))
+    after = model(x).reshape(2, 3, 4, 4, 4)
+    changed = (after - before).abs().amax(dim=(0, 1, 2, 4))
+    assert changed[2] > 1e-4
+    assert torch.equal(changed[[0, 1, 3]], torch.zeros(3))
+    model(x).square().sum().backward()
+    assert model.stream_mixing.grad[1].abs().sum() > 0
+
+
+def test_mhc_invalid_chunks():
+    with pytest.raises(ValueError):
+        make_mhc(chunks=3)

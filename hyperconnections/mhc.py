@@ -41,6 +41,7 @@ class ManifoldHyperConnections(nn.Module):
         sinkhorn_eps: float = _SINKHORN_EPS,
         writeback_kernel_sizes: tuple[int, ...] = (),
         writeback_orthogonalize: bool = True,
+        mixer_chunks: int = 1,
     ) -> None:
         super().__init__()
         self.n = n
@@ -64,6 +65,13 @@ class ManifoldHyperConnections(nn.Module):
         )
 
         self.block_size = embed_dim // m  # block size = embed_dim / m = input_dim / n
+        # mixer_chunks=C: split each stream's block_size features into C contiguous chunks, each
+        # mixed by its own Sinkhorn matrix (per-chunk mixing logits and bias; read/write and
+        # alpha_stream_mixing shared). stream_mixing gains a leading [C] axis only when C > 1.
+        if not isinstance(mixer_chunks, int) or mixer_chunks < 1 or self.block_size % mixer_chunks:
+            raise ValueError("mixer_chunks must be a positive integer dividing block_size")
+        self.mixer_chunks = mixer_chunks
+        self._chunk_shape = (mixer_chunks,) if mixer_chunks > 1 else ()
 
         # read_in (H^pre): [n, m]
         self.read_in = nn.Parameter(torch.empty(n, m))
@@ -78,8 +86,8 @@ class ManifoldHyperConnections(nn.Module):
         self.write_out = nn.Parameter(torch.empty(write_out_shape))
         self.alpha_write_out = nn.Parameter(torch.empty(1))
 
-        # stream_mixing (H^res): [n, n]
-        self.stream_mixing = nn.Parameter(torch.empty(n, n))
+        # stream_mixing (H^res): [n, n], or [C, n, n] with mixer chunks
+        self.stream_mixing = nn.Parameter(torch.empty(*self._chunk_shape, n, n))
         self.alpha_stream_mixing = nn.Parameter(torch.empty(1))
 
         self.proj_read_in = nn.Linear(input_dim, n * m, bias=bias)
@@ -88,7 +96,7 @@ class ManifoldHyperConnections(nn.Module):
             n * m * self.writeback_components,
             bias=bias,
         )
-        self.proj_stream_mixing = nn.Linear(input_dim, n * n, bias=bias)
+        self.proj_stream_mixing = nn.Linear(input_dim, mixer_chunks * n * n, bias=bias)
 
         self.norm = nn.RMSNorm(
             input_dim,
@@ -176,7 +184,8 @@ class ManifoldHyperConnections(nn.Module):
             self.writeback_components,
             self.m,
         )
-        h_stream_mixing = self.proj_stream_mixing(x_norm).reshape(B, self.n, self.n) # [B, n, n]
+        h_stream_mixing = self.proj_stream_mixing(x_norm).reshape(
+            B, *self._chunk_shape, self.n, self.n)  # [B, n, n] or [B, C, n, n] (chunk-major)
         return self.weights_from_logits(h_read_in, h_write_out, h_stream_mixing)
 
     def weights_from_logits(
@@ -185,7 +194,7 @@ class ManifoldHyperConnections(nn.Module):
         h_write_out: torch.Tensor,
         h_stream_mixing: torch.Tensor,
     ):
-        """Read/write/mixing weights from projection logits [B, n, m], [B, n, K, m], [B, n, n].
+        """Read/write/mixing weights from projection logits [B, n, m], [B, n, K, m], [B, (C,) n, n].
 
         compute_mixing_weights = norm -> projections -> this; callers that compute the logits
         elsewhere (e.g. a fused kernel) use it directly.
@@ -253,6 +262,10 @@ class ManifoldHyperConnections(nn.Module):
         )
 
         # Mix within the over-width space and add residual
-        x = einsum(stream_mixing, x, "b n1 n2, b n2 d -> b n1 d")
+        if self.mixer_chunks > 1:  # chunk c of every stream is mixed by stream_mixing[:, c]
+            chunks = x.reshape(B, self.n, self.mixer_chunks, -1)
+            x = torch.einsum("bcij,bjcd->bicd", stream_mixing, chunks).reshape_as(x)
+        else:
+            x = einsum(stream_mixing, x, "b n1 n2, b n2 d -> b n1 d")
         out = source_update + x
         return out.unflatten(0, leading).flatten(-2)
