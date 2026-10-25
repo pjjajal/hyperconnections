@@ -85,27 +85,29 @@ class FusedInputProjection(nn.Module):
         writeback_components: int = 1,
         read_dim: int | None = None,
         num_mixing_streams: int | None = None,
+        mixer_chunks: int = 1,
     ) -> None:
         super().__init__()
         num_mixing_streams = n if num_mixing_streams is None else num_mixing_streams
+        c = mixer_chunks  # mixing segments repeat per chunk (chunk-major); read/write are shared
         segments: list[tuple[str, int, bool, str]] = [
             ("read_in", n * m if read_dim is None else read_dim, bias, "noise"),
             ("write_out", n * m * writeback_components, bias, "noise"),
         ]
         if conserv:
             segments += [
-                ("conserv", num_mixing_streams * num_mixing_streams, False, "zero"),
-                ("dt_conserv", n_dt, True, "noise"),
+                ("conserv", c * num_mixing_streams * num_mixing_streams, False, "zero"),
+                ("dt_conserv", c * n_dt, True, "noise"),
             ]
         if diss_dim is not None:
             segments += [
-                ("diss", diss_dim, False, "zero"),
-                ("dt_diss", n_dt, True, "noise"),
+                ("diss", c * diss_dim, False, "zero"),
+                ("dt_diss", c * n_dt, True, "noise"),
             ]
         if proj_v:
-            segments += [("proj_v", num_mixing_streams, False, "zero")]
+            segments += [("proj_v", c * num_mixing_streams, False, "zero")]
         if inflow:
-            segments += [("inflow", 1, True, "zero")]
+            segments += [("inflow", c, True, "zero")]
 
         offset = 0
         self._slices: dict[str, tuple[int, int]] = {}
@@ -194,6 +196,7 @@ class ContinuousGenHyperConnections(nn.Module):
         projection_inflow: float = 0.0,
         inflow_max: float = 1.0,
         expm_backend: ExpmBackend | None = None,
+        mixer_chunks: int = 1,
     ) -> None:
         super().__init__()
 
@@ -244,6 +247,15 @@ class ContinuousGenHyperConnections(nn.Module):
             raise ValueError("num_readouts must be a positive integer or None")
         self.stream_subdivisions = stream_subdivisions
         self.num_mixing_streams = n * stream_subdivisions
+        # mixer_chunks=C: split each stream's block_size features into C contiguous chunks, each
+        # mixed by its own transition (generator, dt, projection direction and inflow per chunk;
+        # read/write shared). Static anchors gain a leading [C] axis only when C > 1.
+        if not isinstance(mixer_chunks, int) or mixer_chunks < 1 or self.block_size % mixer_chunks:
+            raise ValueError("mixer_chunks must be a positive integer dividing block_size")
+        if mixer_chunks > 1 and stream_subdivisions > 1:
+            raise ValueError("mixer_chunks and stream_subdivisions cannot be combined")
+        self.mixer_chunks = mixer_chunks
+        self._chunk_shape = (mixer_chunks,) if mixer_chunks > 1 else ()
         self.num_readouts = num_readouts
         # With m=1 and no explicit readouts, optionally start by reading one stream
         # (logit +READ_STREAM_LOGIT vs -READ_STREAM_LOGIT, as in mHC's gap-8 init) instead of 1/n each.
@@ -283,8 +295,9 @@ class ContinuousGenHyperConnections(nn.Module):
         self.log_dt_init = math.log(dt)
         self.vec_dt = vec_dt
         n_dt = self.num_mixing_streams if vec_dt else 1
-        self.log_dt_conserv = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
-        self.log_dt_diss = nn.Parameter(torch.empty(n_dt), requires_grad=learn_dt)
+        cs = self._chunk_shape
+        self.log_dt_conserv = nn.Parameter(torch.empty(*cs, n_dt), requires_grad=learn_dt)
+        self.log_dt_diss = nn.Parameter(torch.empty(*cs, n_dt), requires_grad=learn_dt)
         self.sat_c = sat_c
         # Nominal contraction with zero predictor outputs; initialization only.
         # Generator projection retains a unit mode, contracting its complement.
@@ -314,13 +327,13 @@ class ContinuousGenHyperConnections(nn.Module):
             self._diss_diag_init = damping + math.log(-math.expm1(-damping))
 
         if self.has_conservative:
-            self.conserv_A = nn.Parameter(torch.eye(self.num_mixing_streams, self.num_mixing_streams))
+            self.conserv_A = nn.Parameter(torch.eye(self.num_mixing_streams).repeat(*cs, 1, 1))
         if self.dissipation_type == "psd":
-            self.diss_A = nn.Parameter(torch.zeros(self.num_mixing_streams, self.num_mixing_streams))
+            self.diss_A = nn.Parameter(torch.zeros(*cs, self.num_mixing_streams, self.num_mixing_streams))
         if self.dissipation_type == "diagonal":
-            self.diss_diag = nn.Parameter(torch.zeros(self.num_mixing_streams))
+            self.diss_diag = nn.Parameter(torch.zeros(*cs, self.num_mixing_streams))
         if self.dissipation_type == "laplacian":
-            self.laplacian_A = nn.Parameter(torch.zeros(self.num_mixing_streams, self.num_mixing_streams))
+            self.laplacian_A = nn.Parameter(torch.zeros(*cs, self.num_mixing_streams, self.num_mixing_streams))
 
         # Projection Direction
         if projection == "mean":
@@ -343,6 +356,7 @@ class ContinuousGenHyperConnections(nn.Module):
             num_mixing_streams=self.num_mixing_streams,
             m=m,
             n_dt=n_dt,
+            mixer_chunks=mixer_chunks,
             bias=bias,
             conserv=self.has_conservative,
             diss_dim=diss_dim,
@@ -415,8 +429,8 @@ class ContinuousGenHyperConnections(nn.Module):
         nn.init.constant_(self.alpha_write_out, 0.01)
 
         if self.has_conservative:
-            nn.init.eye_(self.conserv_A)
             with torch.no_grad():
+                self.conserv_A.copy_(torch.eye(self.num_mixing_streams).expand_as(self.conserv_A))
                 noise = torch.empty_like(self.conserv_A)
                 trunc_normal_(noise, std=0.01)
                 self.conserv_A.add_(noise)
@@ -501,9 +515,10 @@ class ContinuousGenHyperConnections(nn.Module):
             A = dt_conserv * S  -  dt_diss * Q
         """
         batch_size = projections.read_in.shape[0]
+        lead = (batch_size, *self._chunk_shape)  # [B] or [B, C] per-transition batch
         device = projections.read_in.device
         A = torch.zeros(
-            batch_size,
+            *lead,
             self.num_mixing_streams,
             self.num_mixing_streams,
             device=device,
@@ -512,9 +527,9 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if self.has_conservative:
             M = self.conserv_A + projections.conserv.reshape(
-                batch_size, self.num_mixing_streams, self.num_mixing_streams
+                *lead, self.num_mixing_streams, self.num_mixing_streams
             ).float()
-            logit_conserv = self.log_dt_conserv + projections.dt_conserv.float()
+            logit_conserv = self.log_dt_conserv + projections.dt_conserv.float().reshape(*lead, -1)
             dt_conserv = torch.exp(
                 self.log_dt_min + self.log_dt_range * torch.sigmoid(logit_conserv)
             )
@@ -526,13 +541,13 @@ class ContinuousGenHyperConnections(nn.Module):
             else:
                 sqrt_dt_conserv = dt_conserv.sqrt()
                 skew_dt = (
-                    sqrt_dt_conserv[:, :, None] * skew * sqrt_dt_conserv[:, None, :]
+                    sqrt_dt_conserv[..., :, None] * skew * sqrt_dt_conserv[..., None, :]
                 )
 
             A = A + skew_dt
 
         if self.dissipation_type is not None:
-            logit_diss = self.log_dt_diss + projections.dt_diss.float()
+            logit_diss = self.log_dt_diss + projections.dt_diss.float().reshape(*lead, -1)
             dt_diss = torch.exp(
                 self.log_dt_min + self.log_dt_diss_range * torch.sigmoid(logit_diss)
             )
@@ -540,7 +555,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if self.dissipation_type == "psd":
             R = self.diss_A + projections.diss.reshape(
-                batch_size, self.num_mixing_streams, self.num_mixing_streams
+                *lead, self.num_mixing_streams, self.num_mixing_streams
             ).float()
             if self.sat_c is not None:
                 R = self.sat_c * torch.tanh(R / self.sat_c)
@@ -549,12 +564,12 @@ class ContinuousGenHyperConnections(nn.Module):
             if not self.vec_dt:
                 diss_dt = dt_diss.unsqueeze(-1) * K
             else:
-                diss_dt = sqrt_dt_diss[:, :, None] * K * sqrt_dt_diss[:, None, :]
+                diss_dt = sqrt_dt_diss[..., :, None] * K * sqrt_dt_diss[..., None, :]
             A = A - diss_dt
 
         if self.dissipation_type == "diagonal":
             d = F.softplus(
-                self.diss_diag + projections.diss.float()
+                self.diss_diag + projections.diss.float().reshape(*lead, -1)
             )
             if self.sat_c is not None:
                 d = d / (1 + d / self.sat_c)
@@ -562,7 +577,7 @@ class ContinuousGenHyperConnections(nn.Module):
 
         if self.dissipation_type == "laplacian":
             scores = self.laplacian_A + projections.diss.reshape(
-                batch_size, self.num_mixing_streams, self.num_mixing_streams
+                *lead, self.num_mixing_streams, self.num_mixing_streams
             ).float()
             scores = 0.5 * (scores + scores.transpose(-1, -2))
             adjacency = F.softplus(scores)
@@ -577,7 +592,7 @@ class ContinuousGenHyperConnections(nn.Module):
                 laplacian_dt = dt_diss.unsqueeze(-1) * laplacian
             else:
                 laplacian_dt = (
-                    sqrt_dt_diss[:, :, None] * laplacian * sqrt_dt_diss[:, None, :]
+                    sqrt_dt_diss[..., :, None] * laplacian * sqrt_dt_diss[..., None, :]
                 )
             A = A - laplacian_dt
 
@@ -598,8 +613,10 @@ class ContinuousGenHyperConnections(nn.Module):
 
     def compute_transition(self, projections: CGHCProjections) -> torch.Tensor:
         """Return exp(A), where the time step is already folded into A."""
-        A = self.compute_generator(projections)
-        return expm(A, self.expm_backend).to(projections.read_in.dtype)
+        A = self.compute_generator(projections)  # [B, n, n] or [B, C, n, n]
+        n = A.shape[-1]
+        transition = expm(A.reshape(-1, n, n), self.expm_backend).reshape(A.shape)
+        return transition.to(projections.read_in.dtype)
 
     def compute_read_write_weights(
         self, projections: CGHCProjections
@@ -637,7 +654,7 @@ class ContinuousGenHyperConnections(nn.Module):
         """Input-dependent inflow weight gamma in (-inflow_max, inflow_max), shape [B, 1]."""
         if not self.dynamic_inflow:
             return None
-        logits = projections.inflow
+        logits = projections.inflow.reshape(projections.inflow.shape[0], *self._chunk_shape, 1)
         return self.inflow_max * torch.tanh(logits.to(torch.promote_types(logits.dtype, torch.float32)))
 
     def compute_projection(
@@ -647,8 +664,8 @@ class ContinuousGenHyperConnections(nn.Module):
         if self.projection == "mean":
             return self.projection_dir.unsqueeze(0)
         if self.projection == "v":
-            v = projections.proj_v + self.base_projection_dir
-            return F.normalize(v, dim=-1)
+            v = projections.proj_v.reshape(projections.proj_v.shape[0], *self._chunk_shape, -1)
+            return F.normalize(v + self.base_projection_dir, dim=-1)
         return None
 
     def _stream_mix(
@@ -700,7 +717,7 @@ class ContinuousGenHyperConnections(nn.Module):
         transition_matrix: torch.Tensor,
         projections: CGHCProjections,
     ) -> torch.Tensor:
-        """The [B, n, n] matrix M with _stream_mix(x, T, Y, ...) == M @ x + Y.
+        """The [B, n, n] ([B, C, n, n] with mixer_chunks) matrix M with _stream_mix(x, T, Y) == M x + Y.
 
         Folds the projection variant into one matrix (forward uses _stream_mix and never
         materializes M; callers that apply the mixing themselves, e.g. a fused kernel, use
@@ -711,14 +728,14 @@ class ContinuousGenHyperConnections(nn.Module):
         projection_dir = self.compute_projection(projections)
         if projection_dir is None:
             return transition_matrix
-        v = projection_dir.to(transition_matrix.dtype).expand(transition_matrix.shape[0], -1)
+        v = projection_dir.to(transition_matrix.dtype).expand(transition_matrix.shape[:-1])
         if self.projection_variant == "inflow":
             return self._inflow_transition(transition_matrix, v, self.compute_inflow(projections))
         if self.projection_variant == "two_sided":
-            vt_transition = einsum(v, transition_matrix, "b i, b i j -> b j")
+            vt_transition = (v.unsqueeze(-1) * transition_matrix).sum(dim=-2)  # v^T T
             transition_matrix = transition_matrix - v.unsqueeze(-1) * vt_transition.unsqueeze(-2)
         # Phi x + (decay v - Phi v)(v^T x), as stream_mix_add.
-        phi_v = einsum(transition_matrix, v, "b i j, b j -> b i")
+        phi_v = (transition_matrix * v.unsqueeze(-2)).sum(dim=-1)
         return transition_matrix + (self.projection_decay * v - phi_v).unsqueeze(-1) * v.unsqueeze(-2)
 
     def _inflow_transition(
@@ -818,6 +835,13 @@ class ContinuousGenHyperConnections(nn.Module):
             projections,
             source_update,
         )
+        if self.mixer_chunks > 1:
+            # Per-chunk mixing: chunk c of every stream is mixed by M[:, c].
+            mixing = self.mixing_matrix(transition, projections).to(streams.dtype)  # [B, C, n, n]
+            chunks = streams.reshape(batch_size, self.n, self.mixer_chunks, -1)
+            mixed = torch.einsum("bcij,bjcd->bicd", mixing, chunks).reshape_as(streams)
+            return (mixed + source_update).reshape(*leading_shape, self.input_dim)
+
         projection_dir = (
             None
             if self.projection_variant == "generator"

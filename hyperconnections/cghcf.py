@@ -48,6 +48,8 @@ class ContinuousGenHyperConnectionsForced(ContinuousGenHyperConnections):
     def _transition_and_source(
         self, projections: CGHCProjections, source: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mixer_chunks > 1:
+            raise NotImplementedError("forced CGHC does not support mixer_chunks > 1")
         transition, psi = self.compute_transition_and_psi(projections)
         psi = self._projected_psi(psi, projections)
         source = einsum(psi, source, "b n1 n2, b n2 d -> b n1 d")
